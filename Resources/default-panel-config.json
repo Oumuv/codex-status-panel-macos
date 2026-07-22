@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "theme": {
+    "id": "codex-default",
+    "displayName": "Codex Default",
+    "title": "Codex",
+    "backgroundImage": "quota-panel-background.png"
+  },
+  "widgets": {
+    "codexQuota": true,
+    "codexConnection": true,
+    "followStatus": true,
+    "marketPrices": false
+  },
+  "tracking": {
+    "mode": "follow-current-codex-desktop",
+    "gapPoints": 14,
+    "mascotTopPaddingPoints": 7,
+    "fallback": "top-right"
+  },
+  "refresh": {
+    "quotaSeconds": 300,
+    "marketSeconds": 5,
+    "followSeconds": 0.03
+  }
+}
