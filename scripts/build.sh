@@ -13,6 +13,7 @@ SDK="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)"
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RESOURCES"
 cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
+cp "$ROOT/Resources/AppIcon.icns" "$RESOURCES/AppIcon.icns"
 cp "$ROOT/Resources/quota-panel-background.png" "$RESOURCES/quota-panel-background.png"
 cp "$ROOT/Resources/default-panel-config.json" "$RESOURCES/default-panel-config.json"
 

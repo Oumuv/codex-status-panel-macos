@@ -851,10 +851,18 @@ private final class QuotaPanelView: NSView {
         arrow.stroke()
 
         if isCollapsed {
+            let label = "展开"
+            let labelFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
+            let labelHeight = (label as NSString).size(withAttributes: [.font: labelFont]).height
             drawText(
-                "展开",
-                in: NSRect(x: bodyRect.minX, y: 8, width: bodyRect.width, height: 18),
-                font: .systemFont(ofSize: 11, weight: .semibold),
+                label,
+                in: NSRect(
+                    x: bodyRect.minX,
+                    y: bodyRect.midY - labelHeight / 2,
+                    width: bodyRect.width,
+                    height: labelHeight
+                ),
+                font: labelFont,
                 color: NSColor.white.withAlphaComponent(0.92),
                 alignment: .center
             )
@@ -881,27 +889,27 @@ private final class QuotaPanelView: NSView {
         if !panelConfig.widgets.codexQuota {
             drawText(
                 panelConfig.theme.title,
-                in: NSRect(x: contentX, y: 14, width: contentWidth - 48, height: 18),
+                in: NSRect(x: contentX, y: bodyRect.minY + 11, width: contentWidth - 48, height: 18),
                 font: .systemFont(ofSize: 12.4, weight: .semibold),
                 color: NSColor.white.withAlphaComponent(0.88)
             )
         } else if let errorText {
             drawText(
                 errorText,
-                in: NSRect(x: contentX, y: 14, width: contentWidth - 48, height: 38),
+                in: NSRect(x: contentX, y: bodyRect.minY + 11, width: contentWidth - 48, height: 38),
                 font: .systemFont(ofSize: 12, weight: .medium),
                 color: NSColor(calibratedRed: 1.0, green: 0.72, blue: 0.38, alpha: 1)
             )
         } else if rows.isEmpty {
             drawText(
                 "正在向 Codex 本机服务查询…",
-                in: NSRect(x: contentX, y: 14, width: contentWidth - 48, height: 20),
+                in: NSRect(x: contentX, y: bodyRect.minY + 11, width: contentWidth - 48, height: 20),
                 font: .systemFont(ofSize: 11.5, weight: .medium),
                 color: NSColor.white.withAlphaComponent(0.68)
             )
         } else {
             for (index, row) in rows.prefix(1).enumerated() {
-                draw(row: row, index: index, x: contentX, width: contentWidth)
+                draw(row: row, index: index, bodyMinY: bodyRect.minY, x: contentX, width: contentWidth)
             }
         }
 
@@ -909,7 +917,7 @@ private final class QuotaPanelView: NSView {
             composedStatusText,
             in: NSRect(
                 x: contentX,
-                y: 77,
+                y: bodyRect.minY + 74,
                 width: contentWidth,
                 height: 14
             ),
@@ -926,8 +934,8 @@ private final class QuotaPanelView: NSView {
                 price: btcPrice,
                 direction: btcPriceDirection,
                 statusText: btcStatusText,
-                y: 103,
-                separatorY: 96,
+                y: bodyRect.minY + 100,
+                separatorY: bodyRect.minY + 93,
                 contentX: contentX,
                 contentWidth: contentWidth
             )
@@ -938,8 +946,8 @@ private final class QuotaPanelView: NSView {
                 price: ethPrice,
                 direction: ethPriceDirection,
                 statusText: ethStatusText,
-                y: 126,
-                separatorY: 122,
+                y: bodyRect.minY + 123,
+                separatorY: bodyRect.minY + 119,
                 contentX: contentX,
                 contentWidth: contentWidth
             )
@@ -1034,11 +1042,11 @@ private final class QuotaPanelView: NSView {
     }
 
     private func hideButtonRect(in bodyRect: NSRect) -> NSRect {
-        NSRect(x: bodyRect.maxX - 48, y: 10, width: 38, height: 18)
+        NSRect(x: bodyRect.maxX - 48, y: bodyRect.minY + 7, width: 38, height: 18)
     }
 
-    private func draw(row: QuotaRow, index: Int, x: CGFloat, width: CGFloat) {
-        let top = CGFloat(13 + index * 43)
+    private func draw(row: QuotaRow, index: Int, bodyMinY: CGFloat, x: CGFloat, width: CGFloat) {
+        let top = bodyMinY + CGFloat(10 + index * 43)
         let remaining = max(0, min(100, row.remainingPercent))
         let valueStart = x + 68
         let valueRight = x + width - 48
@@ -2447,9 +2455,11 @@ private func runPlacementSelfTest() -> Never {
     exit(0)
 }
 
-private func renderPreviewOnce(to outputPath: String) -> Never {
-    let view = QuotaPanelView(frame: NSRect(origin: .zero, size: expandedPanelSize))
+private func renderPreviewOnce(to outputPath: String, collapsed: Bool) -> Never {
+    let previewSize = collapsed ? collapsedPanelSize : expandedPanelSize
+    let view = QuotaPanelView(frame: NSRect(origin: .zero, size: previewSize))
     view.pointerSide = .bottom
+    view.isCollapsed = collapsed
     view.rows = [QuotaRow(
         name: "Codex",
         remainingPercent: 94,
@@ -2469,8 +2479,8 @@ private func renderPreviewOnce(to outputPath: String) -> Never {
     let scale: CGFloat = 2
     guard let bitmap = NSBitmapImageRep(
         bitmapDataPlanes: nil,
-        pixelsWide: Int(expandedPanelSize.width * scale),
-        pixelsHigh: Int(expandedPanelSize.height * scale),
+        pixelsWide: Int(previewSize.width * scale),
+        pixelsHigh: Int(previewSize.height * scale),
         bitsPerSample: 8,
         samplesPerPixel: 4,
         hasAlpha: true,
@@ -2482,7 +2492,7 @@ private func renderPreviewOnce(to outputPath: String) -> Never {
         fputs("无法创建预览画布\n", stderr)
         exit(1)
     }
-    bitmap.size = expandedPanelSize
+    bitmap.size = previewSize
 
     view.cacheDisplay(in: view.bounds, to: bitmap)
 
@@ -2550,10 +2560,13 @@ if CommandLine.arguments.contains("--print-panel-config") {
 
 if let previewFlag = CommandLine.arguments.firstIndex(of: "--render-preview") {
     guard CommandLine.arguments.indices.contains(previewFlag + 1) else {
-        fputs("用法：CodexStatusPanel --render-preview <output.png>\n", stderr)
+        fputs("用法：CodexStatusPanel --render-preview <output.png> [--collapsed]\n", stderr)
         exit(1)
     }
-    renderPreviewOnce(to: CommandLine.arguments[previewFlag + 1])
+    renderPreviewOnce(
+        to: CommandLine.arguments[previewFlag + 1],
+        collapsed: CommandLine.arguments.contains("--collapsed")
+    )
 }
 
 private func runPanelApplication() {

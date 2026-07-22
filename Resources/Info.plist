@@ -8,6 +8,8 @@
   <string>Codex 状态面板</string>
   <key>CFBundleExecutable</key>
   <string>CodexStatusPanel</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>io.github.mayday-materials.codex-status-panel</string>
   <key>CFBundleInfoDictionaryVersion</key>
