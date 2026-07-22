@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import Darwin
 import Foundation
 
 private let panelVersion = "1.2.0"
@@ -214,12 +215,15 @@ private let marketPricesEnabled: Bool = {
 // Track fast enough that the panel preserves its visual gap while the pet
 // window is moving between animation positions.
 private let followInterval: TimeInterval = max(0.01, panelConfig.refresh.followSeconds)
-private let expandedPanelSize = NSSize(width: 224, height: marketPricesEnabled ? 160 : 116)
-private let collapsedPanelSize = NSSize(width: 64, height: 44)
+private let panelHorizontalCanvasInset: CGFloat = 7
+private let panelVerticalCanvasInset: CGFloat = 4
+private let panelPointerLength: CGFloat = 10
+private let expandedPanelSize = NSSize(width: 232, height: marketPricesEnabled ? 164 : 120)
+private let collapsedPanelSize = NSSize(width: 72, height: 48)
 private let panelPetGap: CGFloat = panelConfig.tracking.gapPoints
 private let panelScreenMargin: CGFloat = 8
-private let pointerTipBottomInset: CGFloat = 1
-private let pointerHorizontalSafeInset: CGFloat = 18
+private let pointerTipBottomInset = panelVerticalCanvasInset
+private let pointerHorizontalSafeInset = panelHorizontalCanvasInset + 12
 // The v2 sprite has a small transparent top padding inside Codex's stored
 // mascot anchor. Add it so the panel measures from Codex desktop visible top tuft.
 private let petSpriteTopPaddingInsideAnchor: CGFloat = panelConfig.tracking.mascotTopPaddingPoints
@@ -227,6 +231,62 @@ private let petSpriteTopPaddingInsideAnchor: CGFloat = panelConfig.tracking.masc
 private func reportPanelConfigWarnings() {
     for warning in panelConfigWarnings {
         fputs("\(warning)\n", stderr)
+    }
+}
+
+private enum SingleInstanceLockError: LocalizedError {
+    case alreadyRunning
+    case unavailable(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .alreadyRunning:
+            return "已有 Codex 状态面板实例正在运行"
+        case .unavailable(let detail):
+            return "无法创建单实例锁：\(detail)"
+        }
+    }
+}
+
+private final class SingleInstanceLock {
+    private let fileDescriptor: Int32
+
+    private init(fileDescriptor: Int32) {
+        self.fileDescriptor = fileDescriptor
+    }
+
+    static func acquire() throws -> SingleInstanceLock {
+        let lockDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Caches/\(defaultBundleIdentifier)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: lockDirectory, withIntermediateDirectories: true)
+        } catch {
+            throw SingleInstanceLockError.unavailable(error.localizedDescription)
+        }
+
+        let lockURL = lockDirectory.appendingPathComponent("instance.lock")
+        let fileDescriptor = lockURL.path.withCString {
+            Darwin.open($0, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        }
+        guard fileDescriptor >= 0 else {
+            throw SingleInstanceLockError.unavailable(String(cString: strerror(errno)))
+        }
+
+        guard flock(fileDescriptor, LOCK_EX | LOCK_NB) == 0 else {
+            let lockError = errno
+            _ = Darwin.close(fileDescriptor)
+            if lockError == EWOULDBLOCK {
+                throw SingleInstanceLockError.alreadyRunning
+            }
+            throw SingleInstanceLockError.unavailable(String(cString: strerror(lockError)))
+        }
+
+        return SingleInstanceLock(fileDescriptor: fileDescriptor)
+    }
+
+    deinit {
+        _ = flock(fileDescriptor, LOCK_UN)
+        _ = Darwin.close(fileDescriptor)
     }
 }
 
@@ -706,18 +766,21 @@ private final class QuotaPanelView: NSView {
             guard pointerSide != oldValue else { return }
             needsDisplay = true
             window?.invalidateCursorRects(for: self)
+            window?.invalidateShadow()
         }
     }
     var pointerCenterX: CGFloat? {
         didSet {
             guard pointerCenterX != oldValue else { return }
             needsDisplay = true
+            window?.invalidateShadow()
         }
     }
     var isCollapsed = false {
         didSet {
             needsDisplay = true
             window?.invalidateCursorRects(for: self)
+            window?.invalidateShadow()
         }
     }
     var onToggleCollapsed: (() -> Void)?
@@ -738,12 +801,6 @@ private final class QuotaPanelView: NSView {
         NSGraphicsContext.current?.imageInterpolation = .high
 
         let bodyRect = panelBodyRect()
-
-        let shadow = NSShadow()
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.38)
-        shadow.shadowBlurRadius = 12
-        shadow.shadowOffset = NSSize(width: 0, height: -3)
-        shadow.set()
 
         let background = NSColor(calibratedRed: 0.035, green: 0.045, blue: 0.085, alpha: 0.97)
         let border = NSColor.white.withAlphaComponent(0.22)
@@ -769,12 +826,12 @@ private final class QuotaPanelView: NSView {
         case .left:
             let centerY = bodyRect.midY
             arrow.move(to: NSPoint(x: bodyRect.minX + 1, y: centerY - 8))
-            arrow.line(to: NSPoint(x: 1, y: centerY))
+            arrow.line(to: NSPoint(x: panelVerticalCanvasInset, y: centerY))
             arrow.line(to: NSPoint(x: bodyRect.minX + 1, y: centerY + 8))
         case .right:
             let centerY = bodyRect.midY
             arrow.move(to: NSPoint(x: bodyRect.maxX - 1, y: centerY - 8))
-            arrow.line(to: NSPoint(x: bounds.maxX - 1, y: centerY))
+            arrow.line(to: NSPoint(x: bounds.maxX - panelVerticalCanvasInset, y: centerY))
             arrow.line(to: NSPoint(x: bodyRect.maxX - 1, y: centerY + 8))
         case .bottom:
             let requestedCenterX = pointerCenterX ?? bodyRect.midX
@@ -783,7 +840,7 @@ private final class QuotaPanelView: NSView {
                 bodyRect.maxX - 12
             )
             arrow.move(to: NSPoint(x: centerX - 8, y: bodyRect.maxY - 1))
-            arrow.line(to: NSPoint(x: centerX, y: bounds.maxY - 1))
+            arrow.line(to: NSPoint(x: centerX, y: bounds.maxY - panelVerticalCanvasInset))
             arrow.line(to: NSPoint(x: centerX + 8, y: bodyRect.maxY - 1))
         }
         arrow.close()
@@ -792,8 +849,6 @@ private final class QuotaPanelView: NSView {
         border.setStroke()
         arrow.lineWidth = 1
         arrow.stroke()
-
-        NSShadow().set()
 
         if isCollapsed {
             drawText(
@@ -952,14 +1007,29 @@ private final class QuotaPanelView: NSView {
     }
 
     private func panelBodyRect() -> NSRect {
-        let arrowWidth: CGFloat = 10
         switch pointerSide {
         case .left:
-            return NSRect(x: arrowWidth, y: 3, width: bounds.width - arrowWidth, height: bounds.height - 6)
+            let x = panelVerticalCanvasInset + panelPointerLength - 1
+            return NSRect(
+                x: x,
+                y: panelVerticalCanvasInset,
+                width: bounds.width - x - panelHorizontalCanvasInset,
+                height: bounds.height - panelVerticalCanvasInset * 2
+            )
         case .right:
-            return NSRect(x: 0, y: 3, width: bounds.width - arrowWidth, height: bounds.height - 6)
+            return NSRect(
+                x: panelHorizontalCanvasInset,
+                y: panelVerticalCanvasInset,
+                width: bounds.width - panelHorizontalCanvasInset - panelVerticalCanvasInset - panelPointerLength + 1,
+                height: bounds.height - panelVerticalCanvasInset * 2
+            )
         case .bottom:
-            return NSRect(x: 3, y: 3, width: bounds.width - 6, height: bounds.height - arrowWidth - 3)
+            return NSRect(
+                x: panelHorizontalCanvasInset,
+                y: panelVerticalCanvasInset,
+                width: bounds.width - panelHorizontalCanvasInset * 2,
+                height: bounds.height - panelVerticalCanvasInset * 2 - panelPointerLength + 1
+            )
         }
     }
 
@@ -1799,7 +1869,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         panel.contentView = quotaView
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = false
+        panel.hasShadow = true
         panel.level = .statusBar
         panel.hidesOnDeactivate = false
         panel.ignoresMouseEvents = false
@@ -1824,6 +1894,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         quotaView.isCollapsed = isCollapsed
         panel.setContentSize(quotaView.isCollapsed ? collapsedPanelSize : expandedPanelSize)
+        panel.invalidateShadow()
         if !isPanelHiddenByUser {
             followPet(forceStandaloneFallback: isManualStandaloneEnabled)
         }
@@ -2485,7 +2556,24 @@ if let previewFlag = CommandLine.arguments.firstIndex(of: "--render-preview") {
     renderPreviewOnce(to: CommandLine.arguments[previewFlag + 1])
 }
 
-let application = NSApplication.shared
-private let delegate = AppDelegate()
-application.delegate = delegate
-application.run()
+private func runPanelApplication() {
+    let singleInstanceLock: SingleInstanceLock
+    do {
+        singleInstanceLock = try SingleInstanceLock.acquire()
+    } catch SingleInstanceLockError.alreadyRunning {
+        fputs("已有 Codex 状态面板实例正在运行，本次启动退出。\n", stderr)
+        exit(0)
+    } catch {
+        fputs("单实例锁初始化失败：\(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+
+    let application = NSApplication.shared
+    let delegate = AppDelegate()
+    application.delegate = delegate
+    withExtendedLifetime((singleInstanceLock, delegate)) {
+        application.run()
+    }
+}
+
+runPanelApplication()

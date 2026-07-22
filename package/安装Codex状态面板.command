@@ -15,7 +15,8 @@ CONFIG_PATH="$CONFIG_DIR/panel-config.json"
 LOG_PATH="$HOME/Library/Logs/Codex 状态面板.log"
 HEALTH_DIR="$HOME/Library/Caches/io.github.mayday-materials.codex-status-panel"
 HEALTH_PATH="$HEALTH_DIR/panel-health.json"
-DOMAIN="gui/$(id -u)"
+USER_ID="$(/usr/bin/id -u)"
+DOMAIN="gui/$USER_ID"
 PANEL_VERSION="1.2.0"
 
 pause_before_exit() {
@@ -58,6 +59,62 @@ wait_for_panel_health() {
     /bin/sleep 0.1
   done
   return 1
+}
+
+PANEL_PROCESS_PIDS=""
+
+load_panel_process_pids() {
+  local pgrep_status
+  if PANEL_PROCESS_PIDS="$(
+    /usr/bin/pgrep -U "$USER_ID" -f '/Contents/MacOS/CodexStatusPanel([[:space:]]|$)' 2>/dev/null
+  )"; then
+    return 0
+  else
+    pgrep_status="$?"
+  fi
+
+  if [[ "$pgrep_status" -eq 1 ]]; then
+    PANEL_PROCESS_PIDS=""
+    return 0
+  fi
+  fail "无法枚举旧版面板进程（pgrep 状态码 $pgrep_status），已停止覆盖安装。"
+}
+
+wait_for_panel_process_exit() {
+  local attempt
+  for attempt in {1..30}; do
+    load_panel_process_pids
+    [[ -z "$PANEL_PROCESS_PIDS" ]] && return 0
+    /bin/sleep 0.1
+  done
+  return 1
+}
+
+terminate_existing_panel_processes() {
+  local pid
+  local pid_output
+
+  load_panel_process_pids
+  pid_output="$PANEL_PROCESS_PIDS"
+  [[ -z "$pid_output" ]] && return 0
+
+  echo "正在终止旧版面板实例…"
+  while IFS= read -r pid; do
+    [[ "$pid" == <-> ]] || continue
+    /bin/kill -TERM "$pid" 2>/dev/null || true
+  done <<< "$pid_output"
+
+  wait_for_panel_process_exit && return 0
+
+  load_panel_process_pids
+  pid_output="$PANEL_PROCESS_PIDS"
+  while IFS= read -r pid; do
+    [[ "$pid" == <-> ]] || continue
+    /bin/kill -KILL "$pid" 2>/dev/null || true
+  done <<< "$pid_output"
+
+  wait_for_panel_process_exit \
+    || fail "旧版面板进程无法终止，已停止覆盖安装以避免产生重复实例。"
 }
 
 echo "正在安装 Codex 状态面板（macOS Universal 开源版 $PANEL_VERSION）…"
@@ -105,6 +162,7 @@ for _ in {1..20}; do
   /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break
   /bin/sleep 0.1
 done
+terminate_existing_panel_processes
 
 /bin/rm -rf "$APP_DEST"
 /usr/bin/ditto "$APP_SOURCE" "$APP_DEST"
