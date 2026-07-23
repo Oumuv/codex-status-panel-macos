@@ -16,6 +16,13 @@ cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$RESOURCES/AppIcon.icns"
 cp "$ROOT/Resources/quota-panel-background.png" "$RESOURCES/quota-panel-background.png"
 cp "$ROOT/Resources/default-panel-config.json" "$RESOURCES/default-panel-config.json"
+for TASK_ICON in \
+  task-running-icon.png \
+  task-waiting-icon.png \
+  task-completed-icon.png \
+  task-failed-icon.png; do
+  cp "$ROOT/Resources/$TASK_ICON" "$RESOURCES/$TASK_ICON"
+done
 
 for ARCH in arm64 x86_64; do
   /usr/bin/swiftc \

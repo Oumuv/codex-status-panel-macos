@@ -3,7 +3,7 @@ import CoreGraphics
 import Darwin
 import Foundation
 
-private let panelVersion = "1.2.0"
+private let panelVersion = "1.2.1"
 private let defaultBundleIdentifier = "io.github.mayday-materials.codex-status-panel"
 private let panelBundleIdentifier = Bundle.main.bundleIdentifier ?? defaultBundleIdentifier
 private let panelClientName = "codex-status-panel"
@@ -204,21 +204,55 @@ private let editablePanelConfigFileURL: URL = {
 }()
 private let refreshInterval: TimeInterval = max(1, panelConfig.refresh.quotaSeconds)
 private let btcRefreshInterval: TimeInterval = max(1, panelConfig.refresh.marketSeconds)
-private let marketPricesEnabled: Bool = {
-    if let rawValue = ProcessInfo.processInfo.environment["CODEX_STATUS_PANEL_SHOW_MARKET_PRICES"],
-       isFalseEnvironmentValue(rawValue)
-    {
-        return false
+private let taskProgressRefreshInterval: TimeInterval = 2
+private let configuredMarketPricesEnabled: Bool = {
+    if let rawValue = ProcessInfo.processInfo.environment[
+        "CODEX_STATUS_PANEL_SHOW_MARKET_PRICES"
+    ] {
+        return !isFalseEnvironmentValue(rawValue)
     }
     return panelConfig.widgets.marketPrices
 }()
+private let marketPricesPreferenceKey = "showsMarketPrices"
+private func resolvedMarketPricesEnabled(
+    storedValue: Bool?,
+    configuredDefault: Bool
+) -> Bool {
+    storedValue ?? configuredDefault
+}
+private let initialMarketPricesEnabled = resolvedMarketPricesEnabled(
+    storedValue: UserDefaults.standard.object(
+        forKey: marketPricesPreferenceKey
+    ) as? Bool,
+    configuredDefault: configuredMarketPricesEnabled
+)
 // Track fast enough that the panel preserves its visual gap while the pet
 // window is moving between animation positions.
 private let followInterval: TimeInterval = max(0.01, panelConfig.refresh.followSeconds)
 private let panelHorizontalCanvasInset: CGFloat = 7
 private let panelVerticalCanvasInset: CGFloat = 4
 private let panelPointerLength: CGFloat = 10
-private let expandedPanelSize = NSSize(width: 232, height: marketPricesEnabled ? 164 : 120)
+private let taskProgressRowHeight: CGFloat = 23
+private let marketPriceRowHeight: CGFloat = 23
+private let maximumVisibleTaskRows = 5
+private let baseExpandedPanelHeight: CGFloat = 120
+private func panelSizeForTaskRows(
+    _ count: Int,
+    showsMarketPrices: Bool
+) -> NSSize {
+    let safeCount = max(1, min(maximumVisibleTaskRows, count))
+    let marketHeight = showsMarketPrices ? marketPriceRowHeight * 2 : 0
+    return NSSize(
+        width: 232,
+        height: baseExpandedPanelHeight
+            + taskProgressRowHeight * CGFloat(safeCount)
+            + marketHeight
+    )
+}
+private let expandedPanelSize = panelSizeForTaskRows(
+    1,
+    showsMarketPrices: initialMarketPricesEnabled
+)
 private let collapsedPanelSize = NSSize(width: 72, height: 48)
 private let panelPetGap: CGFloat = panelConfig.tracking.gapPoints
 private let panelScreenMargin: CGFloat = 8
@@ -302,19 +336,22 @@ private struct PanelMenuControlState: Equatable {
     let hidePanelEnabled: Bool
     let collapseTitle: String
     let refreshQuotaEnabled: Bool
+    let marketPricesEnabled: Bool
 }
 
 private func panelMenuControlState(
     isPanelVisible: Bool,
     isPanelHiddenByUser: Bool,
     isCollapsed: Bool,
-    isRefreshing: Bool
+    isRefreshing: Bool,
+    showsMarketPrices: Bool
 ) -> PanelMenuControlState {
     PanelMenuControlState(
         showPanelEnabled: isPanelHiddenByUser || !isPanelVisible,
         hidePanelEnabled: isPanelVisible && !isPanelHiddenByUser,
         collapseTitle: collapsedMenuItemTitle(isCollapsed: isCollapsed),
-        refreshQuotaEnabled: !isRefreshing
+        refreshQuotaEnabled: !isRefreshing,
+        marketPricesEnabled: showsMarketPrices
     )
 }
 
@@ -446,12 +483,22 @@ private final class RuntimeHealthWriter {
         locationSource: String?,
         codexConnectionStatus: String,
         followStatus: String,
+        marketPricesEnabled: Bool,
+        panelHeight: CGFloat,
         gap: CGFloat? = nil,
         centerError: CGFloat? = nil,
         force: Bool = false
     ) {
         let now = CFAbsoluteTimeGetCurrent()
-        let signature = "\(status)|\(panelVisible)|\(locationSource ?? "none")|\(codexConnectionStatus)|\(followStatus)"
+        let signature = [
+            status,
+            String(panelVisible),
+            locationSource ?? "none",
+            codexConnectionStatus,
+            followStatus,
+            String(marketPricesEnabled),
+            String(format: "%.1f", panelHeight),
+        ].joined(separator: "|")
         guard force || signature != lastSignature || now - lastWriteAt >= 15 else { return }
 
         var payload: [String: Any] = [
@@ -463,7 +510,7 @@ private final class RuntimeHealthWriter {
             "status": status,
             "panelVisible": panelVisible,
             "marketPricesEnabled": marketPricesEnabled,
-            "panelHeightPoints": expandedPanelSize.height,
+            "panelHeightPoints": panelHeight,
             "updatedAt": ISO8601DateFormatter().string(from: Date()),
         ]
         if let gap { payload["petGapPoints"] = gap }
@@ -524,6 +571,719 @@ private struct QuotaRow {
     let resetsAt: Date?
 }
 
+private enum TaskProgressKind: String, Equatable {
+    case reading
+    case running
+    case waitingForInput
+    case completed
+    case failed
+    case idle
+}
+
+private struct TaskProgressItem: Equatable {
+    let title: String
+    let kind: TaskProgressKind
+    let startedAt: Date
+    let statusOverride: String?
+
+    init(
+        title: String,
+        kind: TaskProgressKind,
+        startedAt: Date = .distantPast,
+        statusOverride: String? = nil
+    ) {
+        self.title = title
+        self.kind = kind
+        self.startedAt = startedAt
+        self.statusOverride = statusOverride
+    }
+
+    var statusText: String {
+        if let statusOverride { return statusOverride }
+        switch kind {
+        case .reading:
+            return "读取中"
+        case .running:
+            return "正在执行"
+        case .waitingForInput:
+            return "等你确认"
+        case .completed:
+            return "已完成"
+        case .failed:
+            return "执行失败"
+        case .idle:
+            return "等待"
+        }
+    }
+}
+
+private struct TaskProgressSnapshot: Equatable {
+    let items: [TaskProgressItem]
+
+    var kind: TaskProgressKind { items.first?.kind ?? .idle }
+    var rowCount: Int { max(1, items.count) }
+
+    static let reading = TaskProgressSnapshot(items: [TaskProgressItem(
+        title: "正在读取任务",
+        kind: .reading
+    )])
+
+    static let idle = TaskProgressSnapshot(items: [TaskProgressItem(
+        title: "暂无进行中的任务",
+        kind: .idle
+    )])
+
+    static func displaying(_ sourceItems: [TaskProgressItem]) -> TaskProgressSnapshot {
+        guard !sourceItems.isEmpty else { return .idle }
+        return TaskProgressSnapshot(items: Array(
+            sourceItems.prefix(maximumVisibleTaskRows)
+        ))
+    }
+}
+
+private func shouldAnimateRunningArrow(
+    isWindowVisible: Bool,
+    isCollapsed: Bool,
+    hasRunningTask: Bool
+) -> Bool {
+    isWindowVisible && !isCollapsed && hasRunningTask
+}
+
+private final class CodexTaskProgressReader {
+    struct UnreadThreadState {
+        let ids: Set<String>
+        let isAvailable: Bool
+    }
+
+    private struct RolloutCandidate {
+        let url: URL
+        let modificationDate: Date
+    }
+
+    private struct ParsedCacheEntry {
+        let modificationDate: Date
+        let snapshot: TaskProgressSnapshot
+    }
+
+    private let fileManager = FileManager.default
+    private let maximumTailBytes: UInt64 = 128 * 1_024
+    private let maximumMetadataBytes = 16 * 1_024
+    private let maximumMetadataCandidates = 128
+    private let maximumRolloutCandidates = 64
+    private let discoveryDayCount = 3
+    private let initialActiveDiscoveryWindow: TimeInterval = 6 * 60 * 60
+    private let rolloutRescanInterval = taskProgressRefreshInterval
+    private let completedTaskVisibility: TimeInterval = 2 * 60
+    private var cachedRollouts: [RolloutCandidate] = []
+    private var cachedRolloutVisibility: [String: Bool] = [:]
+    private var parsedCache: [String: ParsedCacheEntry] = [:]
+    private var cachedThreadTitles: [String: String] = [:]
+    private var cachedThreadIndexModificationDate: Date?
+    private var cachedUnreadThreadIDs = Set<String>()
+    private var cachedUnreadStateModificationDate: Date?
+    private var hasCachedUnreadState = false
+    private var trackedActiveRolloutPaths = Set<String>()
+    private var nextRolloutScanAt = Date.distantPast
+
+    func read(at now: Date = Date()) -> TaskProgressSnapshot {
+        let threadTitles = readThreadTitleIndex()
+        let unreadState = readUnreadThreadState()
+        var items: [TaskProgressItem] = []
+
+        for candidate in recentRollouts(at: now, unreadThreadIDs: unreadState.ids) {
+            let cacheKey = candidate.url.path
+            let snapshot: TaskProgressSnapshot
+            if let cached = parsedCache[cacheKey],
+               cached.modificationDate == candidate.modificationDate
+            {
+                snapshot = cached.snapshot
+            } else {
+                guard let lines = readTailLines(from: candidate.url) else { continue }
+                snapshot = Self.parse(
+                    lines: lines,
+                    modificationDate: candidate.modificationDate,
+                    now: now
+                )
+                parsedCache[cacheKey] = ParsedCacheEntry(
+                    modificationDate: candidate.modificationDate,
+                    snapshot: snapshot
+                )
+            }
+
+            switch snapshot.kind {
+            case .running, .waitingForInput:
+                trackedActiveRolloutPaths.insert(cacheKey)
+            case .completed, .failed, .idle:
+                trackedActiveRolloutPaths.remove(cacheKey)
+            case .reading:
+                break
+            }
+
+            guard var item = snapshot.items.first, item.kind != .idle else { continue }
+            let resolvedTitle = Self.resolvedTitle(
+                for: candidate.url,
+                indexedTitles: threadTitles,
+                fallback: item.title
+            )
+            if resolvedTitle != item.title {
+                item = TaskProgressItem(
+                    title: resolvedTitle,
+                    kind: item.kind,
+                    startedAt: item.startedAt,
+                    statusOverride: item.statusOverride
+                )
+            }
+
+            let threadID = Self.threadID(from: candidate.url)
+            guard Self.shouldDisplay(
+                kind: item.kind,
+                threadID: threadID,
+                modificationDate: candidate.modificationDate,
+                now: now,
+                unreadState: unreadState,
+                fallbackVisibility: completedTaskVisibility
+            ) else { continue }
+            items.append(item)
+        }
+
+        items.sort {
+            let leftTerminal = $0.kind == .completed || $0.kind == .failed
+            let rightTerminal = $1.kind == .completed || $1.kind == .failed
+            if leftTerminal != rightTerminal { return !leftTerminal }
+            if $0.startedAt == $1.startedAt { return $0.title < $1.title }
+            if leftTerminal { return $0.startedAt > $1.startedAt }
+            return $0.startedAt < $1.startedAt
+        }
+        return .displaying(items)
+    }
+
+    static func parse(
+        lines: [String],
+        modificationDate: Date,
+        now: Date
+    ) -> TaskProgressSnapshot {
+        var lifecycle: TaskProgressKind?
+        var pendingUserInputCalls = Set<String>()
+        var latestUserTitle: String?
+        var activeTaskTitle: String?
+        var taskStartedAt = modificationDate
+
+        for line in lines {
+            guard line.contains("task_started")
+                || line.contains("task_complete")
+                || line.contains("task_failed")
+                || line.contains("turn_aborted")
+                || line.contains(#""type":"error""#)
+                || line.contains("user_message")
+                || line.contains("request_user_input")
+                || line.contains("function_call_output")
+                || line.contains("custom_tool_call_output")
+            else { continue }
+
+            guard let data = line.data(using: .utf8),
+                  let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let payload = record["payload"] as? [String: Any],
+                  let payloadType = payload["type"] as? String
+            else { continue }
+
+            if record["type"] as? String == "event_msg" {
+                if payloadType == "user_message",
+                   let message = payload["message"] as? String,
+                   let title = taskTitle(from: message)
+                {
+                    latestUserTitle = title
+                } else if payloadType == "task_started" {
+                    lifecycle = .running
+                    pendingUserInputCalls.removeAll()
+                    activeTaskTitle = latestUserTitle ?? activeTaskTitle
+                    taskStartedAt = timestamp(from: record) ?? modificationDate
+                } else if payloadType == "task_complete" {
+                    lifecycle = .completed
+                    pendingUserInputCalls.removeAll()
+                } else if ["task_failed", "turn_aborted", "error"].contains(payloadType) {
+                    lifecycle = .failed
+                    pendingUserInputCalls.removeAll()
+                }
+                continue
+            }
+
+            if ["function_call", "custom_tool_call"].contains(payloadType),
+               payload["name"] as? String == "request_user_input",
+               let callID = payload["call_id"] as? String
+            {
+                pendingUserInputCalls.insert(callID)
+                continue
+            }
+
+            if ["function_call_output", "custom_tool_call_output"].contains(payloadType),
+               let callID = payload["call_id"] as? String
+            {
+                pendingUserInputCalls.remove(callID)
+            }
+        }
+
+        let title = activeTaskTitle ?? latestUserTitle ?? "Codex 任务"
+        if lifecycle == .running, !pendingUserInputCalls.isEmpty {
+            return TaskProgressSnapshot(items: [TaskProgressItem(
+                title: title,
+                kind: .waitingForInput,
+                startedAt: taskStartedAt
+            )])
+        }
+        if let lifecycle {
+            return TaskProgressSnapshot(items: [TaskProgressItem(
+                title: title,
+                kind: lifecycle,
+                startedAt: taskStartedAt
+            )])
+        }
+        if !pendingUserInputCalls.isEmpty {
+            return TaskProgressSnapshot(items: [TaskProgressItem(
+                title: title,
+                kind: .waitingForInput,
+                startedAt: taskStartedAt
+            )])
+        }
+        if now.timeIntervalSince(modificationDate) <= 30 * 60 {
+            return TaskProgressSnapshot(items: [TaskProgressItem(
+                title: title,
+                kind: .running,
+                startedAt: taskStartedAt
+            )])
+        }
+        return .idle
+    }
+
+    private static func taskTitle(from rawMessage: String) -> String? {
+        var value = rawMessage
+        if let marker = value.range(
+            of: "## My request for Codex:",
+            options: [.caseInsensitive]
+        ) {
+            value = String(value[marker.upperBound...])
+        }
+        if let imageTag = value.range(of: "<image", options: [.caseInsensitive]) {
+            value = String(value[..<imageTag.lowerBound])
+        }
+
+        let lines = value.components(separatedBy: .newlines).compactMap {
+            line -> String? in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  !trimmed.hasPrefix("# Files mentioned"),
+                  !trimmed.hasPrefix("## My request"),
+                  !trimmed.hasPrefix("/")
+            else { return nil }
+            return trimmed.trimmingCharacters(
+                in: CharacterSet(charactersIn: "#*- ")
+            )
+        }
+        let title = lines.joined(separator: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return nil }
+        return String(title.prefix(80))
+    }
+
+    private static func timestamp(from record: [String: Any]) -> Date? {
+        guard let raw = record["timestamp"] as? String else { return nil }
+        return iso8601WithFractional.date(from: raw) ?? iso8601.date(from: raw)
+    }
+
+    static func threadID(from rolloutURL: URL) -> String? {
+        let filename = rolloutURL.deletingPathExtension().lastPathComponent
+        let pattern = #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"#
+        guard let range = filename.range(of: pattern, options: .regularExpression) else {
+            return nil
+        }
+        return String(filename[range]).lowercased()
+    }
+
+    static func resolvedTitle(
+        for rolloutURL: URL,
+        indexedTitles: [String: String],
+        fallback: String
+    ) -> String {
+        guard let threadID = threadID(from: rolloutURL),
+              let indexedTitle = indexedTitles[threadID],
+              !indexedTitle.isEmpty
+        else { return fallback }
+        return indexedTitle
+    }
+
+    private static func userVisibilityFromSessionMetadata(
+        line: String
+    ) -> Bool? {
+        guard let data = line.data(using: .utf8),
+              let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              record["type"] as? String == "session_meta",
+              let payload = record["payload"] as? [String: Any]
+        else {
+            return nil
+        }
+
+        let threadSource = (payload["thread_source"] as? String)?.lowercased()
+        if threadSource == "subagent" || threadSource == "automation" {
+            return false
+        }
+        if let source = payload["source"] as? [String: Any], source["subagent"] != nil {
+            return false
+        }
+        return true
+    }
+
+    static func isUserVisibleSessionMetadata(line: String) -> Bool {
+        userVisibilityFromSessionMetadata(line: line) == true
+    }
+
+    static func shouldDisplay(
+        kind: TaskProgressKind,
+        threadID: String?,
+        modificationDate: Date,
+        now: Date,
+        unreadState: UnreadThreadState,
+        fallbackVisibility: TimeInterval = 2 * 60
+    ) -> Bool {
+        guard kind == .completed || kind == .failed else { return true }
+        if unreadState.isAvailable, let threadID {
+            return unreadState.ids.contains(threadID)
+        }
+        return now.timeIntervalSince(modificationDate) <= fallbackVisibility
+    }
+
+    private func codexHomeURL() -> URL {
+        if let override = ProcessInfo.processInfo.environment["CODEX_HOME"],
+           !override.isEmpty
+        {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        return fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex", isDirectory: true)
+    }
+
+    private func readThreadTitleIndex() -> [String: String] {
+        let indexURL = codexHomeURL().appendingPathComponent("session_index.jsonl")
+        guard let values = try? indexURL.resourceValues(
+            forKeys: [.contentModificationDateKey, .isRegularFileKey]
+        ),
+        values.isRegularFile == true,
+        let modificationDate = values.contentModificationDate
+        else {
+            return cachedThreadTitles
+        }
+
+        if cachedThreadIndexModificationDate == modificationDate {
+            return cachedThreadTitles
+        }
+        guard let data = try? Data(contentsOf: indexURL),
+              let text = String(data: data, encoding: .utf8)
+        else {
+            return cachedThreadTitles
+        }
+
+        var titles: [String: String] = [:]
+        for line in text.split(whereSeparator: \.isNewline) {
+            guard let lineData = String(line).data(using: .utf8),
+                  let record = try? JSONSerialization.jsonObject(
+                      with: lineData
+                  ) as? [String: Any],
+                  let rawID = record["id"] as? String,
+                  let rawTitle = record["thread_name"] as? String
+            else { continue }
+            let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { continue }
+            titles[rawID.lowercased()] = String(title.prefix(80))
+        }
+
+        cachedThreadTitles = titles
+        cachedThreadIndexModificationDate = modificationDate
+        return titles
+    }
+
+    private func readUnreadThreadState() -> UnreadThreadState {
+        let stateURL: URL
+        if let override = ProcessInfo.processInfo.environment[
+            "CODEX_STATUS_PANEL_STATE_FILE"
+        ],
+        !override.isEmpty
+        {
+            stateURL = URL(fileURLWithPath: override)
+        } else if let override = ProcessInfo.processInfo.environment[
+            "CODEX_PANEL_STATE_FILE"
+        ],
+        !override.isEmpty
+        {
+            stateURL = URL(fileURLWithPath: override)
+        } else {
+            stateURL = codexHomeURL().appendingPathComponent(
+                ".codex-global-state.json"
+            )
+        }
+
+        guard let values = try? stateURL.resourceValues(
+            forKeys: [.contentModificationDateKey, .isRegularFileKey]
+        ),
+        values.isRegularFile == true,
+        let modificationDate = values.contentModificationDate
+        else {
+            return UnreadThreadState(
+                ids: cachedUnreadThreadIDs,
+                isAvailable: hasCachedUnreadState
+            )
+        }
+        if cachedUnreadStateModificationDate == modificationDate {
+            return UnreadThreadState(
+                ids: cachedUnreadThreadIDs,
+                isAvailable: hasCachedUnreadState
+            )
+        }
+
+        guard let data = try? Data(contentsOf: stateURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let atomState = root["electron-persisted-atom-state"] as? [String: Any],
+              let unreadByHost = atomState[
+                  "unread-thread-ids-by-host-v1"
+              ] as? [String: Any]
+        else {
+            return UnreadThreadState(
+                ids: cachedUnreadThreadIDs,
+                isAvailable: hasCachedUnreadState
+            )
+        }
+
+        var ids = Set<String>()
+        for value in unreadByHost.values {
+            guard let hostIDs = value as? [String] else { continue }
+            ids.formUnion(hostIDs.map { $0.lowercased() })
+        }
+        cachedUnreadThreadIDs = ids
+        cachedUnreadStateModificationDate = modificationDate
+        hasCachedUnreadState = true
+        return UnreadThreadState(ids: ids, isAvailable: true)
+    }
+
+    private func recentRollouts(
+        at now: Date,
+        unreadThreadIDs: Set<String>
+    ) -> [RolloutCandidate] {
+        if let override = ProcessInfo.processInfo.environment[
+            "CODEX_STATUS_PANEL_TASK_ROLLOUT_FILE"
+        ],
+        !override.isEmpty
+        {
+            let url = URL(fileURLWithPath: override)
+            guard isUserVisibleRollout(url) else { return [] }
+            let modified = (try? url.resourceValues(
+                forKeys: [.contentModificationDateKey]
+            ).contentModificationDate) ?? now
+            return [RolloutCandidate(url: url, modificationDate: modified)]
+        }
+
+        if now < nextRolloutScanAt, !cachedRollouts.isEmpty {
+            cachedRollouts = cachedRollouts.compactMap { candidate in
+                guard let values = try? candidate.url.resourceValues(
+                    forKeys: [
+                        .contentModificationDateKey,
+                        .isRegularFileKey,
+                    ]
+                ),
+                values.isRegularFile == true,
+                let modificationDate = values.contentModificationDate
+                else { return nil }
+                return RolloutCandidate(
+                    url: candidate.url,
+                    modificationDate: modificationDate
+                )
+            }
+            trackedActiveRolloutPaths.formIntersection(
+                cachedRollouts.map { $0.url.path }
+            )
+            return cachedRollouts
+        }
+
+        nextRolloutScanAt = now.addingTimeInterval(rolloutRescanInterval)
+        let sessionsURL = codexHomeURL().appendingPathComponent(
+            "sessions",
+            isDirectory: true
+        )
+        let resourceKeys: Set<URLResourceKey> = [
+            .contentModificationDateKey,
+            .isRegularFileKey,
+        ]
+        var discoveredByPath: [String: RolloutCandidate] = [:]
+        for directory in discoverySessionDirectories(
+            sessionsURL: sessionsURL,
+            at: now
+        ) {
+            guard let urls = try? fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: Array(resourceKeys),
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+            for url in urls {
+                guard let candidate = rolloutCandidate(
+                    at: url,
+                    resourceKeys: resourceKeys
+                ) else { continue }
+                discoveredByPath[url.path] = candidate
+            }
+        }
+
+        var existingTrackedPaths = Set<String>()
+        for path in trackedActiveRolloutPaths {
+            let url = URL(fileURLWithPath: path)
+            guard let candidate = rolloutCandidate(
+                at: url,
+                resourceKeys: resourceKeys
+            ) else { continue }
+            existingTrackedPaths.insert(path)
+            discoveredByPath[path] = candidate
+        }
+        trackedActiveRolloutPaths.formIntersection(existingTrackedPaths)
+
+        let discovered = discoveredByPath.values.filter { candidate in
+            let path = candidate.url.path
+            if trackedActiveRolloutPaths.contains(path) { return true }
+            let isUnread = Self.threadID(from: candidate.url).map {
+                unreadThreadIDs.contains($0)
+            } ?? false
+            if isUnread { return true }
+            return now.timeIntervalSince(candidate.modificationDate)
+                <= initialActiveDiscoveryWindow
+        }
+        let sorted = discovered.sorted { left, right in
+            let leftTracked = trackedActiveRolloutPaths.contains(left.url.path)
+            let rightTracked = trackedActiveRolloutPaths.contains(right.url.path)
+            if leftTracked != rightTracked { return leftTracked }
+            let leftUnread = Self.threadID(from: left.url).map {
+                unreadThreadIDs.contains($0)
+            } ?? false
+            let rightUnread = Self.threadID(from: right.url).map {
+                unreadThreadIDs.contains($0)
+            } ?? false
+            if leftUnread != rightUnread { return leftUnread }
+            return left.modificationDate > right.modificationDate
+        }
+        var candidates: [RolloutCandidate] = []
+        for candidate in sorted.prefix(maximumMetadataCandidates)
+            where isUserVisibleRollout(candidate.url)
+        {
+            candidates.append(candidate)
+            if candidates.count == maximumRolloutCandidates { break }
+        }
+
+        cachedRollouts = candidates
+        let activePaths = Set(cachedRollouts.map { $0.url.path })
+        parsedCache = parsedCache.filter { activePaths.contains($0.key) }
+        return cachedRollouts
+    }
+
+    private func discoverySessionDirectories(
+        sessionsURL: URL,
+        at now: Date
+    ) -> [URL] {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        return (0..<discoveryDayCount).compactMap { dayOffset in
+            guard let date = calendar.date(
+                byAdding: .day,
+                value: -dayOffset,
+                to: now
+            ) else { return nil }
+            let components = calendar.dateComponents(
+                [.year, .month, .day],
+                from: date
+            )
+            guard let year = components.year,
+                  let month = components.month,
+                  let day = components.day
+            else { return nil }
+            return sessionsURL.appendingPathComponent(
+                String(format: "%04d/%02d/%02d", year, month, day),
+                isDirectory: true
+            )
+        }
+    }
+
+    private func rolloutCandidate(
+        at url: URL,
+        resourceKeys: Set<URLResourceKey>
+    ) -> RolloutCandidate? {
+        guard url.pathExtension == "jsonl",
+              url.lastPathComponent.hasPrefix("rollout-"),
+              let values = try? url.resourceValues(forKeys: resourceKeys),
+              values.isRegularFile == true,
+              let modificationDate = values.contentModificationDate
+        else { return nil }
+        return RolloutCandidate(
+            url: url,
+            modificationDate: modificationDate
+        )
+    }
+
+    private func isUserVisibleRollout(_ url: URL) -> Bool {
+        if let cached = cachedRolloutVisibility[url.path] { return cached }
+
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return false
+        }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: maximumMetadataBytes),
+              let text = String(data: data, encoding: .utf8),
+              let firstLine = text.split(
+                  separator: "\n",
+                  maxSplits: 1
+              ).first,
+              let isVisible = Self.userVisibilityFromSessionMetadata(
+                  line: String(firstLine)
+              )
+        else { return false }
+
+        cachedRolloutVisibility[url.path] = isVisible
+        return isVisible
+    }
+
+    private func readTailLines(from url: URL) -> [String]? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return nil
+        }
+        defer { try? handle.close() }
+
+        let fileSize = (try? handle.seekToEnd()) ?? 0
+        let startOffset = fileSize > maximumTailBytes
+            ? fileSize - maximumTailBytes
+            : 0
+        do {
+            try handle.seek(toOffset: startOffset)
+            guard var data = try handle.readToEnd(), !data.isEmpty else {
+                return []
+            }
+            if startOffset > 0,
+               let firstNewline = data.firstIndex(of: 0x0A)
+            {
+                data.removeSubrange(...firstNewline)
+            }
+            guard let text = String(data: data, encoding: .utf8) else {
+                return nil
+            }
+            return text.split(whereSeparator: \.isNewline).map(String.init)
+        } catch {
+            return nil
+        }
+    }
+
+    private static let iso8601WithFractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [
+            .withInternetDateTime,
+            .withFractionalSeconds,
+        ]
+        return formatter
+    }()
+
+    private static let iso8601 = ISO8601DateFormatter()
+}
+
 private struct BinanceTickerResponse: Decodable {
     let symbol: String
     let price: String
@@ -551,6 +1311,7 @@ private enum QuotaClientError: LocalizedError {
     case codexNotFound
     case launchFailed(String)
     case noResponse
+    case authentication(String)
     case server(String)
 
     var errorDescription: String? {
@@ -561,10 +1322,172 @@ private enum QuotaClientError: LocalizedError {
             return "无法启动 Codex 本机服务：\(detail)"
         case .noResponse:
             return "Codex 暂未返回额度数据"
+        case .authentication(let detail):
+            return detail
         case .server(let detail):
             return detail
         }
     }
+}
+
+private struct CodexConfigurationReader {
+    private enum TopLevelLineResult {
+        case skip
+        case stop
+        case provider(String)
+    }
+
+    private static let maximumConfigBytes = 64 * 1_024
+    private static let configReadChunkBytes = 4 * 1_024
+
+    static func modelProvider(at url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+
+        var buffer = Data()
+        var bytesRead = 0
+        while bytesRead < maximumConfigBytes {
+            let requestedBytes = min(
+                configReadChunkBytes,
+                maximumConfigBytes - bytesRead
+            )
+            guard let chunk = try? handle.read(upToCount: requestedBytes),
+                  !chunk.isEmpty
+            else { break }
+            bytesRead += chunk.count
+            buffer.append(chunk)
+
+            while let newline = buffer.firstIndex(of: 0x0A) {
+                let lineData = buffer[..<newline]
+                buffer.removeSubrange(...newline)
+                switch topLevelLineResult(
+                    String(decoding: lineData, as: UTF8.self)
+                ) {
+                case .provider(let provider):
+                    return provider
+                case .stop:
+                    return nil
+                case .skip:
+                    continue
+                }
+            }
+        }
+
+        guard !buffer.isEmpty else { return nil }
+        if case .provider(let provider) = topLevelLineResult(
+            String(decoding: buffer, as: UTF8.self)
+        ) {
+            return provider
+        }
+        return nil
+    }
+
+    static func modelProvider(from source: String) -> String? {
+        for rawLine in source.components(separatedBy: .newlines) {
+            switch topLevelLineResult(rawLine) {
+            case .provider(let provider):
+                return provider
+            case .stop:
+                return nil
+            case .skip:
+                continue
+            }
+        }
+        return nil
+    }
+
+    private static func topLevelLineResult(
+        _ rawLine: String
+    ) -> TopLevelLineResult {
+        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isTOMLTableHeader(line) { return .stop }
+        guard !line.isEmpty,
+              !line.hasPrefix("#"),
+              let equals = line.firstIndex(of: "=")
+        else { return .skip }
+
+        let key = line[..<equals].trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard key == "model_provider" else { return .skip }
+
+        var value = line[line.index(after: equals)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return .stop }
+
+        if let quote = value.first, quote == "\"" || quote == "'" {
+            value.removeFirst()
+            guard let closingQuote = value.firstIndex(of: quote) else {
+                return .stop
+            }
+            value = String(value[..<closingQuote])
+        } else {
+            value = String(value.prefix {
+                !$0.isWhitespace && $0 != "#"
+            })
+        }
+
+        let provider = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !provider.isEmpty else { return .stop }
+        return .provider(String(provider.prefix(80)))
+    }
+
+    private static func isTOMLTableHeader(_ line: String) -> Bool {
+        let key = #"(?:[A-Za-z0-9_-]+|\"(?:\\.|[^\"])*\"|'[^']*')"#
+        let keyPath = key + #"(?:\s*\.\s*"# + key + #")*"#
+        let suffix = #"\s*(?:#.*)?$"#
+        let singleTable = #"^\[\s*"# + keyPath + #"\s*\]"# + suffix
+        let arrayTable = #"^\[\[\s*"# + keyPath + #"\s*\]\]"# + suffix
+        return line.range(of: singleTable, options: .regularExpression) != nil
+            || line.range(of: arrayTable, options: .regularExpression) != nil
+    }
+}
+
+private func codexConfigurationURL() -> URL {
+    if let override = ProcessInfo.processInfo.environment["CODEX_HOME"],
+       !override.isEmpty
+    {
+        return URL(fileURLWithPath: override, isDirectory: true)
+            .appendingPathComponent("config.toml")
+    }
+    return FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".codex", isDirectory: true)
+        .appendingPathComponent("config.toml")
+}
+
+private func quotaErrorDisplayText(
+    _ error: Error,
+    modelProviderLoader: () -> String?
+) -> String {
+    guard let quotaError = error as? QuotaClientError else {
+        return error.localizedDescription
+    }
+    switch quotaError {
+    case .authentication(let message):
+        return quotaErrorDisplayText(
+            message,
+            modelProvider: modelProviderLoader()
+        )
+    default:
+        return error.localizedDescription
+    }
+}
+
+private func quotaErrorDisplayText(
+    _ message: String,
+    modelProvider: String?
+) -> String {
+    guard message.range(
+        of: "authentication",
+        options: [.caseInsensitive]
+    ) != nil else {
+        return message
+    }
+
+    if let modelProvider, !modelProvider.isEmpty {
+        return "model_provider: \(modelProvider)"
+    }
+    return "Codex 未登录或认证已失效"
 }
 
 private final class CodexQuotaClient {
@@ -655,6 +1578,12 @@ private final class CodexQuotaClient {
             return .success(result)
         }
         if let error = finalResponse?.error {
+            if error.message.range(
+                of: "authentication",
+                options: [.caseInsensitive]
+            ) != nil {
+                return .failure(QuotaClientError.authentication(error.message))
+            }
             return .failure(QuotaClientError.server(error.message))
         }
 
@@ -755,6 +1684,17 @@ private final class QuotaPanelView: NSView {
     var codexConnectionText = "连接中" { didSet { needsDisplay = true } }
     var followStatusText = "定位中" { didSet { needsDisplay = true } }
     var errorText: String? { didSet { needsDisplay = true } }
+    var taskProgress = TaskProgressSnapshot.reading {
+        didSet {
+            if taskProgress != oldValue {
+                needsDisplay = true
+                updateRunningArrowTimer()
+            }
+        }
+    }
+    var showsMarketPrices = initialMarketPricesEnabled {
+        didSet { needsDisplay = true }
+    }
     var btcPrice: Double? { didSet { needsDisplay = true } }
     var btcPriceDirection = 0 { didSet { needsDisplay = true } }
     var btcStatusText = "读取中…" { didSet { needsDisplay = true } }
@@ -779,6 +1719,7 @@ private final class QuotaPanelView: NSView {
     var isCollapsed = false {
         didSet {
             needsDisplay = true
+            updateRunningArrowTimer()
             window?.invalidateCursorRects(for: self)
             window?.invalidateShadow()
         }
@@ -786,6 +1727,8 @@ private final class QuotaPanelView: NSView {
     var onToggleCollapsed: (() -> Void)?
     private var hideButtonTrackingArea: NSTrackingArea?
     private var isHideButtonHovered = false
+    private var runningArrowTimer: Timer?
+    private var windowVisibilityObservers: [NSObjectProtocol] = []
 
     private lazy var backgroundImage: NSImage? = {
         guard let resourceURL = Bundle.main.resourceURL?
@@ -794,7 +1737,93 @@ private final class QuotaPanelView: NSView {
         return NSImage(contentsOf: resourceURL)
     }()
 
+    private lazy var completedTaskIcon: NSImage? = taskIcon(
+        named: "task-completed-icon.png"
+    )
+    private lazy var runningTaskIcon: NSImage? = taskIcon(
+        named: "task-running-icon.png"
+    )
+    private lazy var waitingTaskIcon: NSImage? = taskIcon(
+        named: "task-waiting-icon.png"
+    )
+    private lazy var failedTaskIcon: NSImage? = taskIcon(
+        named: "task-failed-icon.png"
+    )
+
+    private func taskIcon(named name: String) -> NSImage? {
+        guard let resourceURL = Bundle.main.resourceURL?
+            .appendingPathComponent(name)
+        else { return nil }
+        return NSImage(contentsOf: resourceURL)
+    }
+
     override var isFlipped: Bool { true }
+
+    deinit {
+        runningArrowTimer?.invalidate()
+        windowVisibilityObservers.forEach {
+            NotificationCenter.default.removeObserver($0)
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        windowVisibilityObservers.forEach {
+            NotificationCenter.default.removeObserver($0)
+        }
+        windowVisibilityObservers.removeAll()
+        if let window {
+            let center = NotificationCenter.default
+            windowVisibilityObservers.append(center.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                self?.updateRunningArrowTimer()
+            })
+        }
+        updateRunningArrowTimer()
+    }
+
+    private func updateRunningArrowTimer() {
+        let hasRunningTask = taskProgress.items.contains {
+            $0.kind == .running
+        }
+        let shouldAnimate = shouldAnimateRunningArrow(
+            isWindowVisible: window?.isVisible == true,
+            isCollapsed: isCollapsed,
+            hasRunningTask: hasRunningTask
+        )
+        if shouldAnimate, runningArrowTimer == nil {
+            let timer = Timer(
+                timeInterval: 1.0 / 30.0,
+                repeats: true
+            ) { [weak self] timer in
+                guard let self else {
+                    timer.invalidate()
+                    return
+                }
+                let remainsVisible = shouldAnimateRunningArrow(
+                    isWindowVisible: self.window?.isVisible == true,
+                    isCollapsed: self.isCollapsed,
+                    hasRunningTask: self.taskProgress.items.contains {
+                        $0.kind == .running
+                    }
+                )
+                guard remainsVisible else {
+                    timer.invalidate()
+                    self.runningArrowTimer = nil
+                    return
+                }
+                self.needsDisplay = true
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            runningArrowTimer = timer
+        } else if !shouldAnimate {
+            runningArrowTimer?.invalidate()
+            runningArrowTimer = nil
+        }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -926,7 +1955,25 @@ private final class QuotaPanelView: NSView {
             alignment: .right
         )
 
-        if marketPricesEnabled {
+        let taskItems = taskProgress.items.isEmpty
+            ? TaskProgressSnapshot.idle.items
+            : taskProgress.items
+        for (index, item) in taskItems.enumerated() {
+            drawTaskProgressItem(
+                item,
+                index: index,
+                y: bodyRect.minY + 100
+                    + CGFloat(index) * taskProgressRowHeight,
+                separatorY: bodyRect.minY + 93
+                    + CGFloat(index) * taskProgressRowHeight,
+                contentX: contentX,
+                contentWidth: contentWidth
+            )
+        }
+        let taskSectionHeight = taskProgressRowHeight
+            * CGFloat(max(1, taskItems.count))
+
+        if showsMarketPrices {
             drawMarketPriceRow(
                 symbol: "BTC/USDT",
                 iconText: "₿",
@@ -934,8 +1981,8 @@ private final class QuotaPanelView: NSView {
                 price: btcPrice,
                 direction: btcPriceDirection,
                 statusText: btcStatusText,
-                y: bodyRect.minY + 100,
-                separatorY: bodyRect.minY + 93,
+                y: bodyRect.minY + 100 + taskSectionHeight,
+                separatorY: bodyRect.minY + 93 + taskSectionHeight,
                 contentX: contentX,
                 contentWidth: contentWidth
             )
@@ -946,8 +1993,12 @@ private final class QuotaPanelView: NSView {
                 price: ethPrice,
                 direction: ethPriceDirection,
                 statusText: ethStatusText,
-                y: bodyRect.minY + 123,
-                separatorY: bodyRect.minY + 119,
+                y: bodyRect.minY + 100
+                    + taskSectionHeight
+                    + marketPriceRowHeight,
+                separatorY: bodyRect.minY + 93
+                    + taskSectionHeight
+                    + marketPriceRowHeight,
                 contentX: contentX,
                 contentWidth: contentWidth
             )
@@ -1124,6 +2175,193 @@ private final class QuotaPanelView: NSView {
         )
     }
 
+    private func drawTaskProgressItem(
+        _ item: TaskProgressItem,
+        index: Int,
+        y: CGFloat,
+        separatorY: CGFloat,
+        contentX: CGFloat,
+        contentWidth: CGFloat
+    ) {
+        let separator = NSBezierPath()
+        separator.move(to: NSPoint(x: contentX, y: separatorY))
+        separator.line(to: NSPoint(
+            x: contentX + contentWidth,
+            y: separatorY
+        ))
+        NSColor.white.withAlphaComponent(0.13).setStroke()
+        separator.lineWidth = 0.75
+        separator.stroke()
+
+        let color = taskProgressColor(for: item.kind)
+        let taskIcon: NSImage?
+        switch item.kind {
+        case .running:
+            taskIcon = runningTaskIcon
+        case .waitingForInput:
+            taskIcon = waitingTaskIcon
+        case .completed:
+            taskIcon = completedTaskIcon
+        case .failed:
+            taskIcon = failedTaskIcon
+        case .reading, .idle:
+            taskIcon = nil
+        }
+
+        let usesStatusIcon = taskIcon != nil
+        if let taskIcon {
+            let iconRect = NSRect(
+                x: contentX - 2,
+                y: y,
+                width: 20,
+                height: 15
+            )
+            taskIcon.draw(
+                in: iconRect,
+                from: NSRect(origin: .zero, size: taskIcon.size),
+                operation: .sourceOver,
+                fraction: 1,
+                respectFlipped: true,
+                hints: [.interpolation: NSImageInterpolation.high]
+            )
+            drawTaskStatusBadge(for: item.kind, iconRect: iconRect)
+        } else {
+            let dot = NSBezierPath(ovalIn: NSRect(
+                x: contentX,
+                y: y + 4,
+                width: 7,
+                height: 7
+            ))
+            color.setFill()
+            dot.fill()
+        }
+
+        let titleOffset: CGFloat = usesStatusIcon ? 22 : 13
+        let titleReservedWidth: CGFloat = usesStatusIcon ? 89 : 80
+        drawText(
+            item.title,
+            in: NSRect(
+                x: contentX + titleOffset,
+                y: y,
+                width: contentWidth - titleReservedWidth,
+                height: 15
+            ),
+            font: .systemFont(
+                ofSize: 9.4,
+                weight: index == 0 ? .semibold : .medium
+            ),
+            color: NSColor.white.withAlphaComponent(0.84)
+        )
+        drawText(
+            item.statusText,
+            in: NSRect(
+                x: contentX + contentWidth - 66,
+                y: y,
+                width: 66,
+                height: 15
+            ),
+            font: .systemFont(ofSize: 9.2, weight: .semibold),
+            color: color,
+            alignment: .right
+        )
+    }
+
+    private func drawTaskStatusBadge(
+        for kind: TaskProgressKind,
+        iconRect: NSRect
+    ) {
+        guard kind != .completed && kind != .failed else { return }
+
+        let badgeRect = NSRect(
+            x: iconRect.minX + 10.6,
+            y: iconRect.minY + 0.4,
+            width: 8.4,
+            height: 8.4
+        )
+        let badge = NSBezierPath(ovalIn: badgeRect)
+        switch kind {
+        case .running:
+            NSColor(
+                calibratedRed: 0.12,
+                green: 0.46,
+                blue: 0.96,
+                alpha: 1
+            ).setFill()
+            badge.fill()
+            drawRunningArrow(in: badgeRect)
+        case .waitingForInput:
+            NSColor(
+                calibratedRed: 1.0,
+                green: 0.76,
+                blue: 0.10,
+                alpha: 1
+            ).setFill()
+            badge.fill()
+            drawText(
+                "?",
+                in: badgeRect.offsetBy(dx: 0, dy: -0.4),
+                font: .systemFont(ofSize: 7.2, weight: .heavy),
+                color: .white,
+                alignment: .center
+            )
+        case .reading, .completed, .failed, .idle:
+            break
+        }
+    }
+
+    private func drawRunningArrow(in badgeRect: NSRect) {
+        let center = NSPoint(x: badgeRect.midX, y: badgeRect.midY)
+        let radius = badgeRect.width * 0.31
+        let progress = Date.timeIntervalSinceReferenceDate
+            .truncatingRemainder(dividingBy: 1.2) / 1.2
+        let rotation = CGFloat(progress) * 2 * .pi
+        let start: CGFloat = rotation - .pi * 0.40
+        let sweep: CGFloat = .pi * 1.56
+        let segments = 18
+        let arc = NSBezierPath()
+        for index in 0...segments {
+            let angle = start + sweep * CGFloat(index) / CGFloat(segments)
+            let point = NSPoint(
+                x: center.x + cos(angle) * radius,
+                y: center.y + sin(angle) * radius
+            )
+            if index == 0 {
+                arc.move(to: point)
+            } else {
+                arc.line(to: point)
+            }
+        }
+        NSColor.white.setStroke()
+        arc.lineWidth = 1.05
+        arc.lineCapStyle = .round
+        arc.stroke()
+
+        let end = start + sweep
+        let tip = NSPoint(
+            x: center.x + cos(end) * radius,
+            y: center.y + sin(end) * radius
+        )
+        let tangent = NSPoint(x: -sin(end), y: cos(end))
+        let normal = NSPoint(x: -tangent.y, y: tangent.x)
+        let base = NSPoint(
+            x: tip.x - tangent.x * 1.6,
+            y: tip.y - tangent.y * 1.6
+        )
+        let head = NSBezierPath()
+        head.move(to: tip)
+        head.line(to: NSPoint(
+            x: base.x + normal.x * 0.72,
+            y: base.y + normal.y * 0.72
+        ))
+        head.line(to: NSPoint(
+            x: base.x - normal.x * 0.72,
+            y: base.y - normal.y * 0.72
+        ))
+        head.close()
+        NSColor.white.setFill()
+        head.fill()
+    }
+
     private func drawMarketPriceRow(
         symbol: String,
         iconText: String,
@@ -1188,6 +2426,41 @@ private final class QuotaPanelView: NSView {
             color: NSColor.white.withAlphaComponent(0.54),
             alignment: .right
         )
+    }
+
+    private func taskProgressColor(for kind: TaskProgressKind) -> NSColor {
+        switch kind {
+        case .reading, .running:
+            return NSColor(
+                calibratedRed: 0.10,
+                green: 0.78,
+                blue: 1.0,
+                alpha: 1
+            )
+        case .waitingForInput:
+            return NSColor(
+                calibratedRed: 1.0,
+                green: 0.79,
+                blue: 0.18,
+                alpha: 1
+            )
+        case .completed:
+            return NSColor(
+                calibratedRed: 0.24,
+                green: 0.86,
+                blue: 0.58,
+                alpha: 1
+            )
+        case .failed:
+            return NSColor(
+                calibratedRed: 1.0,
+                green: 0.39,
+                blue: 0.43,
+                alpha: 1
+            )
+        case .idle:
+            return NSColor.white.withAlphaComponent(0.54)
+        }
     }
 
     private func marketPriceColor(direction: Int) -> NSColor {
@@ -1693,11 +2966,13 @@ private final class PetWindowLocator {
 
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let quotaClient = CodexQuotaClient()
+    private let taskProgressReader = CodexTaskProgressReader()
     private let btcPriceClient = MarketPriceClient(symbol: "BTCUSDT")
     private let ethPriceClient = MarketPriceClient(symbol: "ETHUSDT")
     private let locator = PetWindowLocator()
     private let healthWriter = RuntimeHealthWriter()
     private let quotaView = QuotaPanelView(frame: NSRect(origin: .zero, size: expandedPanelSize))
+    private var currentExpandedPanelSize = expandedPanelSize
     private var panel: NSPanel!
     private var statusItem: NSStatusItem?
     private let statusMenu = NSMenu()
@@ -1707,14 +2982,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let hidePanelMenuItem = NSMenuItem(title: "隐藏面板", action: #selector(hidePanelFromMenu(_:)), keyEquivalent: "")
     private let collapsePanelMenuItem = NSMenuItem(title: "折叠面板", action: #selector(toggleCollapsedFromMenu(_:)), keyEquivalent: "")
     private let refreshQuotaMenuItem = NSMenuItem(title: "立即刷新额度", action: #selector(refreshQuotaFromMenu(_:)), keyEquivalent: "r")
+    private let toggleMarketPricesMenuItem = NSMenuItem(
+        title: "显示行情列表",
+        action: #selector(toggleMarketPricesFromMenu(_:)),
+        keyEquivalent: ""
+    )
     private let resetFollowMenuItem = NSMenuItem(title: "重置跟随位置", action: #selector(resetFollowPositionFromMenu(_:)), keyEquivalent: "")
     private let openConfigMenuItem = NSMenuItem(title: "打开配置文件", action: #selector(openConfigFileFromMenu(_:)), keyEquivalent: ",")
     private var refreshTimer: Timer?
+    private var taskProgressTimer: Timer?
     private var btcRefreshTimer: Timer?
     private var followTimer: Timer?
     private var isRefreshing = false
+    private var isRefreshingTaskProgress = false
     private var isRefreshingBTCPrice = false
     private var isRefreshingETHPrice = false
+    private var showsMarketPrices = initialMarketPricesEnabled
     private var lastBTCPrice: Double?
     private var lastETHPrice: Double?
     private var codexConnectionStatus = "disconnected"
@@ -1731,10 +3014,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         reportPanelConfigWarnings()
         makeStatusItem()
         makePanel()
+        quotaView.showsMarketPrices = showsMarketPrices
         writeHealth(status: "started", panelVisible: false, locationSource: nil, force: true)
         followPet()
         refreshQuota()
-        if marketPricesEnabled {
+        refreshTaskProgress()
+        if showsMarketPrices {
             refreshBTCPrice()
             refreshETHPrice()
         }
@@ -1745,7 +3030,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         refreshTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
             self?.refreshQuota()
         }
-        if marketPricesEnabled {
+        taskProgressTimer = Timer.scheduledTimer(
+            withTimeInterval: taskProgressRefreshInterval,
+            repeats: true
+        ) { [weak self] _ in
+            self?.refreshTaskProgress()
+        }
+        if showsMarketPrices {
             btcRefreshTimer = Timer.scheduledTimer(withTimeInterval: btcRefreshInterval, repeats: true) { [weak self] _ in
                 self?.refreshBTCPrice()
                 self?.refreshETHPrice()
@@ -1755,6 +3046,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     func applicationWillTerminate(_ notification: Notification) {
         refreshTimer?.invalidate()
+        taskProgressTimer?.invalidate()
         btcRefreshTimer?.invalidate()
         followTimer?.invalidate()
         writeHealth(status: "terminated", panelVisible: false, locationSource: nil, force: true)
@@ -1779,6 +3071,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             hidePanelMenuItem,
             collapsePanelMenuItem,
             refreshQuotaMenuItem,
+            toggleMarketPricesMenuItem,
             resetFollowMenuItem,
             openConfigMenuItem,
         ] {
@@ -1821,7 +3114,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             isPanelVisible: panel?.isVisible ?? false,
             isPanelHiddenByUser: isPanelHiddenByUser,
             isCollapsed: quotaView.isCollapsed,
-            isRefreshing: isRefreshing
+            isRefreshing: isRefreshing,
+            showsMarketPrices: showsMarketPrices
         )
         let signature = [
             codexTitle,
@@ -1830,6 +3124,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             String(controlState.hidePanelEnabled),
             controlState.collapseTitle,
             String(controlState.refreshQuotaEnabled),
+            String(controlState.marketPricesEnabled),
         ].joined(separator: "|")
 
         if force || signature != lastStatusMenuSignature {
@@ -1839,6 +3134,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             hidePanelMenuItem.isEnabled = controlState.hidePanelEnabled
             collapsePanelMenuItem.title = controlState.collapseTitle
             refreshQuotaMenuItem.isEnabled = controlState.refreshQuotaEnabled
+            toggleMarketPricesMenuItem.state = controlState.marketPricesEnabled
+                ? .on
+                : .off
             lastStatusMenuSignature = signature
         }
         updateStatusBarIcon()
@@ -1869,7 +3167,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func makePanel() {
         panel = NSPanel(
-            contentRect: NSRect(origin: .zero, size: expandedPanelSize),
+            contentRect: NSRect(origin: .zero, size: currentExpandedPanelSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -1901,7 +3199,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             return
         }
         quotaView.isCollapsed = isCollapsed
-        panel.setContentSize(quotaView.isCollapsed ? collapsedPanelSize : expandedPanelSize)
+        panel.setContentSize(
+            quotaView.isCollapsed
+                ? collapsedPanelSize
+                : currentExpandedPanelSize
+        )
         panel.invalidateShadow()
         if !isPanelHiddenByUser {
             followPet(forceStandaloneFallback: isManualStandaloneEnabled)
@@ -1936,6 +3238,56 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func refreshQuotaFromMenu(_ sender: Any?) {
         refreshQuota()
         updateStatusMenu()
+    }
+
+    @objc private func toggleMarketPricesFromMenu(_ sender: Any?) {
+        setMarketPricesEnabled(!showsMarketPrices)
+    }
+
+    private func setMarketPricesEnabled(_ enabled: Bool) {
+        guard showsMarketPrices != enabled else {
+            updateStatusMenu()
+            return
+        }
+
+        showsMarketPrices = enabled
+        UserDefaults.standard.set(enabled, forKey: marketPricesPreferenceKey)
+        quotaView.showsMarketPrices = enabled
+
+        if enabled {
+            refreshBTCPrice()
+            refreshETHPrice()
+            if btcRefreshTimer == nil {
+                btcRefreshTimer = Timer.scheduledTimer(
+                    withTimeInterval: btcRefreshInterval,
+                    repeats: true
+                ) { [weak self] _ in
+                    self?.refreshBTCPrice()
+                    self?.refreshETHPrice()
+                }
+            }
+        } else {
+            btcRefreshTimer?.invalidate()
+            btcRefreshTimer = nil
+        }
+
+        currentExpandedPanelSize = panelSizeForTaskRows(
+            quotaView.taskProgress.rowCount,
+            showsMarketPrices: enabled
+        )
+        if !quotaView.isCollapsed {
+            panel.setContentSize(currentExpandedPanelSize)
+        }
+        if !isPanelHiddenByUser {
+            followPet(forceStandaloneFallback: isManualStandaloneEnabled)
+        }
+        writeHealth(
+            status: enabled ? "market-prices-shown" : "market-prices-hidden",
+            panelVisible: panel.isVisible,
+            locationSource: lastLocationSource,
+            force: true
+        )
+        updateStatusMenu(force: true)
     }
 
     @objc private func resetFollowPositionFromMenu(_ sender: Any?) {
@@ -1996,7 +3348,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         quotaView.followStatusText = "跟随中"
         followHealthStatus = "following-pet"
         lastLocationSource = pet.source
-        let currentPanelSize = quotaView.isCollapsed ? collapsedPanelSize : expandedPanelSize
+        let currentPanelSize = quotaView.isCollapsed
+            ? collapsedPanelSize
+            : currentExpandedPanelSize
         let placement = panelPlacement(
             petVisibleRect: pet.visibleRect,
             panelSize: currentPanelSize,
@@ -2042,7 +3396,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         guard let screen else { return }
 
         let visible = screen.visibleFrame
-        let currentPanelSize = quotaView.isCollapsed ? collapsedPanelSize : expandedPanelSize
+        let currentPanelSize = quotaView.isCollapsed
+            ? collapsedPanelSize
+            : currentExpandedPanelSize
         let origin = NSPoint(
             x: (visible.maxX - currentPanelSize.width - 24).rounded(),
             y: (visible.maxY - currentPanelSize.height - 24).rounded()
@@ -2069,6 +3425,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         updateStatusMenu()
 
         quotaClient.fetch { [weak self] result in
+            let errorText: String?
+            if case .failure(let error) = result {
+                errorText = quotaErrorDisplayText(error) {
+                    CodexConfigurationReader.modelProvider(
+                        at: codexConfigurationURL()
+                    )
+                }
+            } else {
+                errorText = nil
+            }
+
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isRefreshing = false
@@ -2084,10 +3451,42 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 case .failure(let error):
                     self.codexConnectionStatus = "disconnected"
                     self.quotaView.codexConnectionText = "未连接"
-                    self.quotaView.errorText = error.localizedDescription
+                    self.quotaView.errorText = errorText
+                        ?? error.localizedDescription
                     self.quotaView.statusText = "重试中"
                 }
                 self.updateStatusMenu()
+            }
+        }
+    }
+
+    private func refreshTaskProgress() {
+        guard !isRefreshingTaskProgress else { return }
+        isRefreshingTaskProgress = true
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let snapshot = self.taskProgressReader.read()
+            DispatchQueue.main.async {
+                self.isRefreshingTaskProgress = false
+                self.quotaView.taskProgress = snapshot
+                let nextSize = panelSizeForTaskRows(
+                    snapshot.rowCount,
+                    showsMarketPrices: self.showsMarketPrices
+                )
+                guard nextSize != self.currentExpandedPanelSize else {
+                    return
+                }
+
+                self.currentExpandedPanelSize = nextSize
+                if !self.quotaView.isCollapsed {
+                    self.panel.setContentSize(nextSize)
+                }
+                if !self.isPanelHiddenByUser {
+                    self.followPet(
+                        forceStandaloneFallback: self.isManualStandaloneEnabled
+                    )
+                }
             }
         }
     }
@@ -2106,6 +3505,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             locationSource: locationSource,
             codexConnectionStatus: codexConnectionStatus,
             followStatus: followHealthStatus,
+            marketPricesEnabled: showsMarketPrices,
+            panelHeight: currentExpandedPanelSize.height,
             gap: gap,
             centerError: centerError,
             force: force
@@ -2113,13 +3514,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func refreshBTCPrice() {
-        guard !isRefreshingBTCPrice else { return }
+        guard showsMarketPrices, !isRefreshingBTCPrice else { return }
         isRefreshingBTCPrice = true
 
         btcPriceClient.fetch { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isRefreshingBTCPrice = false
+                guard self.showsMarketPrices else { return }
                 switch result {
                 case .success(let price):
                     if let previousPrice = self.lastBTCPrice {
@@ -2138,13 +3540,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func refreshETHPrice() {
-        guard !isRefreshingETHPrice else { return }
+        guard showsMarketPrices, !isRefreshingETHPrice else { return }
         isRefreshingETHPrice = true
 
         ethPriceClient.fetch { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isRefreshingETHPrice = false
+                guard self.showsMarketPrices else { return }
                 switch result {
                 case .success(let price):
                     if let previousPrice = self.lastETHPrice {
@@ -2241,7 +3644,7 @@ private func printPanelConfiguration() -> Never {
         "panel-config: version=\(panelVersion) "
             + "bundle=\(panelBundleIdentifier) "
             + "theme=\(panelConfig.theme.id) "
-            + "marketPricesEnabled=\(marketPricesEnabled) "
+            + "marketPricesEnabled=\(initialMarketPricesEnabled) "
             + "codexConnection=\(panelConfig.widgets.codexConnection) "
             + "followStatus=\(panelConfig.widgets.followStatus) "
             + "width=\(Int(expandedPanelSize.width)) "
@@ -2256,19 +3659,22 @@ private func runMenuControlsSelfTest() -> Never {
         isPanelVisible: true,
         isPanelHiddenByUser: false,
         isCollapsed: false,
-        isRefreshing: false
+        isRefreshing: false,
+        showsMarketPrices: true
     )
     let hiddenState = panelMenuControlState(
         isPanelVisible: false,
         isPanelHiddenByUser: true,
         isCollapsed: false,
-        isRefreshing: false
+        isRefreshing: false,
+        showsMarketPrices: false
     )
     let refreshingState = panelMenuControlState(
         isPanelVisible: true,
         isPanelHiddenByUser: false,
         isCollapsed: true,
-        isRefreshing: true
+        isRefreshing: true,
+        showsMarketPrices: true
     )
     let checks = [
         statusBarSymbolName(for: menuBarDisplayState(
@@ -2297,20 +3703,35 @@ private func runMenuControlsSelfTest() -> Never {
             showPanelEnabled: false,
             hidePanelEnabled: true,
             collapseTitle: "折叠面板",
-            refreshQuotaEnabled: true
+            refreshQuotaEnabled: true,
+            marketPricesEnabled: true
         ),
         hiddenState == PanelMenuControlState(
             showPanelEnabled: true,
             hidePanelEnabled: false,
             collapseTitle: "折叠面板",
-            refreshQuotaEnabled: true
+            refreshQuotaEnabled: true,
+            marketPricesEnabled: false
         ),
         refreshingState == PanelMenuControlState(
             showPanelEnabled: false,
             hidePanelEnabled: true,
             collapseTitle: "展开面板",
-            refreshQuotaEnabled: false
+            refreshQuotaEnabled: false,
+            marketPricesEnabled: true
         ),
+        resolvedMarketPricesEnabled(
+            storedValue: nil,
+            configuredDefault: false
+        ) == false,
+        resolvedMarketPricesEnabled(
+            storedValue: true,
+            configuredDefault: false
+        ) == true,
+        resolvedMarketPricesEnabled(
+            storedValue: false,
+            configuredDefault: true
+        ) == false,
         panelConfigFileURL.path.hasSuffix("default-panel-config.json")
             || panelConfigFileURL.path.hasSuffix("/panel-config.json"),
         editablePanelConfigFileURL.path.hasSuffix("/panel-config.json"),
@@ -2455,11 +3876,441 @@ private func runPlacementSelfTest() -> Never {
     exit(0)
 }
 
+private func runTaskProgressSelfTest() -> Never {
+    let now = Date()
+    let started = #"{"type":"event_msg","payload":{"type":"task_started"}}"#
+    let completed = #"{"type":"event_msg","payload":{"type":"task_complete"}}"#
+    let failed = #"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
+    let request = #"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call-1"}}"#
+    let response = #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1"}}"#
+    let lifecycleCases: [(String, [String], Date, TaskProgressKind)] = [
+        ("running", [started], now, .running),
+        ("waiting", [started, request], now, .waitingForInput),
+        ("resumed", [started, request, response], now, .running),
+        ("completed", [started, completed], now, .completed),
+        ("failed", [started, failed], now, .failed),
+        ("fresh-tail-fallback", [], now, .running),
+        ("idle", [], now.addingTimeInterval(-31 * 60), .idle),
+    ]
+
+    for test in lifecycleCases {
+        let result = CodexTaskProgressReader.parse(
+            lines: test.1,
+            modificationDate: test.2,
+            now: now
+        )
+        guard result.kind == test.3 else {
+            fputs("task progress case \(test.0) failed: \(result.kind.rawValue)\n", stderr)
+            exit(1)
+        }
+    }
+
+    let titledUserMessage = ##"{"type":"event_msg","payload":{"type":"user_message","message":"# Files mentioned by the user:\n/a.png\n## My request for Codex:\n列出具体任务名称"}}"##
+    let titled = CodexTaskProgressReader.parse(
+        lines: [titledUserMessage, started],
+        modificationDate: now,
+        now: now
+    )
+    guard titled.items.first?.title == "列出具体任务名称" else {
+        fputs("task title extraction failed\n", stderr)
+        exit(1)
+    }
+
+    let threadID = "12345678-1234-4abc-8def-1234567890ab"
+    let rolloutURL = URL(fileURLWithPath: "/tmp/rollout-2026-07-16T16-52-47-\(threadID).jsonl")
+    guard CodexTaskProgressReader.resolvedTitle(
+        for: rolloutURL,
+        indexedTitles: [threadID: "正式任务名称"],
+        fallback: "Codex 任务"
+    ) == "正式任务名称"
+    else {
+        fputs("task index title mapping failed\n", stderr)
+        exit(1)
+    }
+
+    let unreadState = CodexTaskProgressReader.UnreadThreadState(ids: [threadID], isAvailable: true)
+    let readState = CodexTaskProgressReader.UnreadThreadState(ids: [], isAvailable: true)
+    let unavailableState = CodexTaskProgressReader.UnreadThreadState(ids: [], isAvailable: false)
+    let visibilityChecks = [
+        CodexTaskProgressReader.shouldDisplay(
+            kind: .completed,
+            threadID: threadID,
+            modificationDate: now.addingTimeInterval(-3600),
+            now: now,
+            unreadState: unreadState
+        ),
+        !CodexTaskProgressReader.shouldDisplay(
+            kind: .completed,
+            threadID: threadID,
+            modificationDate: now,
+            now: now,
+            unreadState: readState
+        ),
+        CodexTaskProgressReader.shouldDisplay(
+            kind: .failed,
+            threadID: threadID,
+            modificationDate: now,
+            now: now,
+            unreadState: unavailableState,
+            fallbackVisibility: 120
+        ),
+    ]
+    guard visibilityChecks.allSatisfy({ $0 }) else {
+        fputs("completed task filtering failed\n", stderr)
+        exit(1)
+    }
+
+    let userMetadata = #"{"type":"session_meta","payload":{"thread_source":"user","source":{"cli":{}}}}"#
+    let subagentMetadata = #"{"type":"session_meta","payload":{"thread_source":"subagent","source":{"subagent":{"thread_spawn":{}}}}}"#
+    let automationMetadata = #"{"type":"session_meta","payload":{"thread_source":"automation","source":"vscode"}}"#
+    guard CodexTaskProgressReader.isUserVisibleSessionMetadata(line: userMetadata),
+          !CodexTaskProgressReader.isUserVisibleSessionMetadata(line: subagentMetadata),
+          !CodexTaskProgressReader.isUserVisibleSessionMetadata(line: automationMetadata)
+    else {
+        fputs("task non-user session filtering failed\n", stderr)
+        exit(1)
+    }
+
+    let truncated = TaskProgressSnapshot.displaying((0..<7).map { index in
+        TaskProgressItem(title: "任务 \(index + 1)", kind: .running, startedAt: now)
+    })
+    let sameTitleThreads = TaskProgressSnapshot.displaying([
+        TaskProgressItem(title: "相同任务", kind: .running, startedAt: now),
+        TaskProgressItem(title: "  相同任务  ", kind: .completed, startedAt: now),
+    ])
+    guard truncated.items.count == maximumVisibleTaskRows,
+          truncated.items.last?.title == "任务 5",
+          sameTitleThreads.items.count == 2
+    else {
+        fputs("task list truncation or same-title thread display failed\n", stderr)
+        exit(1)
+    }
+
+    let oneTaskWithoutMarket = panelSizeForTaskRows(1, showsMarketPrices: false)
+    let threeTasksWithMarket = panelSizeForTaskRows(3, showsMarketPrices: true)
+    guard abs(
+        threeTasksWithMarket.height - oneTaskWithoutMarket.height
+            - taskProgressRowHeight * 2
+            - marketPriceRowHeight * 2
+    ) <= 0.01 else {
+        fputs("dynamic panel height failed\n", stderr)
+        exit(1)
+    }
+
+    let animationChecks = [
+        shouldAnimateRunningArrow(
+            isWindowVisible: true,
+            isCollapsed: false,
+            hasRunningTask: true
+        ),
+        !shouldAnimateRunningArrow(
+            isWindowVisible: false,
+            isCollapsed: false,
+            hasRunningTask: true
+        ),
+        !shouldAnimateRunningArrow(
+            isWindowVisible: true,
+            isCollapsed: true,
+            hasRunningTask: true
+        ),
+        !shouldAnimateRunningArrow(
+            isWindowVisible: true,
+            isCollapsed: false,
+            hasRunningTask: false
+        ),
+    ]
+    guard animationChecks.allSatisfy({ $0 }) else {
+        fputs("running task animation lifecycle failed\n", stderr)
+        exit(1)
+    }
+
+    let taskIconNames = [
+        "task-running-icon.png",
+        "task-waiting-icon.png",
+        "task-completed-icon.png",
+        "task-failed-icon.png",
+    ]
+    guard let resourceURL = Bundle.main.resourceURL,
+          taskIconNames.allSatisfy({
+              NSImage(contentsOf: resourceURL.appendingPathComponent($0)) != nil
+          })
+    else {
+        fputs("task status icon assets failed\n", stderr)
+        exit(1)
+    }
+
+    let fixtureDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "codex-status-panel-tasks-\(UUID().uuidString)",
+            isDirectory: true
+        )
+    func fixtureSessionDirectory(for date: Date) -> URL {
+        let components = Calendar(identifier: .gregorian).dateComponents(
+            [.year, .month, .day],
+            from: date
+        )
+        return fixtureDirectory.appendingPathComponent(
+            String(
+                format: "sessions/%04d/%02d/%02d",
+                components.year ?? 0,
+                components.month ?? 0,
+                components.day ?? 0
+            ),
+            isDirectory: true
+        )
+    }
+    let sessionsDirectory = fixtureSessionDirectory(for: now)
+    let staleSessionsDirectory = fixtureSessionDirectory(
+        for: now.addingTimeInterval(-7 * 24 * 60 * 60)
+    )
+    let freshRollout = sessionsDirectory.appendingPathComponent(
+        "rollout-2026-07-23T12-00-00-11111111-1111-4111-8111-111111111111.jsonl"
+    )
+    let longRunningRollout = sessionsDirectory.appendingPathComponent(
+        "rollout-2026-07-23T10-00-00-22222222-2222-4222-8222-222222222222.jsonl"
+    )
+    let partialMetadataRollout = sessionsDirectory.appendingPathComponent(
+        "rollout-2026-07-23T12-01-00-33333333-3333-4333-8333-333333333333.jsonl"
+    )
+    let staleRollout = staleSessionsDirectory.appendingPathComponent(
+        "rollout-2026-07-16T12-00-00-55555555-5555-4555-8555-555555555555.jsonl"
+    )
+    let metadata = #"{"type":"session_meta","payload":{"thread_source":"user","source":{"cli":{}}}}"#
+    let freshTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"缓存刷新任务"}}"#
+    let longTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"长时间任务"}}"#
+    let recoveredTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"恢复后的任务"}}"#
+    let staleTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"历史异常残留"}}"#
+    let unreadStateURL = fixtureDirectory.appendingPathComponent(
+        ".codex-global-state.json"
+    )
+    let readStateJSON = #"{"electron-persisted-atom-state":{"unread-thread-ids-by-host-v1":{"local":["11111111-1111-4111-8111-111111111111"]}}}"#
+    let previousCodexHome = ProcessInfo.processInfo.environment["CODEX_HOME"]
+    var integrationFailures: [String] = []
+
+    do {
+        try FileManager.default.createDirectory(
+            at: sessionsDirectory,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: staleSessionsDirectory,
+            withIntermediateDirectories: true
+        )
+        try Data("\(metadata)\n\(freshTitle)\n\(started)\n".utf8)
+            .write(to: freshRollout)
+        try Data("\(metadata)\n\(longTitle)\n\(started)\n".utf8)
+            .write(to: longRunningRollout)
+        try Data("{\"type\":\"session_me".utf8)
+            .write(to: partialMetadataRollout)
+        try Data("\(metadata)\n\(staleTitle)\n\(started)\n".utf8)
+            .write(to: staleRollout)
+        try Data(readStateJSON.utf8).write(to: unreadStateURL)
+        for index in 0..<13 {
+            let suffix = String(format: "%012d", index + 1)
+            let terminalURL = sessionsDirectory.appendingPathComponent(
+                "rollout-2026-07-23T11-\(String(format: "%02d", index))-00-"
+                    + "44444444-4444-4444-8444-\(suffix).jsonl"
+            )
+            let terminalTitle =
+                #"{"type":"event_msg","payload":{"type":"user_message","message":"已读终态 "#
+                + "\(index + 1)"
+                + #""}}"#
+            try Data(
+                "\(metadata)\n\(terminalTitle)\n\(started)\n\(completed)\n".utf8
+            ).write(to: terminalURL)
+        }
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-45 * 60)],
+            ofItemAtPath: longRunningRollout.path
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-7 * 24 * 60 * 60)],
+            ofItemAtPath: staleRollout.path
+        )
+
+        setenv("CODEX_HOME", fixtureDirectory.path, 1)
+        let reader = CodexTaskProgressReader()
+        let initial = reader.read(at: now)
+        if !initial.items.contains(where: {
+            $0.title == "长时间任务" && $0.kind == .running
+        }) {
+            integrationFailures.append("long-running")
+        }
+        if initial.items.contains(where: { $0.title == "Codex 任务" }) {
+            integrationFailures.append("partial-metadata-hidden")
+        }
+        if initial.items.contains(where: { $0.title.hasPrefix("已读终态") }) {
+            integrationFailures.append("read-terminal-filtering")
+        }
+        if initial.items.contains(where: { $0.title == "历史异常残留" }) {
+            integrationFailures.append("stale-running-hidden")
+        }
+
+        try Data("\(metadata)\n\(freshTitle)\n\(started)\n\(completed)\n".utf8)
+            .write(to: freshRollout)
+        try Data("\(metadata)\n\(recoveredTitle)\n\(started)\n".utf8)
+            .write(to: partialMetadataRollout)
+        let updatedDate = Date().addingTimeInterval(1)
+        try FileManager.default.setAttributes(
+            [.modificationDate: updatedDate],
+            ofItemAtPath: freshRollout.path
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: updatedDate],
+            ofItemAtPath: partialMetadataRollout.path
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-8 * 60 * 60)],
+            ofItemAtPath: longRunningRollout.path
+        )
+
+        let refreshed = reader.read(
+            at: now.addingTimeInterval(taskProgressRefreshInterval + 0.1)
+        )
+        if !refreshed.items.contains(where: {
+            $0.title == "缓存刷新任务" && $0.kind == .completed
+        }) {
+            integrationFailures.append("cached-mtime-refresh")
+        }
+        if !refreshed.items.contains(where: {
+            $0.title == "恢复后的任务" && $0.kind == .running
+        }) {
+            integrationFailures.append("partial-metadata-retry")
+        }
+        if !refreshed.items.contains(where: {
+            $0.title == "长时间任务" && $0.kind == .running
+        }) {
+            integrationFailures.append("tracked-running-retained")
+        }
+    } catch {
+        integrationFailures.append("fixture: \(error.localizedDescription)")
+    }
+
+    if let previousCodexHome {
+        setenv("CODEX_HOME", previousCodexHome, 1)
+    } else {
+        unsetenv("CODEX_HOME")
+    }
+    try? FileManager.default.removeItem(at: fixtureDirectory)
+
+    guard integrationFailures.isEmpty else {
+        fputs(
+            "task progress integration failed: "
+                + integrationFailures.joined(separator: ", ")
+                + "\n",
+            stderr
+        )
+        exit(1)
+    }
+
+    print("task-progress-self-test: lifecycle=7/7; title=pass; visibility=pass; filtering=pass; integration=7/7; animation=4/4; list=pass; layout=pass; icons=4/4")
+    exit(0)
+}
+
+private func runAuthenticationFallbackSelfTest() -> Never {
+    let fixtureDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "codex-status-panel-auth-\(UUID().uuidString)",
+            isDirectory: true
+        )
+    let fixtureURL = fixtureDirectory.appendingPathComponent("config.toml")
+
+    let doubleQuoted = """
+    model_provider = "sub2api"
+    model = "gpt-5.4"
+    [features]
+    test = true
+    """
+    let singleQuoted = """
+      model_provider='custom-provider' # active provider
+    [model_providers.custom-provider]
+    name = "Custom"
+    """
+    let nestedOnly = """
+    [model_providers.custom-provider]
+    model_provider = "nested-value"
+    """
+    let arrayBeforeProvider = """
+    allowed_models = [
+      "gpt-5.4",
+    ]
+    model_provider = "array-safe-provider"
+    """
+
+    do {
+        try FileManager.default.createDirectory(
+            at: fixtureDirectory,
+            withIntermediateDirectories: true
+        )
+        try Data(doubleQuoted.utf8).write(to: fixtureURL, options: .atomic)
+    } catch {
+        try? FileManager.default.removeItem(at: fixtureDirectory)
+        fputs("authentication fixture setup failed: \(error)\n", stderr)
+        exit(1)
+    }
+
+    var unexpectedConfigurationReads = 0
+    let nonAuthenticationText = quotaErrorDisplayText(
+        QuotaClientError.noResponse
+    ) {
+        unexpectedConfigurationReads += 1
+        return "must-not-be-read"
+    }
+    let authenticationText = quotaErrorDisplayText(
+        QuotaClientError.authentication("chatgpt authentication required")
+    ) {
+        "sub2api"
+    }
+    let checks = [
+        CodexConfigurationReader.modelProvider(from: doubleQuoted) == "sub2api",
+        CodexConfigurationReader.modelProvider(from: singleQuoted)
+            == "custom-provider",
+        CodexConfigurationReader.modelProvider(from: nestedOnly) == nil,
+        CodexConfigurationReader.modelProvider(from: arrayBeforeProvider)
+            == "array-safe-provider",
+        CodexConfigurationReader.modelProvider(at: fixtureURL) == "sub2api",
+        authenticationText == "model_provider: sub2api",
+        quotaErrorDisplayText(
+            "ChatGPT Authentication token missing",
+            modelProvider: nil
+        ) == "Codex 未登录或认证已失效",
+        nonAuthenticationText == "Codex 暂未返回额度数据",
+        unexpectedConfigurationReads == 0,
+    ]
+
+    try? FileManager.default.removeItem(at: fixtureDirectory)
+    guard checks.allSatisfy({ $0 }) else {
+        fputs("authentication-fallback-self-test: failed\n", stderr)
+        exit(1)
+    }
+    print("authentication-fallback-self-test: parser=5/5; presentation=3/3; minimal-read=pass")
+    exit(0)
+}
+
 private func renderPreviewOnce(to outputPath: String, collapsed: Bool) -> Never {
-    let previewSize = collapsed ? collapsedPanelSize : expandedPanelSize
+    let previewTaskProgress = TaskProgressSnapshot(items: [
+        TaskProgressItem(
+            title: "web3+ai科普视频",
+            kind: .running,
+            startedAt: Date()
+        ),
+        TaskProgressItem(
+            title: "蓝色卜卜宠物",
+            kind: .completed,
+            startedAt: Date()
+        ),
+    ])
+    let previewSize = collapsed
+        ? collapsedPanelSize
+        : panelSizeForTaskRows(
+            previewTaskProgress.rowCount,
+            showsMarketPrices: true
+        )
     let view = QuotaPanelView(frame: NSRect(origin: .zero, size: previewSize))
     view.pointerSide = .bottom
     view.isCollapsed = collapsed
+    view.showsMarketPrices = true
+    view.taskProgress = previewTaskProgress
     view.rows = [QuotaRow(
         name: "Codex",
         remainingPercent: 94,
@@ -2519,6 +4370,8 @@ let cliFlags: Set<String> = [
     "--print-saved-panel-location",
     "--self-test-placement",
     "--self-test-menu-controls",
+    "--self-test-task-progress",
+    "--self-test-authentication-fallback",
     "--print-panel-config",
     "--render-preview",
 ]
@@ -2552,6 +4405,14 @@ if CommandLine.arguments.contains("--self-test-placement") {
 
 if CommandLine.arguments.contains("--self-test-menu-controls") {
     runMenuControlsSelfTest()
+}
+
+if CommandLine.arguments.contains("--self-test-task-progress") {
+    runTaskProgressSelfTest()
+}
+
+if CommandLine.arguments.contains("--self-test-authentication-fallback") {
+    runAuthenticationFallbackSelfTest()
 }
 
 if CommandLine.arguments.contains("--print-panel-config") {

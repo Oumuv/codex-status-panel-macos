@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="${0:A:h:h}"
-VERSION="1.2.0"
+VERSION="1.2.1"
 STAGE_ROOT="$ROOT/build/release"
 STAGE="$STAGE_ROOT/Codex状态面板-macOS"
 OUT="$ROOT/dist/Codex-Status-Panel-macOS-Universal-v$VERSION.zip"

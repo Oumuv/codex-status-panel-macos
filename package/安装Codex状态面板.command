@@ -17,7 +17,7 @@ HEALTH_DIR="$HOME/Library/Caches/io.github.mayday-materials.codex-status-panel"
 HEALTH_PATH="$HEALTH_DIR/panel-health.json"
 USER_ID="$(/usr/bin/id -u)"
 DOMAIN="gui/$USER_ID"
-PANEL_VERSION="1.2.0"
+PANEL_VERSION="1.2.1"
 
 pause_before_exit() {
   if [[ -t 0 ]]; then
@@ -47,7 +47,7 @@ panel_service_has_pid() {
 panel_health_is_current() {
   [[ -s "$HEALTH_PATH" ]] \
     && /usr/bin/grep -q '"version":"'"$PANEL_VERSION"'"' "$HEALTH_PATH" 2>/dev/null \
-    && /usr/bin/grep -q '"marketPricesEnabled":false' "$HEALTH_PATH" 2>/dev/null
+    && /usr/bin/grep -Eq '"marketPricesEnabled":(true|false)' "$HEALTH_PATH" 2>/dev/null
 }
 
 wait_for_panel_health() {

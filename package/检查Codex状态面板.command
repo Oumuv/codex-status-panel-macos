@@ -28,11 +28,13 @@ check "面板签名正常" '[[ -d "$APP" ]] && /usr/bin/codesign --verify --deep
 check "登录启动项存在" '[[ -f "$PLIST" ]]'
 check "登录启动项格式正常" '[[ -f "$PLIST" ]] && /usr/bin/plutil -lint "$PLIST" >/dev/null'
 check "面板进程正在运行" '/bin/launchctl print "$DOMAIN/$LABEL" 2>/dev/null | /usr/bin/grep -Eq "^[[:space:]]*pid = [0-9]+"'
-check "健康状态版本正确" '[[ -s "$HEALTH" ]] && /usr/bin/grep -q '"'"'"version":"1.2.0"'"'"' "$HEALTH"'
-check "行情默认关闭" '[[ -s "$HEALTH" ]] && /usr/bin/grep -q '"'"'"marketPricesEnabled":false'"'"' "$HEALTH"'
+check "健康状态版本正确" '[[ -s "$HEALTH" ]] && /usr/bin/grep -q '"'"'"version":"1.2.1"'"'"' "$HEALTH"'
+check "行情开关状态可读" '[[ -s "$HEALTH" ]] && /usr/bin/grep -Eq '"'"'"marketPricesEnabled":(true|false)'"'"' "$HEALTH"'
 check "配置打印正常" '[[ -x "$BIN" ]] && "$BIN" --print-panel-config >/dev/null'
 check "跟随定位自测正常" '[[ -x "$BIN" ]] && "$BIN" --self-test-placement >/dev/null'
 check "菜单控制自测正常" '[[ -x "$BIN" ]] && "$BIN" --self-test-menu-controls >/dev/null'
+check "任务进度自测正常" '[[ -x "$BIN" ]] && "$BIN" --self-test-task-progress >/dev/null'
+check "认证回退自测正常" '[[ -x "$BIN" ]] && "$BIN" --self-test-authentication-fallback >/dev/null'
 check "正常退出不会立即重启" '[[ -f "$PLIST" ]] && [[ "$(/usr/bin/plutil -extract KeepAlive.SuccessfulExit raw "$PLIST" 2>/dev/null)" == "false" ]]'
 
 if [[ -s "$HEALTH" ]]; then
