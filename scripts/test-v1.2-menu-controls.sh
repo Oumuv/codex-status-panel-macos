@@ -5,7 +5,7 @@ ROOT="${0:A:h:h}"
 BIN="$ROOT/build/Codex 状态面板.app/Contents/MacOS/CodexStatusPanel"
 PLIST="$ROOT/Resources/io.github.mayday-materials.codex-status-panel.plist.in"
 INFO_PLIST="$ROOT/Resources/Info.plist"
-SOURCE="$ROOT/Sources/CodexStatusPanel/main.swift"
+SOURCE_DIR="$ROOT/Sources/CodexStatusPanel"
 INSTALLER="$ROOT/package/安装Codex状态面板.command"
 CHECKER="$ROOT/package/检查Codex状态面板.command"
 TMP_HOME="$(mktemp -d)"
@@ -52,8 +52,8 @@ if [[ "$PREVIEW_USAGE_STATUS" -eq 0 ]] \
   exit 1
 fi
 echo "检查面板折叠文案..."
-/usr/bin/grep -q '"折叠"' "$SOURCE"
-if /usr/bin/grep -q '"隐藏"' "$SOURCE"; then
+/usr/bin/grep -R -q --include='*.swift' '"折叠"' "$SOURCE_DIR"
+if /usr/bin/grep -R -q --include='*.swift' '"隐藏"' "$SOURCE_DIR"; then
   echo '面板内仍存在“隐藏”文案' >&2
   exit 1
 fi

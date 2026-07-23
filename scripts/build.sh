@@ -9,6 +9,7 @@ RESOURCES="$CONTENTS/Resources"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 SDK="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)"
+SWIFT_SOURCES=("$ROOT"/Sources/CodexStatusPanel/*.swift)
 
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RESOURCES"
@@ -32,7 +33,7 @@ for ARCH in arm64 x86_64; do
     -sdk "$SDK" \
     -framework AppKit \
     -framework CoreGraphics \
-    "$ROOT/Sources/CodexStatusPanel/main.swift" \
+    "${SWIFT_SOURCES[@]}" \
     -o "$TMP_DIR/CodexStatusPanel-$ARCH"
 done
 

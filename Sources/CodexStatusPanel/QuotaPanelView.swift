@@ -1,0 +1,865 @@
+// 面板的 AppKit 自绘视图。
+// 数据由 AppDelegate 写入模块内可见属性；属性的 didSet 会触发重绘或更新任务动画计时器。
+
+import AppKit
+import Foundation
+
+final class QuotaPanelView: NSView {
+    // didSet 是属性观察器：属性被赋新值后自动执行，用于通知 AppKit 重新绘制。
+    var rows: [QuotaRow] = [] { didSet { needsDisplay = true } }
+    var statusText = "正在读取额度…" { didSet { needsDisplay = true } }
+    var codexConnectionText = "连接中" { didSet { needsDisplay = true } }
+    var followStatusText = "定位中" { didSet { needsDisplay = true } }
+    var errorText: String? { didSet { needsDisplay = true } }
+    var taskProgress = TaskProgressSnapshot.reading {
+        didSet {
+            if taskProgress != oldValue {
+                needsDisplay = true
+                updateRunningArrowTimer()
+            }
+        }
+    }
+    var showsMarketPrices = initialMarketPricesEnabled {
+        didSet { needsDisplay = true }
+    }
+    var btcPrice: Double? { didSet { needsDisplay = true } }
+    var btcPriceDirection = 0 { didSet { needsDisplay = true } }
+    var btcStatusText = "读取中…" { didSet { needsDisplay = true } }
+    var ethPrice: Double? { didSet { needsDisplay = true } }
+    var ethPriceDirection = 0 { didSet { needsDisplay = true } }
+    var ethStatusText = "读取中…" { didSet { needsDisplay = true } }
+    var pointerSide: PointerSide = .left {
+        didSet {
+            guard pointerSide != oldValue else { return }
+            needsDisplay = true
+            window?.invalidateCursorRects(for: self)
+            window?.invalidateShadow()
+        }
+    }
+    var pointerCenterX: CGFloat? {
+        didSet {
+            guard pointerCenterX != oldValue else { return }
+            needsDisplay = true
+            window?.invalidateShadow()
+        }
+    }
+    var isCollapsed = false {
+        didSet {
+            needsDisplay = true
+            updateRunningArrowTimer()
+            window?.invalidateCursorRects(for: self)
+            window?.invalidateShadow()
+        }
+    }
+    var onToggleCollapsed: (() -> Void)?
+    private var hideButtonTrackingArea: NSTrackingArea?
+    private var isHideButtonHovered = false
+    private var runningArrowTimer: Timer?
+    private var windowVisibilityObservers: [NSObjectProtocol] = []
+
+    // lazy 属性第一次使用时才加载资源，避免创建视图时立即做不必要的磁盘读取。
+    private lazy var backgroundImage: NSImage? = {
+        guard let resourceURL = Bundle.main.resourceURL?
+            .appendingPathComponent(panelConfig.theme.backgroundImage)
+        else { return nil }
+        return NSImage(contentsOf: resourceURL)
+    }()
+
+    private lazy var completedTaskIcon: NSImage? = taskIcon(
+        named: "task-completed-icon.png"
+    )
+    private lazy var runningTaskIcon: NSImage? = taskIcon(
+        named: "task-running-icon.png"
+    )
+    private lazy var waitingTaskIcon: NSImage? = taskIcon(
+        named: "task-waiting-icon.png"
+    )
+    private lazy var failedTaskIcon: NSImage? = taskIcon(
+        named: "task-failed-icon.png"
+    )
+
+    private func taskIcon(named name: String) -> NSImage? {
+        guard let resourceURL = Bundle.main.resourceURL?
+            .appendingPathComponent(name)
+        else { return nil }
+        return NSImage(contentsOf: resourceURL)
+    }
+
+    // AppKit 默认原点在左下；翻转后原点位于左上，更符合从上到下排列内容的习惯。
+    override var isFlipped: Bool { true }
+
+    deinit {
+        runningArrowTimer?.invalidate()
+        windowVisibilityObservers.forEach {
+            NotificationCenter.default.removeObserver($0)
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // 视图可能换到另一个窗口，先移除旧观察者，避免重复回调或持有旧窗口。
+        windowVisibilityObservers.forEach {
+            NotificationCenter.default.removeObserver($0)
+        }
+        windowVisibilityObservers.removeAll()
+        if let window {
+            let center = NotificationCenter.default
+            windowVisibilityObservers.append(center.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                // weak 防止 NotificationCenter 的闭包与视图互相强引用。
+                self?.updateRunningArrowTimer()
+            })
+        }
+        updateRunningArrowTimer()
+    }
+
+    private func updateRunningArrowTimer() {
+        let hasRunningTask = taskProgress.items.contains {
+            $0.kind == .running
+        }
+        let shouldAnimate = shouldAnimateRunningArrow(
+            isWindowVisible: window?.isVisible == true,
+            isCollapsed: isCollapsed,
+            hasRunningTask: hasRunningTask
+        )
+        // 仅在面板可见、未折叠且存在运行任务时启动 30 FPS 动画计时器。
+        if shouldAnimate, runningArrowTimer == nil {
+            let timer = Timer(
+                timeInterval: 1.0 / 30.0,
+                repeats: true
+            ) { [weak self] timer in
+                guard let self else {
+                    timer.invalidate()
+                    return
+                }
+                let remainsVisible = shouldAnimateRunningArrow(
+                    isWindowVisible: self.window?.isVisible == true,
+                    isCollapsed: self.isCollapsed,
+                    hasRunningTask: self.taskProgress.items.contains {
+                        $0.kind == .running
+                    }
+                )
+                guard remainsVisible else {
+                    timer.invalidate()
+                    self.runningArrowTimer = nil
+                    return
+                }
+                self.needsDisplay = true
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            runningArrowTimer = timer
+        } else if !shouldAnimate {
+            runningArrowTimer?.invalidate()
+            runningArrowTimer = nil
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        // NSView 的 draw 是即时绘制入口：状态变化只需设置 needsDisplay，AppKit 会稍后调用这里。
+        NSGraphicsContext.current?.imageInterpolation = .high
+
+        let bodyRect = panelBodyRect()
+
+        let background = NSColor(calibratedRed: 0.035, green: 0.045, blue: 0.085, alpha: 0.97)
+        let border = NSColor.white.withAlphaComponent(0.22)
+        let bodyPath = NSBezierPath(roundedRect: bodyRect, xRadius: 17, yRadius: 17)
+        background.setFill()
+        bodyPath.fill()
+
+        if !isCollapsed, let backgroundImage {
+            NSGraphicsContext.saveGraphicsState()
+            bodyPath.addClip()
+            drawFiveBallBand(backgroundImage, in: bodyRect)
+            NSColor.black.withAlphaComponent(0.08).setFill()
+            bodyPath.fill()
+            NSGraphicsContext.restoreGraphicsState()
+        }
+
+        border.setStroke()
+        bodyPath.lineWidth = 1
+        bodyPath.stroke()
+
+        let arrow = NSBezierPath()
+        switch pointerSide {
+        case .left:
+            let centerY = bodyRect.midY
+            arrow.move(to: NSPoint(x: bodyRect.minX + 1, y: centerY - 8))
+            arrow.line(to: NSPoint(x: panelVerticalCanvasInset, y: centerY))
+            arrow.line(to: NSPoint(x: bodyRect.minX + 1, y: centerY + 8))
+        case .right:
+            let centerY = bodyRect.midY
+            arrow.move(to: NSPoint(x: bodyRect.maxX - 1, y: centerY - 8))
+            arrow.line(to: NSPoint(x: bounds.maxX - panelVerticalCanvasInset, y: centerY))
+            arrow.line(to: NSPoint(x: bodyRect.maxX - 1, y: centerY + 8))
+        case .bottom:
+            let requestedCenterX = pointerCenterX ?? bodyRect.midX
+            let centerX = min(
+                max(requestedCenterX, bodyRect.minX + 12),
+                bodyRect.maxX - 12
+            )
+            arrow.move(to: NSPoint(x: centerX - 8, y: bodyRect.maxY - 1))
+            arrow.line(to: NSPoint(x: centerX, y: bounds.maxY - panelVerticalCanvasInset))
+            arrow.line(to: NSPoint(x: centerX + 8, y: bodyRect.maxY - 1))
+        }
+        arrow.close()
+        background.setFill()
+        arrow.fill()
+        border.setStroke()
+        arrow.lineWidth = 1
+        arrow.stroke()
+
+        if isCollapsed {
+            let label = "展开"
+            let labelFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
+            let labelHeight = (label as NSString).size(withAttributes: [.font: labelFont]).height
+            drawText(
+                label,
+                in: NSRect(
+                    x: bodyRect.minX,
+                    y: bodyRect.midY - labelHeight / 2,
+                    width: bodyRect.width,
+                    height: labelHeight
+                ),
+                font: labelFont,
+                color: NSColor.white.withAlphaComponent(0.92),
+                alignment: .center
+            )
+            return
+        }
+
+        let contentX = bodyRect.minX + 14
+        let contentWidth = bodyRect.width - 28
+        let hideButton = hideButtonRect(in: bodyRect)
+        let hideButtonPath = NSBezierPath(roundedRect: hideButton, xRadius: 8, yRadius: 8)
+        NSColor.white.withAlphaComponent(isHideButtonHovered ? 0.20 : 0.11).setFill()
+        hideButtonPath.fill()
+        NSColor.white.withAlphaComponent(isHideButtonHovered ? 0.38 : 0.20).setStroke()
+        hideButtonPath.lineWidth = 0.75
+        hideButtonPath.stroke()
+        drawText(
+            "折叠",
+            in: NSRect(x: hideButton.minX, y: hideButton.minY + 2, width: hideButton.width, height: 15),
+            font: .systemFont(ofSize: 9.5, weight: .medium),
+            color: NSColor.white.withAlphaComponent(isHideButtonHovered ? 1.0 : 0.86),
+            alignment: .center
+        )
+
+        if !panelConfig.widgets.codexQuota {
+            drawText(
+                panelConfig.theme.title,
+                in: NSRect(x: contentX, y: bodyRect.minY + 11, width: contentWidth - 48, height: 18),
+                font: .systemFont(ofSize: 12.4, weight: .semibold),
+                color: NSColor.white.withAlphaComponent(0.88)
+            )
+        } else if let errorText {
+            drawText(
+                errorText,
+                in: NSRect(x: contentX, y: bodyRect.minY + 11, width: contentWidth - 48, height: 38),
+                font: .systemFont(ofSize: 12, weight: .medium),
+                color: NSColor(calibratedRed: 1.0, green: 0.72, blue: 0.38, alpha: 1)
+            )
+        } else if rows.isEmpty {
+            drawText(
+                "正在向 Codex 本机服务查询…",
+                in: NSRect(x: contentX, y: bodyRect.minY + 11, width: contentWidth - 48, height: 20),
+                font: .systemFont(ofSize: 11.5, weight: .medium),
+                color: NSColor.white.withAlphaComponent(0.68)
+            )
+        } else {
+            for (index, row) in rows.prefix(1).enumerated() {
+                draw(row: row, index: index, bodyMinY: bodyRect.minY, x: contentX, width: contentWidth)
+            }
+        }
+
+        drawText(
+            composedStatusText,
+            in: NSRect(
+                x: contentX,
+                y: bodyRect.minY + 74,
+                width: contentWidth,
+                height: 14
+            ),
+            font: .systemFont(ofSize: 9.2, weight: .regular),
+            color: NSColor.white.withAlphaComponent(0.72),
+            alignment: .right
+        )
+
+        let taskItems = taskProgress.items.isEmpty
+            ? TaskProgressSnapshot.idle.items
+            : taskProgress.items
+        for (index, item) in taskItems.enumerated() {
+            drawTaskProgressItem(
+                item,
+                index: index,
+                y: bodyRect.minY + 100
+                    + CGFloat(index) * taskProgressRowHeight,
+                separatorY: bodyRect.minY + 93
+                    + CGFloat(index) * taskProgressRowHeight,
+                contentX: contentX,
+                contentWidth: contentWidth
+            )
+        }
+        let taskSectionHeight = taskProgressRowHeight
+            * CGFloat(max(1, taskItems.count))
+
+        if showsMarketPrices {
+            drawMarketPriceRow(
+                symbol: "BTC/USDT",
+                iconText: "₿",
+                iconColor: NSColor(calibratedRed: 0.97, green: 0.58, blue: 0.11, alpha: 1),
+                price: btcPrice,
+                direction: btcPriceDirection,
+                statusText: btcStatusText,
+                y: bodyRect.minY + 100 + taskSectionHeight,
+                separatorY: bodyRect.minY + 93 + taskSectionHeight,
+                contentX: contentX,
+                contentWidth: contentWidth
+            )
+            drawMarketPriceRow(
+                symbol: "ETH/USDT",
+                iconText: "Ξ",
+                iconColor: NSColor(calibratedRed: 0.38, green: 0.45, blue: 0.95, alpha: 1),
+                price: ethPrice,
+                direction: ethPriceDirection,
+                statusText: ethStatusText,
+                y: bodyRect.minY + 100
+                    + taskSectionHeight
+                    + marketPriceRowHeight,
+                separatorY: bodyRect.minY + 93
+                    + taskSectionHeight
+                    + marketPriceRowHeight,
+                contentX: contentX,
+                contentWidth: contentWidth
+            )
+        }
+    }
+
+    private var composedStatusText: String {
+        var parts = [statusText]
+        if panelConfig.widgets.codexConnection {
+            parts.append(codexConnectionText)
+        }
+        if panelConfig.widgets.followStatus {
+            parts.append(followStatusText)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hideButtonTrackingArea {
+            removeTrackingArea(hideButtonTrackingArea)
+        }
+        guard !isCollapsed else {
+            hideButtonTrackingArea = nil
+            return
+        }
+        let trackingArea = NSTrackingArea(
+            rect: hideButtonRect(in: panelBodyRect()),
+            options: [.mouseEnteredAndExited, .activeAlways],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        hideButtonTrackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHideButtonHovered = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHideButtonHovered = false
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let bodyRect = panelBodyRect()
+        if isCollapsed || hideButtonRect(in: bodyRect).contains(point) {
+            onToggleCollapsed?()
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        let clickableRect = isCollapsed ? bounds : hideButtonRect(in: panelBodyRect())
+        addCursorRect(clickableRect, cursor: .pointingHand)
+    }
+
+    private func panelBodyRect() -> NSRect {
+        switch pointerSide {
+        case .left:
+            let x = panelVerticalCanvasInset + panelPointerLength - 1
+            return NSRect(
+                x: x,
+                y: panelVerticalCanvasInset,
+                width: bounds.width - x - panelHorizontalCanvasInset,
+                height: bounds.height - panelVerticalCanvasInset * 2
+            )
+        case .right:
+            return NSRect(
+                x: panelHorizontalCanvasInset,
+                y: panelVerticalCanvasInset,
+                width: bounds.width - panelHorizontalCanvasInset - panelVerticalCanvasInset - panelPointerLength + 1,
+                height: bounds.height - panelVerticalCanvasInset * 2
+            )
+        case .bottom:
+            return NSRect(
+                x: panelHorizontalCanvasInset,
+                y: panelVerticalCanvasInset,
+                width: bounds.width - panelHorizontalCanvasInset * 2,
+                height: bounds.height - panelVerticalCanvasInset * 2 - panelPointerLength + 1
+            )
+        }
+    }
+
+    private func hideButtonRect(in bodyRect: NSRect) -> NSRect {
+        NSRect(x: bodyRect.maxX - 48, y: bodyRect.minY + 7, width: 38, height: 18)
+    }
+
+    private func draw(row: QuotaRow, index: Int, bodyMinY: CGFloat, x: CGFloat, width: CGFloat) {
+        let top = bodyMinY + CGFloat(10 + index * 43)
+        let remaining = max(0, min(100, row.remainingPercent))
+        let valueStart = x + 68
+        let valueRight = x + width - 48
+
+        drawText(
+            row.name,
+            in: NSRect(x: x, y: top, width: 64, height: 16),
+            font: .systemFont(ofSize: 10.8, weight: .semibold),
+            color: NSColor.white.withAlphaComponent(0.88)
+        )
+        drawText(
+            "剩余 \(remaining)%",
+            in: NSRect(x: valueStart, y: top, width: valueRight - valueStart, height: 16),
+            font: .monospacedDigitSystemFont(ofSize: 10.8, weight: .semibold),
+            color: progressColor(for: remaining),
+            alignment: .right
+        )
+
+        let trackRect = NSRect(x: x, y: top + 55, width: width, height: 4)
+        let track = NSBezierPath(roundedRect: trackRect, xRadius: 2, yRadius: 2)
+        NSColor.black.withAlphaComponent(0.30).setFill()
+        track.fill()
+
+        let fillWidth = max(3, width * CGFloat(remaining) / 100)
+        let fill = NSBezierPath(
+            roundedRect: NSRect(x: x, y: top + 55, width: fillWidth, height: 4),
+            xRadius: 2,
+            yRadius: 2
+        )
+        progressColor(for: remaining).setFill()
+        fill.fill()
+
+        let resetText: String
+        if let date = row.resetsAt {
+            resetText = "\(Self.resetFormatter.string(from: date)) 重置"
+        } else {
+            resetText = "重置时间未知"
+        }
+        drawText(
+            resetText,
+            in: NSRect(x: x, y: top + 64, width: 94, height: 14),
+            font: .systemFont(ofSize: 9.2, weight: .regular),
+            color: NSColor.white.withAlphaComponent(0.72)
+        )
+    }
+
+    private func drawFiveBallBand(_ image: NSImage, in destinationRect: NSRect) {
+        let imageSize = image.size
+        guard imageSize.width > 0, imageSize.height > 0 else { return }
+
+        // 原图是竖版海报；中间 32% 只包含黑底五颗角色球，两条 MAYDAY 文字在裁剪区外。
+        // 这个裁剪比例也更接近额度面板的横向尺寸。
+        let sourceRect = NSRect(
+            x: 0,
+            y: imageSize.height * 0.34,
+            width: imageSize.width,
+            height: imageSize.height * 0.32
+        )
+
+        let imageRect = NSRect(
+            x: destinationRect.minX,
+            y: destinationRect.minY,
+            width: destinationRect.width,
+            height: min(93, destinationRect.height)
+        )
+
+        image.draw(
+            in: imageRect,
+            from: sourceRect,
+            operation: .sourceOver,
+            fraction: 1,
+            respectFlipped: true,
+            hints: [.interpolation: NSImageInterpolation.high]
+        )
+    }
+
+    private func drawTaskProgressItem(
+        _ item: TaskProgressItem,
+        index: Int,
+        y: CGFloat,
+        separatorY: CGFloat,
+        contentX: CGFloat,
+        contentWidth: CGFloat
+    ) {
+        let separator = NSBezierPath()
+        separator.move(to: NSPoint(x: contentX, y: separatorY))
+        separator.line(to: NSPoint(
+            x: contentX + contentWidth,
+            y: separatorY
+        ))
+        NSColor.white.withAlphaComponent(0.13).setStroke()
+        separator.lineWidth = 0.75
+        separator.stroke()
+
+        let color = taskProgressColor(for: item.kind)
+        let taskIcon: NSImage?
+        switch item.kind {
+        case .running:
+            taskIcon = runningTaskIcon
+        case .waitingForInput:
+            taskIcon = waitingTaskIcon
+        case .completed:
+            taskIcon = completedTaskIcon
+        case .failed:
+            taskIcon = failedTaskIcon
+        case .reading, .idle:
+            taskIcon = nil
+        }
+
+        let usesStatusIcon = taskIcon != nil
+        if let taskIcon {
+            let iconRect = NSRect(
+                x: contentX - 2,
+                y: y,
+                width: 20,
+                height: 15
+            )
+            taskIcon.draw(
+                in: iconRect,
+                from: NSRect(origin: .zero, size: taskIcon.size),
+                operation: .sourceOver,
+                fraction: 1,
+                respectFlipped: true,
+                hints: [.interpolation: NSImageInterpolation.high]
+            )
+            drawTaskStatusBadge(for: item.kind, iconRect: iconRect)
+        } else {
+            let dot = NSBezierPath(ovalIn: NSRect(
+                x: contentX,
+                y: y + 4,
+                width: 7,
+                height: 7
+            ))
+            color.setFill()
+            dot.fill()
+        }
+
+        let titleOffset: CGFloat = usesStatusIcon ? 22 : 13
+        let titleReservedWidth: CGFloat = usesStatusIcon ? 89 : 80
+        drawText(
+            item.title,
+            in: NSRect(
+                x: contentX + titleOffset,
+                y: y,
+                width: contentWidth - titleReservedWidth,
+                height: 15
+            ),
+            font: .systemFont(
+                ofSize: 9.4,
+                weight: index == 0 ? .semibold : .medium
+            ),
+            color: NSColor.white.withAlphaComponent(0.84)
+        )
+        drawText(
+            item.statusText,
+            in: NSRect(
+                x: contentX + contentWidth - 66,
+                y: y,
+                width: 66,
+                height: 15
+            ),
+            font: .systemFont(ofSize: 9.2, weight: .semibold),
+            color: color,
+            alignment: .right
+        )
+    }
+
+    private func drawTaskStatusBadge(
+        for kind: TaskProgressKind,
+        iconRect: NSRect
+    ) {
+        guard kind != .completed && kind != .failed else { return }
+
+        let badgeRect = NSRect(
+            x: iconRect.minX + 10.6,
+            y: iconRect.minY + 0.4,
+            width: 8.4,
+            height: 8.4
+        )
+        let badge = NSBezierPath(ovalIn: badgeRect)
+        switch kind {
+        case .running:
+            NSColor(
+                calibratedRed: 0.12,
+                green: 0.46,
+                blue: 0.96,
+                alpha: 1
+            ).setFill()
+            badge.fill()
+            drawRunningArrow(in: badgeRect)
+        case .waitingForInput:
+            NSColor(
+                calibratedRed: 1.0,
+                green: 0.76,
+                blue: 0.10,
+                alpha: 1
+            ).setFill()
+            badge.fill()
+            drawText(
+                "?",
+                in: badgeRect.offsetBy(dx: 0, dy: -0.4),
+                font: .systemFont(ofSize: 7.2, weight: .heavy),
+                color: .white,
+                alignment: .center
+            )
+        case .reading, .completed, .failed, .idle:
+            break
+        }
+    }
+
+    private func drawRunningArrow(in badgeRect: NSRect) {
+        let center = NSPoint(x: badgeRect.midX, y: badgeRect.midY)
+        let radius = badgeRect.width * 0.31
+        let progress = Date.timeIntervalSinceReferenceDate
+            .truncatingRemainder(dividingBy: 1.2) / 1.2
+        let rotation = CGFloat(progress) * 2 * .pi
+        let start: CGFloat = rotation - .pi * 0.40
+        let sweep: CGFloat = .pi * 1.56
+        let segments = 18
+        let arc = NSBezierPath()
+        for index in 0...segments {
+            let angle = start + sweep * CGFloat(index) / CGFloat(segments)
+            let point = NSPoint(
+                x: center.x + cos(angle) * radius,
+                y: center.y + sin(angle) * radius
+            )
+            if index == 0 {
+                arc.move(to: point)
+            } else {
+                arc.line(to: point)
+            }
+        }
+        NSColor.white.setStroke()
+        arc.lineWidth = 1.05
+        arc.lineCapStyle = .round
+        arc.stroke()
+
+        let end = start + sweep
+        let tip = NSPoint(
+            x: center.x + cos(end) * radius,
+            y: center.y + sin(end) * radius
+        )
+        let tangent = NSPoint(x: -sin(end), y: cos(end))
+        let normal = NSPoint(x: -tangent.y, y: tangent.x)
+        let base = NSPoint(
+            x: tip.x - tangent.x * 1.6,
+            y: tip.y - tangent.y * 1.6
+        )
+        let head = NSBezierPath()
+        head.move(to: tip)
+        head.line(to: NSPoint(
+            x: base.x + normal.x * 0.72,
+            y: base.y + normal.y * 0.72
+        ))
+        head.line(to: NSPoint(
+            x: base.x - normal.x * 0.72,
+            y: base.y - normal.y * 0.72
+        ))
+        head.close()
+        NSColor.white.setFill()
+        head.fill()
+    }
+
+    private func drawMarketPriceRow(
+        symbol: String,
+        iconText: String,
+        iconColor: NSColor,
+        price: Double?,
+        direction: Int,
+        statusText: String,
+        y: CGFloat,
+        separatorY: CGFloat,
+        contentX: CGFloat,
+        contentWidth: CGFloat
+    ) {
+        let separator = NSBezierPath()
+        separator.move(to: NSPoint(x: contentX, y: separatorY))
+        separator.line(to: NSPoint(x: contentX + contentWidth, y: separatorY))
+        NSColor.white.withAlphaComponent(0.13).setStroke()
+        separator.lineWidth = 0.75
+        separator.stroke()
+
+        let iconRect = NSRect(x: contentX, y: y, width: 15, height: 15)
+        let icon = NSBezierPath(ovalIn: iconRect)
+        iconColor.setFill()
+        icon.fill()
+        drawText(
+            iconText,
+            in: NSRect(x: iconRect.minX, y: iconRect.minY + 0.5, width: iconRect.width, height: 14),
+            font: .systemFont(ofSize: 10.2, weight: .bold),
+            color: .white,
+            alignment: .center
+        )
+
+        drawText(
+            symbol,
+            in: NSRect(x: contentX + 20, y: y, width: 62, height: 15),
+            font: .systemFont(ofSize: 9.6, weight: .semibold),
+            color: NSColor.white.withAlphaComponent(0.78)
+        )
+
+        if let price {
+            let formattedPrice = Self.btcPriceFormatter.string(from: NSNumber(value: price)) ?? "--"
+            drawText(
+                formattedPrice,
+                in: NSRect(x: contentX + 78, y: y - 1.5, width: 76, height: 17),
+                font: .monospacedDigitSystemFont(ofSize: 11.4, weight: .bold),
+                color: marketPriceColor(direction: direction),
+                alignment: .right
+            )
+        } else {
+            drawText(
+                "--",
+                in: NSRect(x: contentX + 78, y: y - 1.5, width: 76, height: 17),
+                font: .monospacedDigitSystemFont(ofSize: 11.4, weight: .bold),
+                color: NSColor.white.withAlphaComponent(0.70),
+                alignment: .right
+            )
+        }
+
+        drawText(
+            statusText,
+            in: NSRect(x: contentX + 158, y: y + 1, width: contentWidth - 158, height: 14),
+            font: .systemFont(ofSize: 8.3, weight: .regular),
+            color: NSColor.white.withAlphaComponent(0.54),
+            alignment: .right
+        )
+    }
+
+    private func taskProgressColor(for kind: TaskProgressKind) -> NSColor {
+        switch kind {
+        case .reading, .running:
+            return NSColor(
+                calibratedRed: 0.10,
+                green: 0.78,
+                blue: 1.0,
+                alpha: 1
+            )
+        case .waitingForInput:
+            return NSColor(
+                calibratedRed: 1.0,
+                green: 0.79,
+                blue: 0.18,
+                alpha: 1
+            )
+        case .completed:
+            return NSColor(
+                calibratedRed: 0.24,
+                green: 0.86,
+                blue: 0.58,
+                alpha: 1
+            )
+        case .failed:
+            return NSColor(
+                calibratedRed: 1.0,
+                green: 0.39,
+                blue: 0.43,
+                alpha: 1
+            )
+        case .idle:
+            return NSColor.white.withAlphaComponent(0.54)
+        }
+    }
+
+    private func marketPriceColor(direction: Int) -> NSColor {
+        switch direction {
+        case 1:
+            return NSColor(calibratedRed: 0.24, green: 0.86, blue: 0.58, alpha: 1)
+        case -1:
+            return NSColor(calibratedRed: 1.0, green: 0.39, blue: 0.43, alpha: 1)
+        default:
+            return NSColor.white.withAlphaComponent(0.94)
+        }
+    }
+
+    private func progressColor(for remaining: Int) -> NSColor {
+        if remaining <= 20 {
+            return NSColor(calibratedRed: 1.0, green: 0.34, blue: 0.39, alpha: 1)
+        }
+        if remaining <= 45 {
+            return NSColor(calibratedRed: 1.0, green: 0.70, blue: 0.22, alpha: 1)
+        }
+        return NSColor(calibratedRed: 0.22, green: 0.60, blue: 1.0, alpha: 1)
+    }
+
+    private func drawText(
+        _ text: String,
+        in rect: NSRect,
+        font: NSFont,
+        color: NSColor,
+        alignment: NSTextAlignment = .left
+    ) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = alignment
+        paragraph.lineBreakMode = .byTruncatingTail
+        (text as NSString).draw(
+            in: rect,
+            withAttributes: [
+                .font: font,
+                .foregroundColor: color,
+                .paragraphStyle: paragraph,
+                .shadow: Self.textShadow,
+            ]
+        )
+    }
+
+    private static let textShadow: NSShadow = {
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.72)
+        shadow.shadowBlurRadius = 2
+        shadow.shadowOffset = NSSize(width: 0, height: 1)
+        return shadow
+    }()
+
+    private static let resetFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = .current
+        formatter.dateFormat = "M/d HH:mm"
+        return formatter
+    }()
+
+    private static let btcPriceFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        formatter.usesGroupingSeparator = true
+        return formatter
+    }()
+}
