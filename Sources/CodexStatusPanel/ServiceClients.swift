@@ -209,7 +209,7 @@ func quotaErrorDisplayText(
     }
 
     if let modelProvider, !modelProvider.isEmpty {
-        return "Codex: \(modelProvider)"
+        return "model_provider: \(modelProvider)"
     }
     return "Codex 未登录或认证已失效"
 }

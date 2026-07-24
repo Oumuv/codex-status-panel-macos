@@ -28,7 +28,7 @@ check "面板签名正常" '[[ -d "$APP" ]] && /usr/bin/codesign --verify --deep
 check "登录启动项存在" '[[ -f "$PLIST" ]]'
 check "登录启动项格式正常" '[[ -f "$PLIST" ]] && /usr/bin/plutil -lint "$PLIST" >/dev/null'
 check "面板进程正在运行" '/bin/launchctl print "$DOMAIN/$LABEL" 2>/dev/null | /usr/bin/grep -Eq "^[[:space:]]*pid = [0-9]+"'
-check "健康状态版本正确" '[[ -s "$HEALTH" ]] && /usr/bin/grep -q '"'"'"version":"1.2.1"'"'"' "$HEALTH"'
+check "健康状态版本正确" '[[ -s "$HEALTH" ]] && /usr/bin/grep -q '"'"'"version":"1.2.2"'"'"' "$HEALTH"'
 check "行情开关状态可读" '[[ -s "$HEALTH" ]] && /usr/bin/grep -Eq '"'"'"marketPricesEnabled":(true|false)'"'"' "$HEALTH"'
 check "配置打印正常" '[[ -x "$BIN" ]] && "$BIN" --print-panel-config >/dev/null'
 check "跟随定位自测正常" '[[ -x "$BIN" ]] && "$BIN" --self-test-placement >/dev/null'

@@ -6,16 +6,19 @@ import Foundation
 
 final class QuotaPanelView: NSView {
     // didSet 是属性观察器：属性被赋新值后自动执行，用于通知 AppKit 重新绘制。
-    var rows: [QuotaRow] = [] { didSet { needsDisplay = true } }
+    var quotaPresentation: QuotaPresentation? {
+        didSet { needsDisplay = true }
+    }
+    var quotaSourceName = "Codex" { didSet { needsDisplay = true } }
     var statusText = "正在读取额度…" { didSet { needsDisplay = true } }
-    var codexConnectionText = "连接中" { didSet { needsDisplay = true } }
+    var connectionText = "连接中" { didSet { needsDisplay = true } }
     var followStatusText = "定位中" { didSet { needsDisplay = true } }
     var errorText: String? { didSet { needsDisplay = true } }
     var taskProgress = TaskProgressSnapshot.reading {
         didSet {
             if taskProgress != oldValue {
                 needsDisplay = true
-                updateRunningArrowTimer()
+                syncRunningTaskBadges()
             }
         }
     }
@@ -32,6 +35,7 @@ final class QuotaPanelView: NSView {
         didSet {
             guard pointerSide != oldValue else { return }
             needsDisplay = true
+            syncRunningTaskBadges()
             window?.invalidateCursorRects(for: self)
             window?.invalidateShadow()
         }
@@ -46,7 +50,7 @@ final class QuotaPanelView: NSView {
     var isCollapsed = false {
         didSet {
             needsDisplay = true
-            updateRunningArrowTimer()
+            syncRunningTaskBadges()
             window?.invalidateCursorRects(for: self)
             window?.invalidateShadow()
         }
@@ -54,7 +58,8 @@ final class QuotaPanelView: NSView {
     var onToggleCollapsed: (() -> Void)?
     private var hideButtonTrackingArea: NSTrackingArea?
     private var isHideButtonHovered = false
-    private var runningArrowTimer: Timer?
+    private var runningTaskBadgeViews: [NSImageView] = []
+    private var runningTaskBadgeAnimationsEnabled = false
     private var windowVisibilityObservers: [NSObjectProtocol] = []
 
     // lazy 属性第一次使用时才加载资源，避免创建视图时立即做不必要的磁盘读取。
@@ -70,6 +75,9 @@ final class QuotaPanelView: NSView {
     )
     private lazy var runningTaskIcon: NSImage? = taskIcon(
         named: "task-running-icon.png"
+    )
+    private lazy var runningTaskBadgeAnimation: NSImage? = taskIcon(
+        named: "task-running-badge.gif"
     )
     private lazy var waitingTaskIcon: NSImage? = taskIcon(
         named: "task-waiting-icon.png"
@@ -89,7 +97,7 @@ final class QuotaPanelView: NSView {
     override var isFlipped: Bool { true }
 
     deinit {
-        runningArrowTimer?.invalidate()
+        runningTaskBadgeViews.forEach { $0.animates = false }
         windowVisibilityObservers.forEach {
             NotificationCenter.default.removeObserver($0)
         }
@@ -110,50 +118,76 @@ final class QuotaPanelView: NSView {
                 queue: .main
             ) { [weak self] _ in
                 // weak 防止 NotificationCenter 的闭包与视图互相强引用。
-                self?.updateRunningArrowTimer()
+                self?.updateRunningTaskBadgeAnimationState()
             })
         }
-        updateRunningArrowTimer()
+        syncRunningTaskBadges()
     }
 
-    private func updateRunningArrowTimer() {
-        let hasRunningTask = taskProgress.items.contains {
-            $0.kind == .running
+    func setRunningTaskBadgeAnimationsEnabled(_ enabled: Bool) {
+        guard runningTaskBadgeAnimationsEnabled != enabled else { return }
+        runningTaskBadgeAnimationsEnabled = enabled
+        updateRunningTaskBadgeAnimationState()
+    }
+
+    private func syncRunningTaskBadges() {
+        for imageView in runningTaskBadgeViews {
+            imageView.animates = false
+            imageView.removeFromSuperview()
         }
+        runningTaskBadgeViews.removeAll(keepingCapacity: true)
+
+        guard !isCollapsed,
+              window != nil,
+              let animation = runningTaskBadgeAnimation
+        else { return }
+
+        let bodyRect = panelBodyRect()
+        let contentX = bodyRect.minX + 14
+        let taskItems = taskProgress.items.isEmpty
+            ? TaskProgressSnapshot.idle.items
+            : taskProgress.items
+        for (index, item) in taskItems.enumerated()
+            where item.kind == .running
+        {
+            let iconRect = NSRect(
+                x: contentX - 2,
+                y: bodyRect.minY + 100
+                    + CGFloat(index) * taskProgressRowHeight,
+                width: 20,
+                height: 15
+            )
+            let badgeRect = NSRect(
+                x: iconRect.minX + 10.6,
+                y: iconRect.minY + 0.4,
+                width: 8.4,
+                height: 8.4
+            )
+            let imageView = NSImageView(frame: badgeRect)
+            imageView.image = animation
+            imageView.imageAlignment = .alignCenter
+            imageView.imageScaling = .scaleAxesIndependently
+            imageView.imageFrameStyle = .none
+            imageView.isEditable = false
+            imageView.animates = false
+            addSubview(imageView)
+            runningTaskBadgeViews.append(imageView)
+        }
+
+        updateRunningTaskBadgeAnimationState()
+    }
+
+    private func updateRunningTaskBadgeAnimationState() {
         let shouldAnimate = shouldAnimateRunningArrow(
-            isWindowVisible: window?.isVisible == true,
+            isWindowVisible: runningTaskBadgeAnimationsEnabled
+                && window?.isVisible == true,
             isCollapsed: isCollapsed,
-            hasRunningTask: hasRunningTask
+            hasRunningTask: !runningTaskBadgeViews.isEmpty
         )
-        // 仅在面板可见、未折叠且存在运行任务时启动 30 FPS 动画计时器。
-        if shouldAnimate, runningArrowTimer == nil {
-            let timer = Timer(
-                timeInterval: 1.0 / 30.0,
-                repeats: true
-            ) { [weak self] timer in
-                guard let self else {
-                    timer.invalidate()
-                    return
-                }
-                let remainsVisible = shouldAnimateRunningArrow(
-                    isWindowVisible: self.window?.isVisible == true,
-                    isCollapsed: self.isCollapsed,
-                    hasRunningTask: self.taskProgress.items.contains {
-                        $0.kind == .running
-                    }
-                )
-                guard remainsVisible else {
-                    timer.invalidate()
-                    self.runningArrowTimer = nil
-                    return
-                }
-                self.needsDisplay = true
-            }
-            RunLoop.main.add(timer, forMode: .common)
-            runningArrowTimer = timer
-        } else if !shouldAnimate {
-            runningArrowTimer?.invalidate()
-            runningArrowTimer = nil
+        for imageView in runningTaskBadgeViews
+            where imageView.animates != shouldAnimate
+        {
+            imageView.animates = shouldAnimate
         }
     }
 
@@ -262,17 +296,20 @@ final class QuotaPanelView: NSView {
                 font: .systemFont(ofSize: 12, weight: .medium),
                 color: NSColor(calibratedRed: 1.0, green: 0.72, blue: 0.38, alpha: 1)
             )
-        } else if rows.isEmpty {
+        } else if let quotaPresentation {
+            draw(
+                presentation: quotaPresentation,
+                bodyMinY: bodyRect.minY,
+                x: contentX,
+                width: contentWidth
+            )
+        } else {
             drawText(
-                "正在向 Codex 本机服务查询…",
+                "正在向 \(quotaSourceName) 查询…",
                 in: NSRect(x: contentX, y: bodyRect.minY + 11, width: contentWidth - 48, height: 20),
                 font: .systemFont(ofSize: 11.5, weight: .medium),
                 color: NSColor.white.withAlphaComponent(0.68)
             )
-        } else {
-            for (index, row) in rows.prefix(1).enumerated() {
-                draw(row: row, index: index, bodyMinY: bodyRect.minY, x: contentX, width: contentWidth)
-            }
         }
 
         drawText(
@@ -341,7 +378,7 @@ final class QuotaPanelView: NSView {
     private var composedStatusText: String {
         var parts = [statusText]
         if panelConfig.widgets.codexConnection {
-            parts.append(codexConnectionText)
+            parts.append(connectionText)
         }
         if panelConfig.widgets.followStatus {
             parts.append(followStatusText)
@@ -429,52 +466,102 @@ final class QuotaPanelView: NSView {
         NSRect(x: bodyRect.maxX - 48, y: bodyRect.minY + 7, width: 38, height: 18)
     }
 
-    private func draw(row: QuotaRow, index: Int, bodyMinY: CGFloat, x: CGFloat, width: CGFloat) {
-        let top = bodyMinY + CGFloat(10 + index * 43)
-        let remaining = max(0, min(100, row.remainingPercent))
+    private func draw(
+        presentation: QuotaPresentation,
+        bodyMinY: CGFloat,
+        x: CGFloat,
+        width: CGFloat
+    ) {
+        let top = bodyMinY + 10
         let valueStart = x + 68
         let valueRight = x + width - 48
 
         drawText(
-            row.name,
+            presentation.sourceName,
             in: NSRect(x: x, y: top, width: 64, height: 16),
             font: .systemFont(ofSize: 10.8, weight: .semibold),
             color: NSColor.white.withAlphaComponent(0.88)
         )
         drawText(
-            "剩余 \(remaining)%",
+            presentation.valueText,
             in: NSRect(x: valueStart, y: top, width: valueRight - valueStart, height: 16),
             font: .monospacedDigitSystemFont(ofSize: 10.8, weight: .semibold),
-            color: progressColor(for: remaining),
+            color: quotaValueColor(for: presentation),
             alignment: .right
         )
 
-        let trackRect = NSRect(x: x, y: top + 55, width: width, height: 4)
-        let track = NSBezierPath(roundedRect: trackRect, xRadius: 2, yRadius: 2)
-        NSColor.black.withAlphaComponent(0.30).setFill()
-        track.fill()
+        if let rawPercent = presentation.progressPercent {
+            let percent = max(0, min(100, rawPercent))
+            let trackRect = NSRect(
+                x: x,
+                y: top + 55,
+                width: width,
+                height: 4
+            )
+            let track = NSBezierPath(
+                roundedRect: trackRect,
+                xRadius: 2,
+                yRadius: 2
+            )
+            NSColor.black.withAlphaComponent(0.30).setFill()
+            track.fill()
 
-        let fillWidth = max(3, width * CGFloat(remaining) / 100)
-        let fill = NSBezierPath(
-            roundedRect: NSRect(x: x, y: top + 55, width: fillWidth, height: 4),
-            xRadius: 2,
-            yRadius: 2
-        )
-        progressColor(for: remaining).setFill()
-        fill.fill()
-
-        let resetText: String
-        if let date = row.resetsAt {
-            resetText = "\(Self.resetFormatter.string(from: date)) 重置"
-        } else {
-            resetText = "重置时间未知"
+            let fillWidth = percent == 0
+                ? 0 : max(3, width * CGFloat(percent) / 100)
+            if fillWidth > 0 {
+                let fill = NSBezierPath(
+                    roundedRect: NSRect(
+                        x: x,
+                        y: top + 55,
+                        width: fillWidth,
+                        height: 4
+                    ),
+                    xRadius: 2,
+                    yRadius: 2
+                )
+                progressColor(for: percent).setFill()
+                fill.fill()
+            }
         }
+
         drawText(
-            resetText,
-            in: NSRect(x: x, y: top + 64, width: 94, height: 14),
+            presentation.detailText,
+            in: NSRect(x: x, y: top + 64, width: 80, height: 14),
             font: .systemFont(ofSize: 9.2, weight: .regular),
             color: NSColor.white.withAlphaComponent(0.72)
         )
+    }
+
+    private func quotaValueColor(
+        for presentation: QuotaPresentation
+    ) -> NSColor {
+        quotaColor(for: quotaDisplayTone(for: presentation))
+    }
+
+    private func quotaColor(for tone: QuotaDisplayTone) -> NSColor {
+        switch tone {
+        case .danger:
+            return NSColor(
+                calibratedRed: 1.0,
+                green: 0.34,
+                blue: 0.39,
+                alpha: 1
+            )
+        case .warning:
+            return NSColor(
+                calibratedRed: 1.0,
+                green: 0.70,
+                blue: 0.22,
+                alpha: 1
+            )
+        case .normal:
+            return NSColor(
+                calibratedRed: 0.22,
+                green: 0.60,
+                blue: 1.0,
+                alpha: 1
+            )
+        }
     }
 
     private func drawFiveBallBand(_ image: NSImage, in destinationRect: NSRect) {
@@ -613,6 +700,7 @@ final class QuotaPanelView: NSView {
         let badge = NSBezierPath(ovalIn: badgeRect)
         switch kind {
         case .running:
+            // GIF 子视图只刷新角标；静态帧用于预览和资源加载失败回退。
             NSColor(
                 calibratedRed: 0.12,
                 green: 0.46,
@@ -620,7 +708,7 @@ final class QuotaPanelView: NSView {
                 alpha: 1
             ).setFill()
             badge.fill()
-            drawRunningArrow(in: badgeRect)
+            drawStaticRunningArrow(in: badgeRect)
         case .waitingForInput:
             NSColor(
                 calibratedRed: 1.0,
@@ -641,12 +729,10 @@ final class QuotaPanelView: NSView {
         }
     }
 
-    private func drawRunningArrow(in badgeRect: NSRect) {
+    private func drawStaticRunningArrow(in badgeRect: NSRect) {
         let center = NSPoint(x: badgeRect.midX, y: badgeRect.midY)
         let radius = badgeRect.width * 0.31
-        let progress = Date.timeIntervalSinceReferenceDate
-            .truncatingRemainder(dividingBy: 1.2) / 1.2
-        let rotation = CGFloat(progress) * 2 * .pi
+        let rotation: CGFloat = 0
         let start: CGFloat = rotation - .pi * 0.40
         let sweep: CGFloat = .pi * 1.56
         let segments = 18
@@ -807,13 +893,7 @@ final class QuotaPanelView: NSView {
     }
 
     private func progressColor(for remaining: Int) -> NSColor {
-        if remaining <= 20 {
-            return NSColor(calibratedRed: 1.0, green: 0.34, blue: 0.39, alpha: 1)
-        }
-        if remaining <= 45 {
-            return NSColor(calibratedRed: 1.0, green: 0.70, blue: 0.22, alpha: 1)
-        }
-        return NSColor(calibratedRed: 0.22, green: 0.60, blue: 1.0, alpha: 1)
+        quotaColor(for: quotaDisplayTone(remainingPercent: remaining))
     }
 
     private func drawText(
@@ -843,14 +923,6 @@ final class QuotaPanelView: NSView {
         shadow.shadowBlurRadius = 2
         shadow.shadowOffset = NSSize(width: 0, height: 1)
         return shadow
-    }()
-
-    private static let resetFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.timeZone = .current
-        formatter.dateFormat = "M/d HH:mm"
-        return formatter
     }()
 
     private static let btcPriceFormatter: NumberFormatter = {

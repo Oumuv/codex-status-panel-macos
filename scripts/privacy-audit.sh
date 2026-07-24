@@ -6,6 +6,7 @@ PATTERN='(/Users/[^/[:space:]]+|[A-Za-z]:\\Users\\[^\\[:space:]]+|ghp_[A-Za-z0-9
 
 if rg -n -i --hidden \
   --glob '!.git/**' \
+  --glob '!mayday-bubu-digital-materials/**' \
   --glob '!build/**' --glob '!**/build/**' \
   --glob '!scripts/privacy-audit.sh' \
   --glob '!dist/**' \

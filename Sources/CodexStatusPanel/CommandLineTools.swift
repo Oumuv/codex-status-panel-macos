@@ -11,22 +11,26 @@ func printQuotaOnce() -> Never {
     // CLI 需要打印一次结果后退出；信号量把异步客户端桥接成有超时的同步等待。
     let semaphore = DispatchSemaphore(value: 0)
     var exitCode: Int32 = 1
-    CodexQuotaClient().fetch { result in
+    let provider = makeQuotaUsageProvider(
+        configuration: panelConfig.usageProvider
+    )
+    provider.fetch { result in
         switch result {
-        case .success(let response):
-            let snapshot = codexSnapshot(from: response)
-            let remaining = snapshot.primary.map { max(0, 100 - $0.usedPercent) }
-                ?? snapshot.individualLimit?.remainingPercent
-                ?? 0
-            print("codex: remaining=\(remaining)%")
+        case .success(let presentation):
+            print("\(presentation.sourceName): \(presentation.valueText)")
             exitCode = 0
         case .failure(let error):
-            fputs("\(error.localizedDescription)\n", stderr)
+            let displayText = quotaErrorDisplayText(error) {
+                CodexConfigurationReader.modelProvider(
+                    at: codexConfigurationURL()
+                )
+            }
+            fputs("\(displayText)\n", stderr)
         }
         semaphore.signal()
     }
     if semaphore.wait(timeout: .now() + 20) == .timedOut {
-        fputs("读取额度超时\n", stderr)
+        fputs("读取用量超时\n", stderr)
     }
     exit(exitCode)
 }
@@ -51,11 +55,16 @@ func printMarketPriceOnce(symbol: String, label: String) -> Never {
 }
 
 func printPanelConfiguration() -> Never {
+    let usageSummary = usageProviderDiagnosticSummary(
+        panelConfig.usageProvider
+    )
     print(
         "panel-config: version=\(panelVersion) "
             + "bundle=\(panelBundleIdentifier) "
             + "theme=\(panelConfig.theme.id) "
             + "marketPricesEnabled=\(initialMarketPricesEnabled) "
+            + "usageProvider=\(usageSummary.provider) "
+            + "usageProviderConfigured=\(usageSummary.isConfigured) "
             + "codexConnection=\(panelConfig.widgets.codexConnection) "
             + "followStatus=\(panelConfig.widgets.followStatus) "
             + "width=\(Int(expandedPanelSize.width)) "
@@ -152,6 +161,10 @@ func runMenuControlsSelfTest() -> Never {
             storedValue: false,
             configuredDefault: true
         ) == false,
+        statusBarTooltip(
+            for: .disconnected,
+            quotaSourceName: "Sub2API"
+        ) == "Codex 状态面板：Sub2API 未连接",
         panelConfigFileURL.path.hasSuffix("default-panel-config.json")
             || panelConfigFileURL.path.hasSuffix("/panel-config.json"),
         editablePanelConfigFileURL.path.hasSuffix("/panel-config.json"),
@@ -595,7 +608,686 @@ func runAuthenticationFallbackSelfTest() -> Never {
     exit(0)
 }
 
-func renderPreviewOnce(to outputPath: String, collapsed: Bool) -> Never {
+private func usageProviderConfigurationChecks() -> [Bool] {
+    let decoder = JSONDecoder()
+    let legacyJSON = #"""
+    {
+      "version": 1,
+      "theme": {"id":"legacy","displayName":"Legacy","title":"Codex","backgroundImage":"quota-panel-background.png"},
+      "widgets": {"codexQuota":true,"codexConnection":true,"followStatus":true,"marketPrices":false},
+      "tracking": {"mode":"follow-current-codex-desktop","gapPoints":14,"mascotTopPaddingPoints":7,"fallback":"top-right"},
+      "refresh": {"quotaSeconds":300,"marketSeconds":5,"followSeconds":0.03}
+    }
+    """#
+    let missingProviderJSON = #"{"baseUrl":"https://example.com","apiKey":"self-test-key"}"#
+    let malformedProviderFieldJSON = #"""
+    {
+      "version": 1,
+      "usageProvider": {"baseUrl":"https://example.com","apiKey":123,"modelProvider":"sub2api"},
+      "theme": {"id":"invalid","displayName":"Invalid","title":"Codex","backgroundImage":"quota-panel-background.png"},
+      "widgets": {"codexQuota":true,"codexConnection":true,"followStatus":true,"marketPrices":false},
+      "tracking": {"mode":"follow-current-codex-desktop","gapPoints":14,"mascotTopPaddingPoints":7,"fallback":"top-right"},
+      "refresh": {"quotaSeconds":300,"marketSeconds":5,"followSeconds":0.03}
+    }
+    """#
+    let malformedProviderObjectJSON = malformedProviderFieldJSON
+        .replacingOccurrences(
+            of: #"{"baseUrl":"https://example.com","apiKey":123,"modelProvider":"sub2api"}"#,
+            with: "123"
+        )
+    let legacyConfig = try? decoder.decode(
+        PanelConfig.self,
+        from: Data(legacyJSON.utf8)
+    )
+    let defaulted = try? decoder.decode(
+        UsageProviderConfiguration.self,
+        from: Data(missingProviderJSON.utf8)
+    )
+    let malformedFieldConfig = try? decoder.decode(
+        PanelConfig.self,
+        from: Data(malformedProviderFieldJSON.utf8)
+    )
+    let malformedObjectConfig = try? decoder.decode(
+        PanelConfig.self,
+        from: Data(malformedProviderObjectJSON.utf8)
+    )
+
+    let codexDisabled: Bool
+    if case .success(.codex) = resolveUsageProviderConfiguration(nil) {
+        codexDisabled = true
+    } else {
+        codexDisabled = false
+    }
+
+    let emptyDisabled: Bool
+    if case .success(.codex) = resolveUsageProviderConfiguration(
+        UsageProviderConfiguration(
+            baseUrl: "",
+            apiKey: "",
+            modelProvider: "sub2api"
+        )
+    ) {
+        emptyDisabled = true
+    } else {
+        emptyDisabled = false
+    }
+
+    let uppercaseAccepted: Bool
+    if case let .success(.sub2api(baseURL, apiKey)) = resolveUsageProviderConfiguration(
+        UsageProviderConfiguration(
+            baseUrl: "https://example.com/proxy/",
+            apiKey: " self-test-key ",
+            modelProvider: " SUB2API "
+        )
+    ) {
+        uppercaseAccepted = baseURL.absoluteString == "https://example.com/proxy/"
+            && apiKey == "self-test-key"
+    } else {
+        uppercaseAccepted = false
+    }
+
+    let emptyProviderAccepted: Bool
+    if case .success(.sub2api) = resolveUsageProviderConfiguration(
+        UsageProviderConfiguration(
+            baseUrl: "https://example.com",
+            apiKey: "self-test-key",
+            modelProvider: "  "
+        )
+    ) {
+        emptyProviderAccepted = true
+    } else {
+        emptyProviderAccepted = false
+    }
+
+    let missingURLRejected = resolveUsageProviderConfiguration(
+        UsageProviderConfiguration(
+            baseUrl: "",
+            apiKey: "self-test-key",
+            modelProvider: "sub2api"
+        )
+    ) == .failure(.missingBaseURL)
+    let missingKeyRejected = resolveUsageProviderConfiguration(
+        UsageProviderConfiguration(
+            baseUrl: "https://example.com",
+            apiKey: "",
+            modelProvider: "sub2api"
+        )
+    ) == .failure(.missingAPIKey)
+    let invalidURLRejected = resolveUsageProviderConfiguration(
+        UsageProviderConfiguration(
+            baseUrl: "file:///tmp/usage",
+            apiKey: "self-test-key",
+            modelProvider: "sub2api"
+        )
+    ) == .failure(.invalidBaseURL)
+    let queryRejected = resolveUsageProviderConfiguration(
+        UsageProviderConfiguration(
+            baseUrl: "https://example.com?token=value",
+            apiKey: "self-test-key",
+            modelProvider: "sub2api"
+        )
+    ) == .failure(.invalidBaseURL)
+    let fragmentRejected = resolveUsageProviderConfiguration(
+        UsageProviderConfiguration(
+            baseUrl: "https://example.com#usage",
+            apiKey: "self-test-key",
+            modelProvider: "sub2api"
+        )
+    ) == .failure(.invalidBaseURL)
+    let userInfoRejected = resolveUsageProviderConfiguration(
+        UsageProviderConfiguration(
+            baseUrl: "https://demo:secret@localhost",
+            apiKey: "self-test-key",
+            modelProvider: "sub2api"
+        )
+    ) == .failure(.invalidBaseURL)
+    let unknownRejected = resolveUsageProviderConfiguration(
+        UsageProviderConfiguration(
+            baseUrl: "https://example.com",
+            apiKey: "self-test-key",
+            modelProvider: "other"
+        )
+    ) == .failure(.unsupportedModelProvider)
+    let controlCharacterKeyRejected = resolveUsageProviderConfiguration(
+        UsageProviderConfiguration(
+            baseUrl: "https://example.com",
+            apiKey: "self-test\r\nkey",
+            modelProvider: "sub2api"
+        )
+    ) == .failure(.invalidAPIKey)
+    let oversizedKeyRejected = resolveUsageProviderConfiguration(
+        UsageProviderConfiguration(
+            baseUrl: "https://example.com",
+            apiKey: String(repeating: "k", count: 129),
+            modelProvider: "sub2api"
+        )
+    ) == .failure(.invalidAPIKey)
+    let summary = usageProviderDiagnosticSummary(
+        UsageProviderConfiguration(
+            baseUrl: "https://example.com",
+            apiKey: "self-test-key",
+            modelProvider: "sub2api"
+        )
+    )
+
+    return [
+        legacyConfig?.usageProvider == nil,
+        defaulted?.modelProvider == "sub2api",
+        codexDisabled,
+        emptyDisabled,
+        uppercaseAccepted,
+        emptyProviderAccepted,
+        missingURLRejected,
+        missingKeyRejected,
+        invalidURLRejected,
+        queryRejected,
+        fragmentRejected,
+        userInfoRejected,
+        unknownRejected,
+        malformedFieldConfig.map {
+            resolveUsageProviderConfiguration($0.usageProvider)
+                == .failure(.invalidFormat)
+        } == true,
+        malformedObjectConfig.map {
+            resolveUsageProviderConfiguration($0.usageProvider)
+                == .failure(.invalidFormat)
+        } == true,
+        controlCharacterKeyRejected,
+        oversizedKeyRejected,
+        summary == UsageProviderDiagnosticSummary(
+            provider: "sub2api",
+            isConfigured: true
+        ),
+        !String(describing: summary).contains("self-test-key"),
+    ]
+}
+
+private func codexProviderChecks() -> [Bool] {
+    let primary = RateLimitsResult(
+        rateLimits: RateLimitSnapshot(
+            limitId: "codex",
+            limitName: "Codex",
+            primary: RateLimitWindow(
+                usedPercent: 6,
+                windowDurationMins: 10_080,
+                resetsAt: nil
+            ),
+            secondary: nil,
+            individualLimit: nil
+        ),
+        rateLimitsByLimitId: nil
+    )
+    let individual = RateLimitsResult(
+        rateLimits: RateLimitSnapshot(
+            limitId: "codex",
+            limitName: "Codex",
+            primary: nil,
+            secondary: nil,
+            individualLimit: SpendControlLimit(
+                remainingPercent: 20,
+                resetsAt: 1_800_000_000
+            )
+        ),
+        rateLimitsByLimitId: nil
+    )
+    let primaryPresentation = try? codexQuotaPresentation(from: primary)
+    let individualPresentation = try? codexQuotaPresentation(from: individual)
+    return [
+        primaryPresentation == QuotaPresentation(
+            sourceName: "Codex",
+            valueText: "剩余 94%",
+            progressPercent: 94,
+            detailText: "重置时间未知",
+            isDepleted: false
+        ),
+        individualPresentation?.progressPercent == 20,
+        individualPresentation?.valueText == "剩余 20%",
+    ]
+}
+
+private func quotaUIContractChecks() -> [Bool] {
+    let normal = QuotaPresentation(
+        sourceName: "Sub2API",
+        valueText: "剩余 46%",
+        progressPercent: 46,
+        detailText: "",
+        isDepleted: false
+    )
+    let warning = QuotaPresentation(
+        sourceName: "Sub2API",
+        valueText: "剩余 45%",
+        progressPercent: 45,
+        detailText: "",
+        isDepleted: false
+    )
+    let danger = QuotaPresentation(
+        sourceName: "Sub2API",
+        valueText: "剩余 20%",
+        progressPercent: 20,
+        detailText: "",
+        isDepleted: false
+    )
+    let wallet = QuotaPresentation(
+        sourceName: "Sub2API",
+        valueText: "余额 $12.34",
+        progressPercent: nil,
+        detailText: "今日Token 1.23亿",
+        isDepleted: false
+    )
+    let emptyWallet = QuotaPresentation(
+        sourceName: "Sub2API",
+        valueText: "余额 $0.00",
+        progressPercent: nil,
+        detailText: "今日Token 0.00亿",
+        isDepleted: true
+    )
+    let failure: Result<QuotaPresentation, Error> = .failure(
+        QuotaPresentationError.noDisplayableUsage
+    )
+
+    return [
+        quotaDisplayTone(for: normal) == .normal,
+        quotaDisplayTone(for: warning) == .warning,
+        quotaDisplayTone(for: danger) == .danger,
+        quotaDisplayTone(for: wallet) == .normal
+            && wallet.progressPercent == nil,
+        quotaDisplayTone(for: emptyWallet) == .danger
+            && emptyWallet.progressPercent == nil,
+        quotaPresentationAfterRefresh(
+            previous: wallet,
+            result: failure
+        ) == wallet,
+        quotaPresentationAfterRefresh(
+            previous: nil,
+            result: failure
+        ) == nil,
+        quotaPresentationAfterRefresh(
+            previous: wallet,
+            result: .success(normal)
+        ) == normal,
+    ]
+}
+
+private final class UsageProviderTestTask: HTTPDataTasking {
+    private(set) var isCancelled = false
+
+    func cancel() {
+        isCancelled = true
+    }
+}
+
+private final class UsageProviderTestLoader: HTTPDataLoading {
+    var capturedRequests: [URLRequest] = []
+    var data: Data?
+    var statusCode: Int
+    var error: Error?
+    var completes = true
+    let task = UsageProviderTestTask()
+
+    init(data: Data?, statusCode: Int = 200, error: Error? = nil) {
+        self.data = data
+        self.statusCode = statusCode
+        self.error = error
+    }
+
+    func loadData(
+        with request: URLRequest,
+        completion: @escaping (Data?, URLResponse?, Error?) -> Void
+    ) -> HTTPDataTasking {
+        capturedRequests.append(request)
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: statusCode,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )
+        if completes {
+            completion(data, response, error)
+        }
+        return task
+    }
+}
+
+private func fetchedPresentation(
+    provider: QuotaUsageFetching
+) -> Result<QuotaPresentation, Error>? {
+    let semaphore = DispatchSemaphore(value: 0)
+    var captured: Result<QuotaPresentation, Error>?
+    provider.fetch {
+        captured = $0
+        semaphore.signal()
+    }
+    _ = semaphore.wait(timeout: .now() + 1)
+    return captured
+}
+
+private func sub2APIProviderChecks() -> (
+    url: [Bool],
+    request: [Bool],
+    mapping: [Bool],
+    errors: [Bool]
+) {
+    let root = URL(string: "https://example.com")!
+    let prefixed = URL(string: "https://example.com/proxy/")!
+    let walletData = Data(#"{"mode":"unrestricted","isValid":true,"planName":"钱包余额","unit":"USD","remaining":12.34,"balance":12.34,"usage":{"today":{"total_tokens":123456789}},"unknown":"ignored"}"#.utf8)
+    let loader = UsageProviderTestLoader(data: walletData)
+    let client = try! Sub2APIUsageClient(
+        baseURL: root,
+        apiKey: "self-test-key",
+        loader: loader
+    )
+    let walletResult = fetchedPresentation(provider: client)
+    let request = loader.capturedRequests.first
+
+    let quotaData = Data(#"{"mode":"quota_limited","isValid":true,"quota":{"limit":100,"used":6,"remaining":94,"unit":"USD"}}"#.utf8)
+    let rateData = Data(#"{"mode":"quota_limited","isValid":true,"unit":"USD","rate_limits":[{"window":"5h","limit":20,"used":12,"remaining":8,"reset_at":"2026-07-25T00:00:00Z"},{"window":"1d","limit":100,"used":10,"remaining":90}]}"#.utf8)
+    let subscriptionData = Data(#"{"mode":"unrestricted","isValid":true,"planName":"Pro","unit":"USD","subscription":{"daily_usage_usd":2,"daily_limit_usd":10,"weekly_usage_usd":70,"weekly_limit_usd":100,"monthly_usage_usd":5,"monthly_limit_usd":100,"weekly_window_start":"2026-07-20T00:00:00Z"}}"#.utf8)
+    let zeroWalletData = Data(#"{"mode":"unrestricted","isValid":true,"unit":"USD","balance":0,"usage":{"today":{"total_tokens":0}}}"#.utf8)
+    let walletWithoutUsageData = Data(#"{"mode":"unrestricted","isValid":true,"unit":"USD","balance":9.99}"#.utf8)
+    let emptyData = Data(#"{"mode":"unrestricted","isValid":true}"#.utf8)
+    let incompleteQuotaData = Data(#"{"mode":"quota_limited","isValid":true,"quota":{"limit":100,"unit":"USD"}}"#.utf8)
+    let inactiveData = Data(#"{"mode":"unrestricted","isValid":false,"unit":"USD","balance":12.34}"#.utf8)
+    let extremeQuotaData = Data(#"{"mode":"quota_limited","isValid":true,"quota":{"limit":1e-308,"remaining":1e308,"unit":"USD"}}"#.utf8)
+    let fixedNow = Date(timeIntervalSince1970: 1_774_000_000)
+
+    let quota = try? Sub2APIUsageMapper.presentation(
+        from: quotaData,
+        now: fixedNow
+    )
+    let rate = try? Sub2APIUsageMapper.presentation(
+        from: rateData,
+        now: fixedNow
+    )
+    let subscription = try? Sub2APIUsageMapper.presentation(
+        from: subscriptionData,
+        now: fixedNow
+    )
+    let zeroWallet = try? Sub2APIUsageMapper.presentation(
+        from: zeroWalletData,
+        now: fixedNow
+    )
+    let walletWithoutUsage = try? Sub2APIUsageMapper.presentation(
+        from: walletWithoutUsageData,
+        now: fixedNow
+    )
+    let extremeQuota = try? Sub2APIUsageMapper.presentation(
+        from: extremeQuotaData,
+        now: fixedNow
+    )
+    var boundedBuffer = BoundedHTTPResponseBuffer(maximumBytes: 4)
+    let acceptedAtLimit = boundedBuffer.append(Data(repeating: 1, count: 4))
+    let rejectedPastLimit = !boundedBuffer.append(Data([2]))
+
+    let timeoutLoader = UsageProviderTestLoader(data: walletData)
+    timeoutLoader.completes = false
+    let timeoutClient = try! Sub2APIUsageClient(
+        baseURL: root,
+        apiKey: "self-test-key",
+        loader: timeoutLoader,
+        totalTimeout: 0.01
+    )
+    let absoluteTimeoutText: String?
+    if case let .failure(error)? = fetchedPresentation(
+        provider: timeoutClient
+    ) {
+        absoluteTimeoutText = error.localizedDescription
+    } else {
+        absoluteTimeoutText = nil
+    }
+    let wallet: QuotaPresentation?
+    if case let .success(value)? = walletResult {
+        wallet = value
+    } else {
+        wallet = nil
+    }
+
+    func normalizedURL(_ value: String) -> String? {
+        guard let url = URL(string: value) else { return nil }
+        return try? sub2APIUsageURL(from: url).absoluteString
+    }
+
+    func errorText(
+        status: Int,
+        data: Data? = walletData,
+        error: Error? = nil
+    ) -> String? {
+        let stub = UsageProviderTestLoader(
+            data: data,
+            statusCode: status,
+            error: error
+        )
+        let testClient = try! Sub2APIUsageClient(
+            baseURL: root,
+            apiKey: "self-test-key",
+            loader: stub
+        )
+        if case let .failure(failure)? = fetchedPresentation(
+            provider: testClient
+        ) {
+            return failure.localizedDescription
+        }
+        return nil
+    }
+
+    let invalidConfigurationProvider = makeQuotaUsageProvider(
+        configuration: UsageProviderConfiguration(
+            baseUrl: "https://example.com",
+            apiKey: "",
+            modelProvider: "sub2api"
+        ),
+        loader: loader
+    )
+    let invalidConfigurationText: String?
+    if case let .failure(error)? = fetchedPresentation(
+        provider: invalidConfigurationProvider
+    ) {
+        invalidConfigurationText = error.localizedDescription
+    } else {
+        invalidConfigurationText = nil
+    }
+
+    return (
+        url: [
+            normalizedURL("https://example.com")
+                == "https://example.com/v1/usage",
+            normalizedURL("https://example.com:18443")
+                == "https://example.com:18443/v1/usage",
+            normalizedURL("https://example.com/v1")
+                == "https://example.com/v1/usage",
+            normalizedURL("https://example.com/v1/usage/")
+                == "https://example.com/v1/usage",
+            try? sub2APIUsageURL(from: prefixed).absoluteString
+                == "https://example.com/proxy/v1/usage",
+        ].map { $0 == true },
+        request: [
+            request?.httpMethod == "GET",
+            request?.value(forHTTPHeaderField: "Accept")
+                == "application/json",
+            request?.value(forHTTPHeaderField: "Authorization")
+                == "Bearer self-test-key",
+            request?.value(forHTTPHeaderField: "x-api-key") == nil,
+            request?.url?.query == nil,
+            request?.httpBody == nil,
+            request?.timeoutInterval == 10,
+            request?.cachePolicy == .reloadIgnoringLocalCacheData,
+        ],
+        mapping: [
+            quota?.valueText == "剩余 94%"
+                && quota?.progressPercent == 94,
+            quota?.detailText == "$94.00 / $100.00",
+            rate?.valueText == "剩余 40%"
+                && rate?.detailText.hasPrefix("5 小时") == true,
+            subscription?.valueText == "剩余 30%"
+                && subscription?.detailText.hasPrefix("周额度") == true,
+            wallet?.valueText == "余额 $12.34"
+                && wallet?.progressPercent == nil,
+            wallet?.detailText == "今日Token 1.23亿"
+                && wallet?.isDepleted == false,
+            zeroWallet?.isDepleted == true
+                && zeroWallet?.progressPercent == nil
+                && zeroWallet?.detailText == "今日Token 0.00亿",
+            walletWithoutUsage?.detailText == "今日Token --"
+                && walletWithoutUsage?.valueText == "余额 $9.99",
+            (try? Sub2APIUsageMapper.presentation(
+                from: emptyData,
+                now: fixedNow
+            )) == nil,
+            (try? Sub2APIUsageMapper.presentation(
+                from: incompleteQuotaData,
+                now: fixedNow
+            )) == nil,
+        ],
+        errors: [
+            errorText(status: 401)
+                == "Sub2API API Key 无效或无权限",
+            errorText(
+                status: 401,
+                error: URLError(.networkConnectionLost)
+            ) == "Sub2API API Key 无效或无权限",
+            errorText(status: 403)
+                == "Sub2API API Key 无效或无权限",
+            errorText(status: 429)
+                == "Sub2API 请求过于频繁",
+            errorText(status: 500)
+                == "Sub2API 接口返回 HTTP 500",
+            errorText(status: 200, data: Data("not-json".utf8))
+                == "Sub2API 响应格式异常",
+            errorText(status: 200, data: Data())
+                == "Sub2API 返回了空响应",
+            errorText(
+                status: 200,
+                data: Data(repeating: 0, count: 1_048_577)
+            ) == "Sub2API 响应过大",
+            errorText(status: 200, data: inactiveData)
+                == "Sub2API API Key 当前不可用",
+            errorText(status: 200, error: URLError(.timedOut))
+                == "Sub2API 请求超时",
+            errorText(status: 200, error: URLError(.cannotFindHost))
+                == "无法连接 Sub2API",
+            errorText(
+                status: 200,
+                error: URLError(.serverCertificateUntrusted)
+            ) == "Sub2API TLS 连接失败",
+            makeQuotaUsageProvider(configuration: nil)
+                is CodexQuotaUsageProvider,
+            invalidConfigurationProvider.sourceDisplayName == "Sub2API"
+                && invalidConfigurationText
+                    == "第三方用量配置缺少 apiKey",
+            extremeQuota?.progressPercent == 100,
+            acceptedAtLimit && rejectedPastLimit
+                && boundedBuffer.data.count == 4,
+            absoluteTimeoutText == "Sub2API 请求超时"
+                && timeoutLoader.task.isCancelled,
+        ]
+    )
+}
+
+func runUsageProviderSelfTest() -> Never {
+    let configChecks = usageProviderConfigurationChecks()
+    let codexChecks = codexProviderChecks()
+    let uiChecks = quotaUIContractChecks()
+    let sub2API = sub2APIProviderChecks()
+    guard configChecks.allSatisfy({ $0 }) else {
+        fputs("usage-provider-self-test: config failed\n", stderr)
+        exit(1)
+    }
+    guard codexChecks.allSatisfy({ $0 }) else {
+        fputs("usage-provider-self-test: codex failed\n", stderr)
+        exit(1)
+    }
+    guard uiChecks.allSatisfy({ $0 }) else {
+        fputs("usage-provider-self-test: ui failed\n", stderr)
+        exit(1)
+    }
+    guard sub2API.url.allSatisfy({ $0 }) else {
+        fputs("usage-provider-self-test: url failed\n", stderr)
+        exit(1)
+    }
+    guard sub2API.request.allSatisfy({ $0 }) else {
+        fputs("usage-provider-self-test: request failed\n", stderr)
+        exit(1)
+    }
+    guard sub2API.mapping.allSatisfy({ $0 }) else {
+        fputs("usage-provider-self-test: mapping failed\n", stderr)
+        exit(1)
+    }
+    guard sub2API.errors.allSatisfy({ $0 }) else {
+        fputs("usage-provider-self-test: errors failed\n", stderr)
+        exit(1)
+    }
+    print(
+        "usage-provider-self-test: "
+            + "config=\(configChecks.count)/\(configChecks.count); "
+            + "codex=\(codexChecks.count)/\(codexChecks.count); "
+            + "ui=\(uiChecks.count)/\(uiChecks.count); "
+            + "url=\(sub2API.url.count)/\(sub2API.url.count); "
+            + "request=\(sub2API.request.count)/\(sub2API.request.count); "
+            + "mapping=\(sub2API.mapping.count)/\(sub2API.mapping.count); "
+            + "errors=\(sub2API.errors.count)/\(sub2API.errors.count)"
+    )
+    exit(0)
+}
+
+enum PreviewUsageMode: String {
+    case codex
+    case sub2apiWallet = "sub2api-wallet"
+    case sub2apiEmptyWallet = "sub2api-empty-wallet"
+    case sub2apiWarning = "sub2api-warning"
+    case sub2apiDanger = "sub2api-danger"
+}
+
+private func previewQuotaPresentation(
+    for mode: PreviewUsageMode
+) -> QuotaPresentation {
+    switch mode {
+    case .codex:
+        return QuotaPresentation(
+            sourceName: "Codex",
+            valueText: "剩余 94%",
+            progressPercent: 94,
+            detailText: "7/31 12:43 重置",
+            isDepleted: false
+        )
+    case .sub2apiWallet:
+        return QuotaPresentation(
+            sourceName: "Sub2API",
+            valueText: "余额 $12.34",
+            progressPercent: nil,
+            detailText: "今日Token 1.23亿",
+            isDepleted: false
+        )
+    case .sub2apiEmptyWallet:
+        return QuotaPresentation(
+            sourceName: "Sub2API",
+            valueText: "余额 $0.00",
+            progressPercent: nil,
+            detailText: "今日Token 0.00亿",
+            isDepleted: true
+        )
+    case .sub2apiWarning:
+        return QuotaPresentation(
+            sourceName: "Sub2API",
+            valueText: "剩余 45%",
+            progressPercent: 45,
+            detailText: "1 天 · 重置时间未知",
+            isDepleted: false
+        )
+    case .sub2apiDanger:
+        return QuotaPresentation(
+            sourceName: "Sub2API",
+            valueText: "剩余 20%",
+            progressPercent: 20,
+            detailText: "5 小时 · 重置时间未知",
+            isDepleted: false
+        )
+    }
+}
+
+func renderPreviewOnce(
+    to outputPath: String,
+    collapsed: Bool,
+    usageMode: PreviewUsageMode
+) -> Never {
     // 离屏创建 NSView 并缓存到位图，不需要真正显示窗口即可生成 UI 预览 PNG。
     let previewTaskProgress = TaskProgressSnapshot(items: [
         TaskProgressItem(
@@ -620,13 +1312,11 @@ func renderPreviewOnce(to outputPath: String, collapsed: Bool) -> Never {
     view.isCollapsed = collapsed
     view.showsMarketPrices = true
     view.taskProgress = previewTaskProgress
-    view.rows = [QuotaRow(
-        name: "Codex",
-        remainingPercent: 94,
-        resetsAt: Calendar.current.date(byAdding: .day, value: 7, to: Date())
-    )]
+    let presentation = previewQuotaPresentation(for: usageMode)
+    view.quotaSourceName = presentation.sourceName
+    view.quotaPresentation = presentation
     view.statusText = "12:43"
-    view.codexConnectionText = "已连接"
+    view.connectionText = "已连接"
     view.followStatusText = "跟随中"
     view.btcPrice = 64_169.97
     view.btcPriceDirection = 1

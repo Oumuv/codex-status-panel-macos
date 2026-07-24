@@ -123,14 +123,17 @@ func statusBarSymbolName(for state: MenuBarDisplayState) -> String {
     }
 }
 
-func statusBarTooltip(for state: MenuBarDisplayState) -> String {
+func statusBarTooltip(
+    for state: MenuBarDisplayState,
+    quotaSourceName: String = "Codex"
+) -> String {
     switch state {
     case .normal:
         return "Codex 状态面板：正常"
     case .refreshing:
         return "Codex 状态面板：正在读取"
     case .disconnected:
-        return "Codex 状态面板：Codex 未连接"
+        return "Codex 状态面板：\(quotaSourceName) 未连接"
     case .followAttention:
         return "Codex 状态面板：跟随目标不可用"
     }

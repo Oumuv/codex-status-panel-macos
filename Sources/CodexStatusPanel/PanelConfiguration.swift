@@ -4,7 +4,7 @@
 import AppKit
 import Foundation
 
-let panelVersion = "1.2.1"
+let panelVersion = "1.2.2"
 let defaultBundleIdentifier = "io.github.mayday-materials.codex-status-panel"
 let panelBundleIdentifier = Bundle.main.bundleIdentifier ?? defaultBundleIdentifier
 let panelClientName = "codex-status-panel"
@@ -24,13 +24,62 @@ private func defaultMarketPricesEnabledFromEnvironment() -> Bool {
 /// `fallback` 是所有外部配置都不可用时仍能启动面板的内置默认值。
 struct PanelConfig: Decodable {
     var version: Int
+    var usageProvider: UsageProviderConfiguration?
     var theme: PanelTheme
     var widgets: PanelWidgets
     var tracking: PanelTracking
     var refresh: PanelRefresh
 
+    private enum CodingKeys: String, CodingKey {
+        case version, usageProvider, theme, widgets, tracking, refresh
+    }
+
+    init(
+        version: Int,
+        usageProvider: UsageProviderConfiguration?,
+        theme: PanelTheme,
+        widgets: PanelWidgets,
+        tracking: PanelTracking,
+        refresh: PanelRefresh
+    ) {
+        self.version = version
+        self.usageProvider = usageProvider
+        self.theme = theme
+        self.widgets = widgets
+        self.tracking = tracking
+        self.refresh = refresh
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(Int.self, forKey: .version)
+        theme = try container.decode(PanelTheme.self, forKey: .theme)
+        widgets = try container.decode(PanelWidgets.self, forKey: .widgets)
+        tracking = try container.decode(PanelTracking.self, forKey: .tracking)
+        refresh = try container.decode(PanelRefresh.self, forKey: .refresh)
+
+        let providerIsMissing = !container.contains(.usageProvider)
+        let providerIsNull = providerIsMissing
+            ? false : try container.decodeNil(forKey: .usageProvider)
+        if providerIsMissing || providerIsNull {
+            usageProvider = nil
+        } else {
+            do {
+                usageProvider = try container.decode(
+                    UsageProviderConfiguration.self,
+                    forKey: .usageProvider
+                )
+            } catch {
+                // Provider 的类型错误必须保留为显式失败，不能让整个配置源
+                // 解码失败后继续回退到内置 Codex 账户。
+                usageProvider = .invalidFormat
+            }
+        }
+    }
+
     static let fallback = PanelConfig(
         version: 1,
+        usageProvider: nil,
         theme: PanelTheme(
             id: "codex-default",
             displayName: "Codex Default",
@@ -55,6 +104,176 @@ struct PanelConfig: Decodable {
             followSeconds: 0.03
         )
     )
+}
+
+struct UsageProviderConfiguration: Decodable, Equatable {
+    let baseUrl: String
+    let apiKey: String
+    let modelProvider: String
+    let validationError: UsageProviderConfigurationError?
+
+    init(
+        baseUrl: String = "",
+        apiKey: String = "",
+        modelProvider: String = "sub2api",
+        validationError: UsageProviderConfigurationError? = nil
+    ) {
+        self.baseUrl = baseUrl
+        self.apiKey = apiKey
+        self.modelProvider = modelProvider
+        self.validationError = validationError
+    }
+
+    static let invalidFormat = UsageProviderConfiguration(
+        validationError: .invalidFormat
+    )
+
+    private enum CodingKeys: String, CodingKey {
+        case baseUrl
+        case apiKey
+        case modelProvider
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        var hasInvalidField = false
+
+        func decodeString(
+            _ key: CodingKeys,
+            default defaultValue: String
+        ) -> String {
+            do {
+                return try container.decodeIfPresent(
+                    String.self,
+                    forKey: key
+                ) ?? defaultValue
+            } catch {
+                hasInvalidField = true
+                return defaultValue
+            }
+        }
+
+        baseUrl = decodeString(.baseUrl, default: "")
+        apiKey = decodeString(.apiKey, default: "")
+        modelProvider = decodeString(
+            .modelProvider,
+            default: "sub2api"
+        )
+        validationError = hasInvalidField ? .invalidFormat : nil
+    }
+}
+
+enum ResolvedUsageProviderConfiguration: Equatable {
+    case codex
+    case sub2api(baseURL: URL, apiKey: String)
+}
+
+enum UsageProviderConfigurationError: LocalizedError, Equatable {
+    case missingBaseURL
+    case missingAPIKey
+    case invalidBaseURL
+    case invalidAPIKey
+    case invalidFormat
+    case unsupportedModelProvider
+
+    var errorDescription: String? {
+        switch self {
+        case .missingBaseURL:
+            return "第三方用量配置缺少 baseUrl"
+        case .missingAPIKey:
+            return "第三方用量配置缺少 apiKey"
+        case .invalidBaseURL:
+            return "第三方用量配置的 baseUrl 无效"
+        case .invalidAPIKey:
+            return "第三方用量配置的 apiKey 无效"
+        case .invalidFormat:
+            return "第三方用量配置格式无效"
+        case .unsupportedModelProvider:
+            return "第三方用量目前只支持 sub2api"
+        }
+    }
+}
+
+struct UsageProviderDiagnosticSummary: Equatable {
+    let provider: String
+    let isConfigured: Bool
+}
+
+func resolveUsageProviderConfiguration(
+    _ configuration: UsageProviderConfiguration?
+) -> Result<ResolvedUsageProviderConfiguration, UsageProviderConfigurationError> {
+    guard let configuration else { return .success(.codex) }
+    if let validationError = configuration.validationError {
+        return .failure(validationError)
+    }
+
+    let baseURLText = configuration.baseUrl.trimmingCharacters(
+        in: .whitespacesAndNewlines
+    )
+    let apiKey = configuration.apiKey.trimmingCharacters(
+        in: .whitespacesAndNewlines
+    )
+    let rawProvider = configuration.modelProvider.trimmingCharacters(
+        in: .whitespacesAndNewlines
+    )
+    let provider = rawProvider.isEmpty
+        ? "sub2api"
+        : rawProvider.lowercased()
+
+    if baseURLText.isEmpty && apiKey.isEmpty {
+        return .success(.codex)
+    }
+    guard !baseURLText.isEmpty else { return .failure(.missingBaseURL) }
+    guard !apiKey.isEmpty else { return .failure(.missingAPIKey) }
+    guard apiKey.utf8.count <= 128,
+          !apiKey.unicodeScalars.contains(where: {
+              CharacterSet.controlCharacters.contains($0)
+          })
+    else {
+        return .failure(.invalidAPIKey)
+    }
+    guard provider == "sub2api" else {
+        return .failure(.unsupportedModelProvider)
+    }
+
+    guard var components = URLComponents(string: baseURLText),
+          let scheme = components.scheme?.lowercased(),
+          scheme == "http" || scheme == "https",
+          components.host?.isEmpty == false,
+          components.user == nil,
+          components.password == nil,
+          components.query == nil,
+          components.fragment == nil
+    else {
+        return .failure(.invalidBaseURL)
+    }
+    components.scheme = scheme
+    guard let baseURL = components.url else {
+        return .failure(.invalidBaseURL)
+    }
+    return .success(.sub2api(baseURL: baseURL, apiKey: apiKey))
+}
+
+func usageProviderDiagnosticSummary(
+    _ configuration: UsageProviderConfiguration?
+) -> UsageProviderDiagnosticSummary {
+    switch resolveUsageProviderConfiguration(configuration) {
+    case .success(.codex):
+        return UsageProviderDiagnosticSummary(
+            provider: "codex",
+            isConfigured: false
+        )
+    case .success(.sub2api):
+        return UsageProviderDiagnosticSummary(
+            provider: "sub2api",
+            isConfigured: true
+        )
+    case .failure:
+        return UsageProviderDiagnosticSummary(
+            provider: "invalid",
+            isConfigured: true
+        )
+    }
 }
 
 struct PanelTheme: Decodable {

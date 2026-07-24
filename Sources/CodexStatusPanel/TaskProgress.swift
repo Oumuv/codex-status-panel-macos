@@ -37,12 +37,6 @@ struct RPCResponse: Decodable {
     let error: RPCError?
 }
 
-struct QuotaRow {
-    let name: String
-    let remainingPercent: Int
-    let resetsAt: Date?
-}
-
 enum TaskProgressKind: String, Equatable {
     case reading
     case running

@@ -1,5 +1,10 @@
 {
   "version": 1,
+  "usageProvider": {
+    "baseUrl": "",
+    "apiKey": "",
+    "modelProvider": "sub2api"
+  },
   "theme": {
     "id": "codex-default",
     "displayName": "Codex Default",

@@ -19,6 +19,7 @@ cp "$ROOT/Resources/quota-panel-background.png" "$RESOURCES/quota-panel-backgrou
 cp "$ROOT/Resources/default-panel-config.json" "$RESOURCES/default-panel-config.json"
 for TASK_ICON in \
   task-running-icon.png \
+  task-running-badge.gif \
   task-waiting-icon.png \
   task-completed-icon.png \
   task-failed-icon.png; do

@@ -15,6 +15,7 @@ let cliFlags: Set<String> = [
     "--self-test-menu-controls",
     "--self-test-task-progress",
     "--self-test-authentication-fallback",
+    "--self-test-usage-provider",
     "--print-panel-config",
     "--print-task-progress",
     "--render-preview",
@@ -59,6 +60,10 @@ if CommandLine.arguments.contains("--self-test-authentication-fallback") {
     runAuthenticationFallbackSelfTest()
 }
 
+if CommandLine.arguments.contains("--self-test-usage-provider") {
+    runUsageProviderSelfTest()
+}
+
 if CommandLine.arguments.contains("--print-panel-config") {
     printPanelConfiguration()
 }
@@ -69,12 +74,29 @@ if CommandLine.arguments.contains("--print-task-progress") {
 
 if let previewFlag = CommandLine.arguments.firstIndex(of: "--render-preview") {
     guard CommandLine.arguments.indices.contains(previewFlag + 1) else {
-        fputs("用法：CodexStatusPanel --render-preview <output.png> [--collapsed]\n", stderr)
+        fputs("用法：CodexStatusPanel --render-preview <output.png> [--collapsed] [--preview-usage <mode>]\n", stderr)
         exit(1)
+    }
+    let usageMode: PreviewUsageMode
+    if let modeFlag = CommandLine.arguments.firstIndex(
+        of: "--preview-usage"
+    ) {
+        guard CommandLine.arguments.indices.contains(modeFlag + 1),
+              let parsed = PreviewUsageMode(
+                rawValue: CommandLine.arguments[modeFlag + 1]
+              )
+        else {
+            fputs("用法：--preview-usage <codex|sub2api-wallet|sub2api-empty-wallet|sub2api-warning|sub2api-danger>\n", stderr)
+            exit(1)
+        }
+        usageMode = parsed
+    } else {
+        usageMode = .codex
     }
     renderPreviewOnce(
         to: CommandLine.arguments[previewFlag + 1],
-        collapsed: CommandLine.arguments.contains("--collapsed")
+        collapsed: CommandLine.arguments.contains("--collapsed"),
+        usageMode: usageMode
     )
 }
 

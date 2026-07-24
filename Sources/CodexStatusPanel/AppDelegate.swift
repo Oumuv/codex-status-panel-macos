@@ -6,7 +6,9 @@ import Foundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 这些服务对象各自封装一种数据来源；AppDelegate 只负责编排刷新时机和界面状态。
-    private let quotaClient = CodexQuotaClient()
+    private let quotaProvider = makeQuotaUsageProvider(
+        configuration: panelConfig.usageProvider
+    )
     private let taskProgressReader = CodexTaskProgressReader()
     private let btcPriceClient = MarketPriceClient(symbol: "BTCUSDT")
     private let ethPriceClient = MarketPriceClient(symbol: "ETHUSDT")
@@ -55,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // accessory 模式不会在 Dock 中显示普通 App 图标，只保留菜单栏状态项和浮动面板。
         NSApp.setActivationPolicy(.accessory)
         reportPanelConfigWarnings()
+        quotaView.quotaSourceName = quotaProvider.sourceDisplayName
         makeStatusItem()
         makePanel()
         quotaView.showsMarketPrices = showsMarketPrices
@@ -89,6 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        quotaView.setRunningTaskBadgeAnimationsEnabled(false)
         refreshTimer?.invalidate()
         taskProgressTimer?.invalidate()
         btcRefreshTimer?.invalidate()
@@ -145,7 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             quotaUpdatedText = quotaView.statusText
         }
 
-        let codexTitle = "Codex：\(quotaView.codexConnectionText) · 额度：\(quotaUpdatedText)"
+        let quotaTitle = "\(quotaView.quotaSourceName)：\(quotaView.connectionText) · 额度：\(quotaUpdatedText)"
         let followTitle: String
         if isPanelHiddenByUser {
             followTitle = "面板：已隐藏"
@@ -163,7 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         // 只有菜单显示内容真正变化时才更新 AppKit 对象，减少高频跟随期间的无效工作。
         let signature = [
-            codexTitle,
+            quotaTitle,
             followTitle,
             String(controlState.showPanelEnabled),
             String(controlState.hidePanelEnabled),
@@ -173,7 +177,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ].joined(separator: "|")
 
         if force || signature != lastStatusMenuSignature {
-            codexStatusMenuItem.title = codexTitle
+            codexStatusMenuItem.title = quotaTitle
             followStatusMenuItem.title = followTitle
             showPanelMenuItem.isEnabled = controlState.showPanelEnabled
             hidePanelMenuItem.isEnabled = controlState.hidePanelEnabled
@@ -196,7 +200,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             followHealthStatus: iconFollowStatus
         )
         guard state != lastStatusBarDisplayState else { return }
-        let tooltip = statusBarTooltip(for: state)
+        let tooltip = statusBarTooltip(
+            for: state,
+            quotaSourceName: quotaView.quotaSourceName
+        )
 
         if let image = NSImage(systemSymbolName: statusBarSymbolName(for: state), accessibilityDescription: tooltip) {
             image.isTemplate = true
@@ -266,6 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func hidePanelFromMenu(_ sender: Any?) {
         isManualStandaloneEnabled = false
         isPanelHiddenByUser = true
+        quotaView.setRunningTaskBadgeAnimationsEnabled(false)
         if panel.isVisible {
             panel.orderOut(nil)
         }
@@ -358,6 +366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func followPet(forceStandaloneFallback: Bool = false) {
         // 这是跟随功能的状态分支：用户隐藏 → 找不到桌宠时回退/等待 → 找到后精确跟随。
         guard !isPanelHiddenByUser else {
+            quotaView.setRunningTaskBadgeAnimationsEnabled(false)
             if panel.isVisible {
                 panel.orderOut(nil)
             }
@@ -382,6 +391,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     locationSource: "screen-fallback"
                 )
             } else {
+                quotaView.setRunningTaskBadgeAnimationsEnabled(false)
                 panel.orderOut(nil)
                 quotaView.followStatusText = "等待桌宠"
                 followHealthStatus = "waiting-for-pet"
@@ -413,6 +423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !panel.isVisible {
             panel.orderFrontRegardless()
         }
+        quotaView.setRunningTaskBadgeAnimationsEnabled(true)
         writeHealth(
             status: "following-pet",
             panelVisible: true,
@@ -458,12 +469,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !panel.isVisible {
             panel.orderFrontRegardless()
         }
+        quotaView.setRunningTaskBadgeAnimationsEnabled(true)
     }
 
     private func refreshQuota() {
         guard !isRefreshing else { return }
         isRefreshing = true
-        if quotaView.rows.isEmpty {
+        if quotaView.quotaPresentation == nil {
             quotaView.errorText = nil
             quotaView.statusText = "正在读取额度…"
         } else {
@@ -472,7 +484,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusMenu()
 
         // 客户端在后台队列回调；先准备错误文案，再切回主线程修改 AppKit 界面。
-        quotaClient.fetch { [weak self] result in
+        quotaProvider.fetch { [weak self] result in
             let errorText: String?
             if case .failure(let error) = result {
                 errorText = quotaErrorDisplayText(error) {
@@ -487,20 +499,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isRefreshing = false
+                self.quotaView.quotaPresentation = quotaPresentationAfterRefresh(
+                    previous: self.quotaView.quotaPresentation,
+                    result: result
+                )
                 switch result {
-                case .success(let response):
-                    self.quotaView.rows = Self.makeRows(from: response)
+                case .success(let presentation):
+                    self.quotaView.quotaSourceName = presentation.sourceName
                     self.quotaView.errorText = nil
                     self.codexConnectionStatus = "connected"
-                    self.quotaView.codexConnectionText = "已连接"
+                    self.quotaView.connectionText = "已连接"
                     let now = Date()
                     self.lastQuotaUpdatedAt = now
                     self.quotaView.statusText = Self.timeFormatter.string(from: now)
                 case .failure(let error):
                     self.codexConnectionStatus = "disconnected"
-                    self.quotaView.codexConnectionText = "未连接"
-                    self.quotaView.errorText = errorText
-                        ?? error.localizedDescription
+                    self.quotaView.connectionText = "未连接"
+                    if self.quotaView.quotaPresentation == nil {
+                        self.quotaView.errorText = errorText
+                            ?? error.localizedDescription
+                    } else {
+                        self.quotaView.errorText = nil
+                    }
                     self.quotaView.statusText = "重试中"
                 }
                 self.updateStatusMenu()
@@ -613,28 +633,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
-    }
-
-    private static func makeRows(from response: RateLimitsResult) -> [QuotaRow] {
-        let snapshot = codexSnapshot(from: response)
-
-        if let window = snapshot.primary {
-            return [QuotaRow(
-                name: "Codex",
-                remainingPercent: max(0, 100 - window.usedPercent),
-                resetsAt: window.resetsAt.map { Date(timeIntervalSince1970: TimeInterval($0)) }
-            )]
-        }
-
-        if let individual = snapshot.individualLimit {
-            return [QuotaRow(
-                name: "Codex",
-                remainingPercent: individual.remainingPercent,
-                resetsAt: Date(timeIntervalSince1970: TimeInterval(individual.resetsAt))
-            )]
-        }
-
-        return [QuotaRow(name: "Codex", remainingPercent: 0, resetsAt: nil)]
     }
 
     private static let timeFormatter: DateFormatter = {
