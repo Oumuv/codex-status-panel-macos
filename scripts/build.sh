@@ -9,22 +9,17 @@ RESOURCES="$CONTENTS/Resources"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 SDK="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)"
-SWIFT_SOURCES=("$ROOT"/Sources/CodexStatusPanel/*.swift)
+SWIFT_SOURCES=("$ROOT"/Sources/CodexStatusPanel/**/*.swift(N))
 
-rm -rf "$APP"
-mkdir -p "$MACOS" "$RESOURCES"
-cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
-cp "$ROOT/Resources/AppIcon.icns" "$RESOURCES/AppIcon.icns"
-cp "$ROOT/Resources/quota-panel-background.png" "$RESOURCES/quota-panel-background.png"
-cp "$ROOT/Resources/default-panel-config.json" "$RESOURCES/default-panel-config.json"
-for TASK_ICON in \
-  task-running-icon.png \
-  task-running-badge.gif \
-  task-waiting-icon.png \
-  task-completed-icon.png \
-  task-failed-icon.png; do
-  cp "$ROOT/Resources/$TASK_ICON" "$RESOURCES/$TASK_ICON"
-done
+if (( ${#SWIFT_SOURCES[@]} == 0 )); then
+  echo "没有找到 Swift 源文件：$ROOT/Sources/CodexStatusPanel" >&2
+  exit 1
+fi
+
+/bin/rm -rf "$APP"
+/bin/mkdir -p "$MACOS" "$RESOURCES"
+/usr/bin/ditto "$ROOT/Resources" "$RESOURCES"
+/bin/mv "$RESOURCES/Info.plist" "$CONTENTS/Info.plist"
 
 for ARCH in arm64 x86_64; do
   /usr/bin/swiftc \

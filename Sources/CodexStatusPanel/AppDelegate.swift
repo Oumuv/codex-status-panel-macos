@@ -6,7 +6,7 @@ import Foundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 这些服务对象各自封装一种数据来源；AppDelegate 只负责编排刷新时机和界面状态。
-    private let quotaProvider = makeQuotaUsageProvider(
+    private var quotaProvider = makeQuotaUsageProvider(
         configuration: panelConfig.usageProvider
     )
     private let taskProgressReader = CodexTaskProgressReader()
@@ -33,11 +33,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     )
     private let resetFollowMenuItem = NSMenuItem(title: "重置跟随位置", action: #selector(resetFollowPositionFromMenu(_:)), keyEquivalent: "")
     private let openConfigMenuItem = NSMenuItem(title: "打开配置文件", action: #selector(openConfigFileFromMenu(_:)), keyEquivalent: ",")
+    private let reloadConfigMenuItem = NSMenuItem(title: "重新加载配置", action: #selector(reloadConfigFromMenu(_:)), keyEquivalent: "")
     private var refreshTimer: Timer?
     private var taskProgressTimer: Timer?
     private var btcRefreshTimer: Timer?
     private var followTimer: Timer?
     private var isRefreshing = false
+    private var quotaRefreshGeneration = 0
     private var isRefreshingTaskProgress = false
     private var isRefreshingBTCPrice = false
     private var isRefreshingETHPrice = false
@@ -52,6 +54,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isManualStandaloneEnabled = false
     private var lastStatusMenuSignature = ""
     private var lastStatusBarDisplayState: MenuBarDisplayState?
+    private lazy var statusBarIconImage: NSImage? = {
+        guard let imageURL = Bundle.main.url(forResource: "03-pink", withExtension: "png"),
+              let image = NSImage(contentsOf: imageURL) else {
+            return nil
+        }
+        image.size = NSSize(width: 18, height: 18)
+        image.isTemplate = false
+        return image
+    }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // accessory 模式不会在 Dock 中显示普通 App 图标，只保留菜单栏状态项和浮动面板。
@@ -70,25 +81,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             refreshETHPrice()
         }
 
-        // 定时器会持有闭包；使用 weak self 避免闭包反过来强持有 AppDelegate。
-        followTimer = Timer.scheduledTimer(withTimeInterval: followInterval, repeats: true) { [weak self] _ in
-            self?.followPet()
-        }
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
-            self?.refreshQuota()
-        }
         taskProgressTimer = Timer.scheduledTimer(
             withTimeInterval: taskProgressRefreshInterval,
             repeats: true
         ) { [weak self] _ in
             self?.refreshTaskProgress()
         }
-        if showsMarketPrices {
-            btcRefreshTimer = Timer.scheduledTimer(withTimeInterval: btcRefreshInterval, repeats: true) { [weak self] _ in
-                self?.refreshBTCPrice()
-                self?.refreshETHPrice()
-            }
-        }
+        restartConfigurableTimers()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -98,6 +97,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         btcRefreshTimer?.invalidate()
         followTimer?.invalidate()
         writeHealth(status: "terminated", panelVisible: false, locationSource: nil, force: true)
+    }
+
+    private func restartConfigurableTimers() {
+        followTimer?.invalidate()
+        refreshTimer?.invalidate()
+        btcRefreshTimer?.invalidate()
+        btcRefreshTimer = nil
+
+        // 定时器会持有闭包；使用 weak self 避免闭包反过来强持有 AppDelegate。
+        followTimer = Timer.scheduledTimer(
+            withTimeInterval: followInterval,
+            repeats: true
+        ) { [weak self] _ in
+            self?.followPet()
+        }
+        refreshTimer = Timer.scheduledTimer(
+            withTimeInterval: refreshInterval,
+            repeats: true
+        ) { [weak self] _ in
+            self?.refreshQuota()
+        }
+        if showsMarketPrices {
+            btcRefreshTimer = Timer.scheduledTimer(
+                withTimeInterval: btcRefreshInterval,
+                repeats: true
+            ) { [weak self] _ in
+                self?.refreshBTCPrice()
+                self?.refreshETHPrice()
+            }
+        }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -122,6 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             toggleMarketPricesMenuItem,
             resetFollowMenuItem,
             openConfigMenuItem,
+            reloadConfigMenuItem,
         ] {
             item.target = self
             statusMenu.addItem(item)
@@ -205,7 +235,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             quotaSourceName: quotaView.quotaSourceName
         )
 
-        if let image = NSImage(systemSymbolName: statusBarSymbolName(for: state), accessibilityDescription: tooltip) {
+        button.imageScaling = .scaleProportionallyDown
+        if let image = statusBarIconImage {
+            image.accessibilityDescription = tooltip
+            button.image = image
+            button.title = ""
+        } else if let image = NSImage(systemSymbolName: statusBarSymbolName(for: state), accessibilityDescription: tooltip) {
             image.isTemplate = true
             button.image = image
             button.title = ""
@@ -297,14 +332,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setMarketPricesEnabled(!showsMarketPrices)
     }
 
-    private func setMarketPricesEnabled(_ enabled: Bool) {
+    private func setMarketPricesEnabled(
+        _ enabled: Bool,
+        persistPreference: Bool = true
+    ) {
         guard showsMarketPrices != enabled else {
             updateStatusMenu()
             return
         }
 
         showsMarketPrices = enabled
-        UserDefaults.standard.set(enabled, forKey: marketPricesPreferenceKey)
+        if persistPreference {
+            UserDefaults.standard.set(enabled, forKey: marketPricesPreferenceKey)
+        }
         quotaView.showsMarketPrices = enabled
 
         if enabled {
@@ -356,6 +396,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSWorkspace.shared.open(editableConfigURL)
         } else {
             NSWorkspace.shared.open(editablePanelConfigFileURL.deletingLastPathComponent())
+        }
+    }
+
+    @objc private func reloadConfigFromMenu(_ sender: Any?) {
+        let previousUsageProvider = panelConfig.usageProvider
+
+        do {
+            let reloadedConfig = try reloadPanelConfig()
+            quotaRefreshGeneration += 1
+            isRefreshing = false
+            quotaProvider = makeQuotaUsageProvider(
+                configuration: reloadedConfig.usageProvider
+            )
+            quotaView.reloadPanelConfiguration()
+            quotaView.quotaSourceName = quotaProvider.sourceDisplayName
+
+            if previousUsageProvider != reloadedConfig.usageProvider {
+                quotaView.quotaPresentation = nil
+                quotaView.errorText = nil
+                lastQuotaUpdatedAt = nil
+                codexConnectionStatus = "disconnected"
+                quotaView.connectionText = "连接中"
+            }
+
+            let marketPricesEnabled = resolvedMarketPricesEnabled(
+                storedValue: UserDefaults.standard.object(
+                    forKey: marketPricesPreferenceKey
+                ) as? Bool,
+                configuredDefault: configuredMarketPricesEnabled(
+                    for: reloadedConfig
+                )
+            )
+            setMarketPricesEnabled(
+                marketPricesEnabled,
+                persistPreference: false
+            )
+            restartConfigurableTimers()
+            locator.reset()
+            refreshQuota()
+            if !isPanelHiddenByUser {
+                followPet(forceStandaloneFallback: isManualStandaloneEnabled)
+            }
+            updateStatusMenu(force: true)
+        } catch {
+            fputs(
+                "panel-config: 重新加载失败，继续使用当前配置：\(error.localizedDescription)\n",
+                stderr
+            )
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "无法重新加载配置"
+            alert.informativeText = "配置文件没有生效，应用将继续使用当前配置。\n\n\(error.localizedDescription)"
+            alert.addButton(withTitle: "好")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
         }
     }
 
@@ -475,6 +570,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshQuota() {
         guard !isRefreshing else { return }
         isRefreshing = true
+        let refreshGeneration = quotaRefreshGeneration
+        let provider = quotaProvider
         if quotaView.quotaPresentation == nil {
             quotaView.errorText = nil
             quotaView.statusText = "正在读取额度…"
@@ -484,7 +581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusMenu()
 
         // 客户端在后台队列回调；先准备错误文案，再切回主线程修改 AppKit 界面。
-        quotaProvider.fetch { [weak self] result in
+        provider.fetch { [weak self] result in
             let errorText: String?
             if case .failure(let error) = result {
                 errorText = quotaErrorDisplayText(error) {
@@ -497,7 +594,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self,
+                      self.quotaRefreshGeneration == refreshGeneration
+                else { return }
                 self.isRefreshing = false
                 self.quotaView.quotaPresentation = quotaPresentationAfterRefresh(
                     previous: self.quotaView.quotaPresentation,

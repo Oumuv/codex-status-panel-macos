@@ -635,22 +635,20 @@ private func usageProviderConfigurationChecks() -> [Bool] {
             of: #"{"baseUrl":"https://example.com","apiKey":123,"modelProvider":"sub2api"}"#,
             with: "123"
         )
-    let legacyConfig = try? decoder.decode(
-        PanelConfig.self,
-        from: Data(legacyJSON.utf8)
-    )
+    let legacyConfig = try? decodePanelConfig(from: Data(legacyJSON.utf8))
     let defaulted = try? decoder.decode(
         UsageProviderConfiguration.self,
         from: Data(missingProviderJSON.utf8)
     )
-    let malformedFieldConfig = try? decoder.decode(
-        PanelConfig.self,
+    let malformedFieldConfig = try? decodePanelConfig(
         from: Data(malformedProviderFieldJSON.utf8)
     )
-    let malformedObjectConfig = try? decoder.decode(
-        PanelConfig.self,
+    let malformedObjectConfig = try? decodePanelConfig(
         from: Data(malformedProviderObjectJSON.utf8)
     )
+    let malformedPanelConfigRejected = (
+        try? decodePanelConfig(from: Data("{".utf8))
+    ) == nil
 
     let codexDisabled: Bool
     if case .success(.codex) = resolveUsageProviderConfiguration(nil) {
@@ -792,6 +790,7 @@ private func usageProviderConfigurationChecks() -> [Bool] {
             resolveUsageProviderConfiguration($0.usageProvider)
                 == .failure(.invalidFormat)
         } == true,
+        malformedPanelConfigRejected,
         controlCharacterKeyRejected,
         oversizedKeyRejected,
         summary == UsageProviderDiagnosticSummary(
@@ -837,7 +836,7 @@ private func codexProviderChecks() -> [Bool] {
             sourceName: "Codex",
             valueText: "剩余 94%",
             progressPercent: 94,
-            detailText: "重置时间未知",
+            detailText: "已用 6%",
             isDepleted: false
         ),
         individualPresentation?.progressPercent == 20,
@@ -869,16 +868,20 @@ private func quotaUIContractChecks() -> [Bool] {
     )
     let wallet = QuotaPresentation(
         sourceName: "Sub2API",
-        valueText: "余额 $12.34",
+        valueText: "剩余 $12.34",
         progressPercent: nil,
-        detailText: "今日Token 1.23亿",
+        detailText: "",
+        dailyTokenText: "今日Token 1.23亿",
+        showsInlineUsageMetrics: true,
         isDepleted: false
     )
     let emptyWallet = QuotaPresentation(
         sourceName: "Sub2API",
-        valueText: "余额 $0.00",
+        valueText: "剩余 $0.00",
         progressPercent: nil,
-        detailText: "今日Token 0.00亿",
+        detailText: "",
+        dailyTokenText: "今日Token 0.00亿",
+        showsInlineUsageMetrics: true,
         isDepleted: true
     )
     let failure: Result<QuotaPresentation, Error> = .failure(
@@ -979,9 +982,9 @@ private func sub2APIProviderChecks() -> (
     let walletResult = fetchedPresentation(provider: client)
     let request = loader.capturedRequests.first
 
-    let quotaData = Data(#"{"mode":"quota_limited","isValid":true,"quota":{"limit":100,"used":6,"remaining":94,"unit":"USD"}}"#.utf8)
-    let rateData = Data(#"{"mode":"quota_limited","isValid":true,"unit":"USD","rate_limits":[{"window":"5h","limit":20,"used":12,"remaining":8,"reset_at":"2026-07-25T00:00:00Z"},{"window":"1d","limit":100,"used":10,"remaining":90}]}"#.utf8)
-    let subscriptionData = Data(#"{"mode":"unrestricted","isValid":true,"planName":"Pro","unit":"USD","subscription":{"daily_usage_usd":2,"daily_limit_usd":10,"weekly_usage_usd":70,"weekly_limit_usd":100,"monthly_usage_usd":5,"monthly_limit_usd":100,"weekly_window_start":"2026-07-20T00:00:00Z"}}"#.utf8)
+    let quotaData = Data(#"{"mode":"quota_limited","isValid":true,"quota":{"limit":100,"used":6,"remaining":94,"unit":"USD"},"usage":{"today":{"total_tokens":123456789}}}"#.utf8)
+    let rateData = Data(#"{"mode":"quota_limited","isValid":true,"unit":"USD","rate_limits":[{"window":"5h","limit":20,"used":12,"remaining":8,"reset_at":"2026-07-25T00:00:00Z"},{"window":"1d","limit":100,"used":10,"remaining":90}],"usage":{"today":{"total_tokens":123456789}}}"#.utf8)
+    let subscriptionData = Data(#"{"mode":"unrestricted","isValid":true,"planName":"Pro","unit":"USD","subscription":{"daily_usage_usd":2,"daily_limit_usd":10,"weekly_usage_usd":70,"weekly_limit_usd":100,"monthly_usage_usd":5,"monthly_limit_usd":100,"weekly_window_start":"2026-07-20T00:00:00Z"},"usage":{"today":{"total_tokens":123456789}}}"#.utf8)
     let zeroWalletData = Data(#"{"mode":"unrestricted","isValid":true,"unit":"USD","balance":0,"usage":{"today":{"total_tokens":0}}}"#.utf8)
     let walletWithoutUsageData = Data(#"{"mode":"unrestricted","isValid":true,"unit":"USD","balance":9.99}"#.utf8)
     let emptyData = Data(#"{"mode":"unrestricted","isValid":true}"#.utf8)
@@ -1112,22 +1115,32 @@ private func sub2APIProviderChecks() -> (
             request?.cachePolicy == .reloadIgnoringLocalCacheData,
         ],
         mapping: [
-            quota?.valueText == "剩余 94%"
+            quota?.valueText == "剩余 $94.00"
                 && quota?.progressPercent == 94,
-            quota?.detailText == "$94.00 / $100.00",
-            rate?.valueText == "剩余 40%"
-                && rate?.detailText.hasPrefix("5 小时") == true,
-            subscription?.valueText == "剩余 30%"
-                && subscription?.detailText.hasPrefix("周额度") == true,
-            wallet?.valueText == "余额 $12.34"
+            quota?.detailText == "今日已用 $6.00"
+                && quota?.dailyTokenText == "今日Token 1.23亿"
+                && quota?.showsInlineUsageMetrics == true,
+            rate?.valueText == "剩余 $8.00"
+                && rate?.detailText == "今日已用 $10.00"
+                && rate?.dailyTokenText == "今日Token 1.23亿"
+                && rate?.showsInlineUsageMetrics == true,
+            subscription?.valueText == "剩余 $30.00"
+                && subscription?.detailText == "今日已用 $2.00"
+                && subscription?.dailyTokenText == "今日Token 1.23亿"
+                && subscription?.showsInlineUsageMetrics == true,
+            wallet?.valueText == "剩余 $12.34"
                 && wallet?.progressPercent == nil,
-            wallet?.detailText == "今日Token 1.23亿"
+            wallet?.detailText.isEmpty == true
+                && wallet?.dailyTokenText == "今日Token 1.23亿"
+                && wallet?.showsInlineUsageMetrics == true
                 && wallet?.isDepleted == false,
             zeroWallet?.isDepleted == true
                 && zeroWallet?.progressPercent == nil
-                && zeroWallet?.detailText == "今日Token 0.00亿",
-            walletWithoutUsage?.detailText == "今日Token --"
-                && walletWithoutUsage?.valueText == "余额 $9.99",
+                && zeroWallet?.detailText.isEmpty == true
+                && zeroWallet?.dailyTokenText == "今日Token 0.00亿",
+            walletWithoutUsage?.detailText.isEmpty == true
+                && walletWithoutUsage?.dailyTokenText == nil
+                && walletWithoutUsage?.valueText == "剩余 $9.99",
             (try? Sub2APIUsageMapper.presentation(
                 from: emptyData,
                 now: fixedNow
@@ -1230,6 +1243,7 @@ func runUsageProviderSelfTest() -> Never {
 
 enum PreviewUsageMode: String {
     case codex
+    case unconfigured
     case sub2apiWallet = "sub2api-wallet"
     case sub2apiEmptyWallet = "sub2api-empty-wallet"
     case sub2apiWarning = "sub2api-warning"
@@ -1238,46 +1252,56 @@ enum PreviewUsageMode: String {
 
 private func previewQuotaPresentation(
     for mode: PreviewUsageMode
-) -> QuotaPresentation {
+) -> QuotaPresentation? {
     switch mode {
+    case .unconfigured:
+        return nil
     case .codex:
         return QuotaPresentation(
             sourceName: "Codex",
             valueText: "剩余 94%",
             progressPercent: 94,
-            detailText: "7/31 12:43 重置",
+            detailText: "已用 6%",
             isDepleted: false
         )
     case .sub2apiWallet:
         return QuotaPresentation(
             sourceName: "Sub2API",
-            valueText: "余额 $12.34",
+            valueText: "剩余 $12.34",
             progressPercent: nil,
-            detailText: "今日Token 1.23亿",
+            detailText: "",
+            dailyTokenText: "今日Token 1.23亿",
+            showsInlineUsageMetrics: true,
             isDepleted: false
         )
     case .sub2apiEmptyWallet:
         return QuotaPresentation(
             sourceName: "Sub2API",
-            valueText: "余额 $0.00",
+            valueText: "剩余 $0.00",
             progressPercent: nil,
-            detailText: "今日Token 0.00亿",
+            detailText: "",
+            dailyTokenText: "今日Token 0.00亿",
+            showsInlineUsageMetrics: true,
             isDepleted: true
         )
     case .sub2apiWarning:
         return QuotaPresentation(
             sourceName: "Sub2API",
-            valueText: "剩余 45%",
+            valueText: "剩余 $45.00",
             progressPercent: 45,
-            detailText: "1 天 · 重置时间未知",
+            detailText: "今日已用 $55.00",
+            dailyTokenText: "今日Token 1.23亿",
+            showsInlineUsageMetrics: true,
             isDepleted: false
         )
     case .sub2apiDanger:
         return QuotaPresentation(
             sourceName: "Sub2API",
-            valueText: "剩余 20%",
+            valueText: "剩余 $20.00",
             progressPercent: 20,
-            detailText: "5 小时 · 重置时间未知",
+            detailText: "今日已用 $80.00",
+            dailyTokenText: "今日Token 3.45亿",
+            showsInlineUsageMetrics: true,
             isDepleted: false
         )
     }
@@ -1313,8 +1337,13 @@ func renderPreviewOnce(
     view.showsMarketPrices = true
     view.taskProgress = previewTaskProgress
     let presentation = previewQuotaPresentation(for: usageMode)
-    view.quotaSourceName = presentation.sourceName
-    view.quotaPresentation = presentation
+    if let presentation {
+        view.quotaSourceName = presentation.sourceName
+        view.quotaPresentation = presentation
+    } else {
+        view.hasUsageProviderConfiguration = false
+        view.errorText = "model_provider: sub2api"
+    }
     view.statusText = "12:43"
     view.connectionText = "已连接"
     view.followStatusText = "跟随中"

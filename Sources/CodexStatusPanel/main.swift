@@ -86,7 +86,7 @@ if let previewFlag = CommandLine.arguments.firstIndex(of: "--render-preview") {
                 rawValue: CommandLine.arguments[modeFlag + 1]
               )
         else {
-            fputs("用法：--preview-usage <codex|sub2api-wallet|sub2api-empty-wallet|sub2api-warning|sub2api-danger>\n", stderr)
+            fputs("用法：--preview-usage <codex|unconfigured|sub2api-wallet|sub2api-empty-wallet|sub2api-warning|sub2api-danger>\n", stderr)
             exit(1)
         }
         usageMode = parsed

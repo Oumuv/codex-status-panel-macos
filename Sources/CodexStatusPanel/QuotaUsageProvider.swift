@@ -8,7 +8,27 @@ struct QuotaPresentation: Equatable {
     let valueText: String
     let progressPercent: Int?
     let detailText: String
+    let dailyTokenText: String?
+    let showsInlineUsageMetrics: Bool
     let isDepleted: Bool
+
+    init(
+        sourceName: String,
+        valueText: String,
+        progressPercent: Int?,
+        detailText: String,
+        dailyTokenText: String? = nil,
+        showsInlineUsageMetrics: Bool = false,
+        isDepleted: Bool
+    ) {
+        self.sourceName = sourceName
+        self.valueText = valueText
+        self.progressPercent = progressPercent
+        self.detailText = detailText
+        self.dailyTokenText = dailyTokenText
+        self.showsInlineUsageMetrics = showsInlineUsageMetrics
+        self.isDepleted = isDepleted
+    }
 }
 
 enum QuotaDisplayTone: Equatable {
@@ -60,29 +80,17 @@ enum QuotaPresentationError: LocalizedError, Equatable {
     }
 }
 
-func quotaResetDetail(_ date: Date?) -> String {
-    guard let date else { return "重置时间未知" }
-    let formatter = DateFormatter()
-    formatter.locale = Locale(identifier: "zh_CN")
-    formatter.timeZone = .current
-    formatter.dateFormat = "M/d HH:mm"
-    return "\(formatter.string(from: date)) 重置"
-}
-
 func codexQuotaPresentation(
     from response: RateLimitsResult
 ) throws -> QuotaPresentation {
     let snapshot = codexSnapshot(from: response)
     if let primary = snapshot.primary {
         let remaining = max(0, min(100, 100 - primary.usedPercent))
-        let resetDate = primary.resetsAt.map {
-            Date(timeIntervalSince1970: TimeInterval($0))
-        }
         return QuotaPresentation(
             sourceName: "Codex",
             valueText: "剩余 \(remaining)%",
             progressPercent: remaining,
-            detailText: quotaResetDetail(resetDate),
+            detailText: "已用 \(100 - remaining)%",
             isDepleted: remaining <= 0
         )
     }
@@ -95,9 +103,7 @@ func codexQuotaPresentation(
             sourceName: "Codex",
             valueText: "剩余 \(remaining)%",
             progressPercent: remaining,
-            detailText: quotaResetDetail(Date(
-                timeIntervalSince1970: TimeInterval(individual.resetsAt)
-            )),
+            detailText: "已用 \(100 - remaining)%",
             isDepleted: remaining <= 0
         )
     }
@@ -503,6 +509,9 @@ enum Sub2APIUsageMapper {
         if payload.isValid == false {
             throw Sub2APIUsageError.inactiveKey
         }
+        let dailyTokenText = todayTokenDetail(
+            payload.usage?.today?.totalTokens
+        )
 
         switch payload.mode.lowercased() {
         case "quota_limited":
@@ -530,7 +539,13 @@ enum Sub2APIUsageMapper {
                 return try percentagePresentation(
                     remaining: remaining,
                     limit: quota.limit,
-                    detail: "\(money(remaining, unit: quota.unit ?? payload.unit)) / \(money(quota.limit, unit: quota.unit ?? payload.unit))"
+                    detail: usedAmountDetail(
+                        used: quota.limit - remaining,
+                        limit: quota.limit,
+                        unit: quota.unit ?? payload.unit
+                    ),
+                    unit: quota.unit ?? payload.unit,
+                    dailyTokenText: dailyTokenText
                 )
             }
             let candidates = (payload.rateLimits ?? []).compactMap {
@@ -555,13 +570,19 @@ enum Sub2APIUsageMapper {
                 throw Sub2APIUsageError.invalidResponse
             }
             let remaining = max(0, tightest.limit - tightest.used)
-            let detail = tightest.resetAt.map {
-                "\(tightest.name) · \(quotaResetDetail($0))"
-            } ?? "\(tightest.name) · 重置时间未知"
+            let dailyUsed = candidates.first {
+                $0.name == "1 天"
+            }?.used ?? tightest.used
             return try percentagePresentation(
                 remaining: remaining,
                 limit: tightest.limit,
-                detail: detail
+                detail: usedAmountDetail(
+                    used: dailyUsed,
+                    limit: max(tightest.limit, dailyUsed),
+                    unit: payload.unit
+                ),
+                unit: payload.unit,
+                dailyTokenText: dailyTokenText
             )
 
         case "unrestricted":
@@ -601,13 +622,21 @@ enum Sub2APIUsageMapper {
                         0,
                         tightest.limit - tightest.used
                     )
-                    let detail = tightest.resetAt.map {
-                        "\(tightest.name) · \(quotaResetDetail($0))"
-                    } ?? "\(tightest.name) · \(money(remaining, unit: payload.unit)) / \(money(tightest.limit, unit: payload.unit))"
+                    let dailyUsed = subscription.dailyUsageUSD.flatMap {
+                        $0.isFinite ? max(0, $0) : nil
+                    }
                     return try percentagePresentation(
                         remaining: remaining,
                         limit: tightest.limit,
-                        detail: detail
+                        detail: dailyUsed.map {
+                            usedAmountDetail(
+                                used: $0,
+                                limit: max(tightest.limit, $0),
+                                unit: payload.unit
+                            )
+                        } ?? "",
+                        unit: payload.unit,
+                        dailyTokenText: dailyTokenText
                     )
                 }
             }
@@ -619,11 +648,11 @@ enum Sub2APIUsageMapper {
             }
             return QuotaPresentation(
                 sourceName: "Sub2API",
-                valueText: "余额 \(money(balance, unit: payload.unit))",
+                valueText: "剩余 \(money(balance, unit: payload.unit))",
                 progressPercent: nil,
-                detailText: todayTokenDetail(
-                    payload.usage?.today?.totalTokens
-                ),
+                detailText: "",
+                dailyTokenText: dailyTokenText,
+                showsInlineUsageMetrics: true,
                 isDepleted: balance <= 0
             )
 
@@ -635,7 +664,9 @@ enum Sub2APIUsageMapper {
     private static func percentagePresentation(
         remaining: Double,
         limit: Double,
-        detail: String
+        detail: String,
+        unit: String?,
+        dailyTokenText: String?
     ) throws -> QuotaPresentation {
         guard remaining.isFinite, limit.isFinite, limit > 0 else {
             throw Sub2APIUsageError.invalidResponse
@@ -646,16 +677,18 @@ enum Sub2APIUsageMapper {
         )
         return QuotaPresentation(
             sourceName: "Sub2API",
-            valueText: "剩余 \(percent)%",
+            valueText: "剩余 \(money(boundedRemaining, unit: unit))",
             progressPercent: percent,
             detailText: detail,
+            dailyTokenText: dailyTokenText,
+            showsInlineUsageMetrics: true,
             isDepleted: boundedRemaining <= 0
         )
     }
 
-    private static func todayTokenDetail(_ totalTokens: Int64?) -> String {
+    private static func todayTokenDetail(_ totalTokens: Int64?) -> String? {
         guard let totalTokens, totalTokens >= 0 else {
-            return "今日Token --"
+            return nil
         }
         let value = Double(totalTokens) / 100_000_000
         let formatted = String(
@@ -709,6 +742,14 @@ enum Sub2APIUsageMapper {
         let normalizedUnit = (unit ?? "USD").uppercased()
         return normalizedUnit == "USD"
             ? "$\(value)" : "\(normalizedUnit) \(value)"
+    }
+
+    private static func usedAmountDetail(
+        used: Double,
+        limit: Double,
+        unit: String?
+    ) -> String {
+        "今日已用 \(money(min(limit, max(0, used)), unit: unit))"
     }
 
     private static func parseISO8601(_ raw: String?) -> Date? {

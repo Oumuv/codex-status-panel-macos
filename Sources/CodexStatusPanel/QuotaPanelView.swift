@@ -1,10 +1,27 @@
 // 面板的 AppKit 自绘视图。
-// 数据由 AppDelegate 写入模块内可见属性；属性的 didSet 会触发重绘或更新任务动画计时器。
+// 数据由 AppDelegate 写入模块内可见属性；属性的 didSet 会触发重绘或同步任务动画层。
 
 import AppKit
 import Foundation
 
 final class QuotaPanelView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureLayerBacking()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureLayerBacking()
+    }
+
+    private func configureLayerBacking() {
+        // GIF 角标必须拥有独立绘制层，否则每一帧都会向上触发整个面板重绘。
+        wantsLayer = true
+        canDrawSubviewsIntoLayer = false
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
+    }
+
     // didSet 是属性观察器：属性被赋新值后自动执行，用于通知 AppKit 重新绘制。
     var quotaPresentation: QuotaPresentation? {
         didSet { needsDisplay = true }
@@ -13,6 +30,9 @@ final class QuotaPanelView: NSView {
     var statusText = "正在读取额度…" { didSet { needsDisplay = true } }
     var connectionText = "连接中" { didSet { needsDisplay = true } }
     var followStatusText = "定位中" { didSet { needsDisplay = true } }
+    var hasUsageProviderConfiguration = panelConfig.usageProvider != nil {
+        didSet { needsDisplay = true }
+    }
     var errorText: String? { didSet { needsDisplay = true } }
     var taskProgress = TaskProgressSnapshot.reading {
         didSet {
@@ -62,13 +82,21 @@ final class QuotaPanelView: NSView {
     private var runningTaskBadgeAnimationsEnabled = false
     private var windowVisibilityObservers: [NSObjectProtocol] = []
 
-    // lazy 属性第一次使用时才加载资源，避免创建视图时立即做不必要的磁盘读取。
-    private lazy var backgroundImage: NSImage? = {
+    // lazy 属性第一次使用时才加载资源；重新加载配置时会主动替换该缓存。
+    private lazy var backgroundImage: NSImage? = loadBackgroundImage()
+
+    private func loadBackgroundImage() -> NSImage? {
         guard let resourceURL = Bundle.main.resourceURL?
             .appendingPathComponent(panelConfig.theme.backgroundImage)
         else { return nil }
         return NSImage(contentsOf: resourceURL)
-    }()
+    }
+
+    func reloadPanelConfiguration() {
+        hasUsageProviderConfiguration = panelConfig.usageProvider != nil
+        backgroundImage = loadBackgroundImage()
+        needsDisplay = true
+    }
 
     private lazy var completedTaskIcon: NSImage? = taskIcon(
         named: "task-completed-icon.png"
@@ -169,6 +197,9 @@ final class QuotaPanelView: NSView {
             imageView.imageScaling = .scaleAxesIndependently
             imageView.imageFrameStyle = .none
             imageView.isEditable = false
+            imageView.wantsLayer = true
+            imageView.canDrawSubviewsIntoLayer = false
+            imageView.layerContentsRedrawPolicy = .onSetNeedsDisplay
             imageView.animates = false
             addSubview(imageView)
             runningTaskBadgeViews.append(imageView)
@@ -289,19 +320,32 @@ final class QuotaPanelView: NSView {
                 font: .systemFont(ofSize: 12.4, weight: .semibold),
                 color: NSColor.white.withAlphaComponent(0.88)
             )
-        } else if let errorText {
-            drawText(
-                errorText,
-                in: NSRect(x: contentX, y: bodyRect.minY + 11, width: contentWidth - 48, height: 38),
-                font: .systemFont(ofSize: 12, weight: .medium),
-                color: NSColor(calibratedRed: 1.0, green: 0.72, blue: 0.38, alpha: 1)
-            )
         } else if let quotaPresentation {
             draw(
                 presentation: quotaPresentation,
                 bodyMinY: bodyRect.minY,
                 x: contentX,
                 width: contentWidth
+            )
+        } else if !hasUsageProviderConfiguration {
+            drawText(
+                "暂无用量数据",
+                in: NSRect(x: contentX, y: bodyRect.minY + 11, width: contentWidth - 48, height: 18),
+                font: .systemFont(ofSize: 12.4, weight: .semibold),
+                color: NSColor.white.withAlphaComponent(0.88)
+            )
+            drawText(
+                "配置 usageProvider 后显示额度和 Token",
+                in: NSRect(x: contentX, y: bodyRect.minY + 74, width: contentWidth, height: 14),
+                font: .systemFont(ofSize: 9.2, weight: .regular),
+                color: NSColor.white.withAlphaComponent(0.66)
+            )
+        } else if let errorText {
+            drawText(
+                errorText,
+                in: NSRect(x: contentX, y: bodyRect.minY + 11, width: contentWidth - 48, height: 38),
+                font: .systemFont(ofSize: 12, weight: .medium),
+                color: NSColor(calibratedRed: 1.0, green: 0.72, blue: 0.38, alpha: 1)
             )
         } else {
             drawText(
@@ -311,19 +355,6 @@ final class QuotaPanelView: NSView {
                 color: NSColor.white.withAlphaComponent(0.68)
             )
         }
-
-        drawText(
-            composedStatusText,
-            in: NSRect(
-                x: contentX,
-                y: bodyRect.minY + 74,
-                width: contentWidth,
-                height: 14
-            ),
-            font: .systemFont(ofSize: 9.2, weight: .regular),
-            color: NSColor.white.withAlphaComponent(0.72),
-            alignment: .right
-        )
 
         let taskItems = taskProgress.items.isEmpty
             ? TaskProgressSnapshot.idle.items
@@ -373,17 +404,6 @@ final class QuotaPanelView: NSView {
                 contentWidth: contentWidth
             )
         }
-    }
-
-    private var composedStatusText: String {
-        var parts = [statusText]
-        if panelConfig.widgets.codexConnection {
-            parts.append(connectionText)
-        }
-        if panelConfig.widgets.followStatus {
-            parts.append(followStatusText)
-        }
-        return parts.joined(separator: " · ")
     }
 
     override func updateTrackingAreas() {
@@ -482,13 +502,23 @@ final class QuotaPanelView: NSView {
             font: .systemFont(ofSize: 10.8, weight: .semibold),
             color: NSColor.white.withAlphaComponent(0.88)
         )
-        drawText(
-            presentation.valueText,
-            in: NSRect(x: valueStart, y: top, width: valueRight - valueStart, height: 16),
-            font: .monospacedDigitSystemFont(ofSize: 10.8, weight: .semibold),
-            color: quotaValueColor(for: presentation),
-            alignment: .right
-        )
+        let topValueText: String?
+        if presentation.showsInlineUsageMetrics {
+            topValueText = presentation.progressPercent.map {
+                "剩余 \(max(0, min(100, $0)))%"
+            }
+        } else {
+            topValueText = presentation.valueText
+        }
+        if let topValueText {
+            drawText(
+                topValueText,
+                in: NSRect(x: valueStart, y: top, width: valueRight - valueStart, height: 16),
+                font: .monospacedDigitSystemFont(ofSize: 10.8, weight: .semibold),
+                color: quotaValueColor(for: presentation),
+                alignment: .right
+            )
+        }
 
         if let rawPercent = presentation.progressPercent {
             let percent = max(0, min(100, rawPercent))
@@ -524,11 +554,163 @@ final class QuotaPanelView: NSView {
             }
         }
 
+        if presentation.showsInlineUsageMetrics {
+            drawInlineUsageMetrics(
+                presentation,
+                in: NSRect(x: x, y: top + 64, width: width, height: 14)
+            )
+        } else {
+            let dailyTokenWidth = presentation.dailyTokenText == nil
+                ? 0 : min(92, width * 0.46)
+            let detailWidth = dailyTokenWidth == 0
+                ? width : max(0, width - dailyTokenWidth - 8)
+            drawText(
+                presentation.detailText,
+                in: NSRect(x: x, y: top + 64, width: detailWidth, height: 14),
+                font: .systemFont(ofSize: 9.2, weight: .regular),
+                color: NSColor.white.withAlphaComponent(0.72)
+            )
+            if let dailyTokenText = presentation.dailyTokenText {
+                drawMetricText(
+                    dailyTokenText,
+                    in: NSRect(
+                        x: x + width - dailyTokenWidth,
+                        y: top + 64,
+                        width: dailyTokenWidth,
+                        height: 14
+                    ),
+                    valueColor: NSColor(
+                        calibratedRed: 1.0,
+                        green: 0.34,
+                        blue: 0.39,
+                        alpha: 1
+                    ),
+                    alignment: .right,
+                    fontSize: 9.2
+                )
+            }
+        }
+    }
+
+    private func drawInlineUsageMetrics(
+        _ presentation: QuotaPresentation,
+        in rect: NSRect
+    ) {
+        let gap: CGFloat = 3
+        let tokenWidth = floor((rect.width - gap * 2) * 0.30)
+        let usedWidth = floor((rect.width - gap * 2) * 0.38)
+        let remainingWidth = rect.width - gap * 2 - tokenWidth - usedWidth
+        let tokenText = (presentation.dailyTokenText ?? "今日Token --")
+            .replacingOccurrences(of: "今日Token ", with: "Token ")
+        let usedText = presentation.detailText.isEmpty
+            ? "今日已用 --" : presentation.detailText
+
+        drawMetricText(
+            tokenText,
+            in: NSRect(
+                x: rect.minX,
+                y: rect.minY,
+                width: tokenWidth,
+                height: rect.height
+            ),
+            valueColor: NSColor(
+                calibratedRed: 1.0,
+                green: 0.34,
+                blue: 0.39,
+                alpha: 1
+            ),
+            alignment: .left,
+            fontSize: 8.2
+        )
+        drawMetricText(
+            usedText,
+            in: NSRect(
+                x: rect.minX + tokenWidth + gap,
+                y: rect.minY,
+                width: usedWidth,
+                height: rect.height
+            ),
+            valueColor: NSColor(
+                calibratedRed: 1.0,
+                green: 0.63,
+                blue: 0.20,
+                alpha: 1
+            ),
+            alignment: .center,
+            fontSize: 8.2
+        )
+        drawMetricText(
+            presentation.valueText,
+            in: NSRect(
+                x: rect.maxX - remainingWidth,
+                y: rect.minY,
+                width: remainingWidth,
+                height: rect.height
+            ),
+            valueColor: NSColor(
+                calibratedRed: 0.24,
+                green: 0.86,
+                blue: 0.58,
+                alpha: 1
+            ),
+            alignment: .right,
+            fontSize: 8.2
+        )
+    }
+
+    private func drawMetricText(
+        _ text: String,
+        in rect: NSRect,
+        valueColor: NSColor,
+        alignment: NSTextAlignment,
+        fontSize: CGFloat
+    ) {
+        let separator = " "
+        guard let separatorRange = text.range(of: separator) else {
+            drawText(
+                text,
+                in: rect,
+                font: .systemFont(ofSize: fontSize, weight: .semibold),
+                color: valueColor,
+                alignment: alignment
+            )
+            return
+        }
+
+        let label = String(text[..<separatorRange.lowerBound])
+        let value = String(text[separatorRange.upperBound...])
+        let labelFont = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+        let valueFont = NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .bold)
+        let labelWidth = ceil((label as NSString).size(withAttributes: [.font: labelFont]).width)
+        let valueWidth = ceil((value as NSString).size(withAttributes: [.font: valueFont]).width)
+        let spacing: CGFloat = 2
+        let contentWidth = labelWidth + spacing + valueWidth
+        let startX: CGFloat
+        switch alignment {
+        case .right:
+            startX = max(rect.minX, rect.maxX - contentWidth)
+        case .center:
+            startX = max(rect.minX, rect.midX - contentWidth / 2)
+        default:
+            startX = rect.minX
+        }
+
         drawText(
-            presentation.detailText,
-            in: NSRect(x: x, y: top + 64, width: 80, height: 14),
-            font: .systemFont(ofSize: 9.2, weight: .regular),
-            color: NSColor.white.withAlphaComponent(0.72)
+            label,
+            in: NSRect(x: startX, y: rect.minY, width: labelWidth, height: rect.height),
+            font: labelFont,
+            color: NSColor.white.withAlphaComponent(0.96)
+        )
+        drawText(
+            value,
+            in: NSRect(
+                x: startX + labelWidth + spacing,
+                y: rect.minY,
+                width: valueWidth,
+                height: rect.height
+            ),
+            font: valueFont,
+            color: valueColor
         )
     }
 

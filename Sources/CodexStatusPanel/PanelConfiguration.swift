@@ -4,7 +4,7 @@
 import AppKit
 import Foundation
 
-let panelVersion = "1.2.2"
+let panelVersion = "1.2.4"
 let defaultBundleIdentifier = "io.github.mayday-materials.codex-status-panel"
 let panelBundleIdentifier = Bundle.main.bundleIdentifier ?? defaultBundleIdentifier
 let panelClientName = "codex-status-panel"
@@ -101,7 +101,7 @@ struct PanelConfig: Decodable {
         refresh: PanelRefresh(
             quotaSeconds: 300,
             marketSeconds: 5,
-            followSeconds: 0.03
+            followSeconds: 0.05
         )
     )
 }
@@ -351,13 +351,11 @@ func ensureEditablePanelConfigFile() -> URL? {
 /// 按“环境变量指定文件 → 用户文件 → App 内置文件 → 代码默认值”的顺序加载。
 /// 某一级解析失败时先记录警告，再继续尝试下一级，而不是让整个 App 启动失败。
 private func loadPanelConfig() -> LoadedPanelConfig {
-    let decoder = JSONDecoder()
     var warnings: [String] = []
 
     func decodeConfig(from url: URL, source: String) -> PanelConfig? {
         do {
-            let data = try Data(contentsOf: url)
-            return try decoder.decode(PanelConfig.self, from: data)
+            return try decodePanelConfig(at: url)
         } catch {
             warnings.append("panel-config: \(source) 无法加载，将继续尝试其他配置源：\(error.localizedDescription)")
             return nil
@@ -414,9 +412,17 @@ private func loadPanelConfig() -> LoadedPanelConfig {
     return LoadedPanelConfig(config: .fallback, warnings: warnings, sourceURL: nil, sourceKind: .fallback)
 }
 
-// 顶层 let 在首次访问时初始化一次，后续各组件共享同一份配置快照。
+func decodePanelConfig(from data: Data) throws -> PanelConfig {
+    try JSONDecoder().decode(PanelConfig.self, from: data)
+}
+
+func decodePanelConfig(at url: URL) throws -> PanelConfig {
+    try decodePanelConfig(from: Data(contentsOf: url))
+}
+
+// 启动时先加载一次；菜单热加载成功后再原子替换这份运行时配置。
 private let loadedPanelConfig = loadPanelConfig()
-let panelConfig = loadedPanelConfig.config
+private(set) var panelConfig = loadedPanelConfig.config
 private let panelConfigWarnings = loadedPanelConfig.warnings
 let panelConfigFileURL = loadedPanelConfig.sourceURL ?? defaultUserPanelConfigURL()
 let editablePanelConfigFileURL: URL = {
@@ -427,17 +433,31 @@ let editablePanelConfigFileURL: URL = {
         return defaultUserPanelConfigURL()
     }
 }()
-let refreshInterval: TimeInterval = max(1, panelConfig.refresh.quotaSeconds)
-let btcRefreshInterval: TimeInterval = max(1, panelConfig.refresh.marketSeconds)
+
+@discardableResult
+func reloadPanelConfig() throws -> PanelConfig {
+    let configURL = ensureEditablePanelConfigFile()
+        ?? editablePanelConfigFileURL
+    let reloadedConfig = try decodePanelConfig(at: configURL)
+    panelConfig = reloadedConfig
+    return reloadedConfig
+}
+
+var refreshInterval: TimeInterval {
+    max(1, panelConfig.refresh.quotaSeconds)
+}
+var btcRefreshInterval: TimeInterval {
+    max(1, panelConfig.refresh.marketSeconds)
+}
 let taskProgressRefreshInterval: TimeInterval = 2
-private let configuredMarketPricesEnabled: Bool = {
+func configuredMarketPricesEnabled(for config: PanelConfig) -> Bool {
     if let rawValue = ProcessInfo.processInfo.environment[
         "CODEX_STATUS_PANEL_SHOW_MARKET_PRICES"
     ] {
         return !isFalseEnvironmentValue(rawValue)
     }
-    return panelConfig.widgets.marketPrices
-}()
+    return config.widgets.marketPrices
+}
 let marketPricesPreferenceKey = "showsMarketPrices"
 func resolvedMarketPricesEnabled(
     storedValue: Bool?,
@@ -450,10 +470,12 @@ let initialMarketPricesEnabled = resolvedMarketPricesEnabled(
     storedValue: UserDefaults.standard.object(
         forKey: marketPricesPreferenceKey
     ) as? Bool,
-    configuredDefault: configuredMarketPricesEnabled
+    configuredDefault: configuredMarketPricesEnabled(for: panelConfig)
 )
-// 桌宠动画移动时需要较高频率跟踪，才能让面板与桌宠之间的视觉间距保持稳定。
-let followInterval: TimeInterval = max(0.01, panelConfig.refresh.followSeconds)
+// 20 Hz 足以保持跟随平滑，同时避免高频窗口查询持续占用主线程。
+var followInterval: TimeInterval {
+    max(0.05, panelConfig.refresh.followSeconds)
+}
 let panelHorizontalCanvasInset: CGFloat = 7
 let panelVerticalCanvasInset: CGFloat = 4
 let panelPointerLength: CGFloat = 10
@@ -480,12 +502,16 @@ let expandedPanelSize = panelSizeForTaskRows(
     showsMarketPrices: initialMarketPricesEnabled
 )
 let collapsedPanelSize = NSSize(width: 72, height: 48)
-let panelPetGap: CGFloat = panelConfig.tracking.gapPoints
+var panelPetGap: CGFloat {
+    panelConfig.tracking.gapPoints
+}
 let panelScreenMargin: CGFloat = 8
 let pointerTipBottomInset = panelVerticalCanvasInset
 let pointerHorizontalSafeInset = panelHorizontalCanvasInset + 12
 // v2 桌宠图片在保存的锚点顶部包含少量透明区域；扣除它后，间距才从可见头顶计算。
-let petSpriteTopPaddingInsideAnchor: CGFloat = panelConfig.tracking.mascotTopPaddingPoints
+var petSpriteTopPaddingInsideAnchor: CGFloat {
+    panelConfig.tracking.mascotTopPaddingPoints
+}
 
 func reportPanelConfigWarnings() {
     for warning in panelConfigWarnings {

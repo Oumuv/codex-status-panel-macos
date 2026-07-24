@@ -25,11 +25,11 @@ echo "检查认证回退自测入口..."
 "$BIN" --self-test-authentication-fallback \
   | /usr/bin/grep -q 'authentication-fallback-self-test:.*presentation=3/3'
 echo "检查版本号..."
-"$BIN" --print-panel-config | /usr/bin/grep -q 'version=1.2.2'
+"$BIN" --print-panel-config | /usr/bin/grep -q 'version=1.2.4'
 /usr/bin/plutil -extract CFBundleShortVersionString raw "$INFO_PLIST" \
-  | /usr/bin/grep -q '^1.2.2$'
+  | /usr/bin/grep -q '^1.2.4$'
 /usr/bin/plutil -extract CFBundleVersion raw "$INFO_PLIST" \
-  | /usr/bin/grep -q '^4$'
+  | /usr/bin/grep -q '^6$'
 echo "检查 LaunchAgent 正常退出语义..."
 /usr/bin/plutil -extract KeepAlive.SuccessfulExit raw "$PLIST" | /usr/bin/grep -q '^false$'
 echo "检查行情开关健康状态兼容..."
@@ -67,9 +67,9 @@ if [[ "$PREVIEW_USAGE_STATUS" -eq 0 ]] \
   echo "缺少 --render-preview 输出路径时没有以失败状态返回用法提示" >&2
   exit 1
 fi
-echo "检查五种用量预览..."
+echo "检查六种用量预览..."
 for PREVIEW_MODE in \
-  codex sub2api-wallet sub2api-empty-wallet sub2api-warning sub2api-danger; do
+  codex unconfigured sub2api-wallet sub2api-empty-wallet sub2api-warning sub2api-danger; do
   PREVIEW_PATH="$TMP_HOME/$PREVIEW_MODE.png"
   "$BIN" --render-preview "$PREVIEW_PATH" \
     --preview-usage "$PREVIEW_MODE" >/dev/null

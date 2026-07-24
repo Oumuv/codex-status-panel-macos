@@ -29,19 +29,29 @@ final class PetWindowLocator {
         let isPrimary: Bool
     }
 
+    private struct StoredStateFileSignature: Equatable {
+        let path: String
+        let modificationDate: Date?
+        let fileSize: Int?
+    }
+
     private var cachedWindowID: CGWindowID?
     private var cachedMascotMetrics: StoredMascotMetrics?
     private var lastVisualProbeAt: CFAbsoluteTime = 0
-    private var lastOverlayStateReadAt: CFAbsoluteTime = 0
+    private var lastOverlayStateCheckAt: CFAbsoluteTime = 0
+    private var storedStateFileSignature: StoredStateFileSignature?
     private var storedOverlayLocations: [StoredOverlayLocation] = []
     private var storedDisplayID: String?
     private(set) var overlayOpen: Bool?
 
+    private static let overlayStateCheckInterval: CFTimeInterval = 0.25
+    private static let visualProbeRetryInterval: CFTimeInterval = 1.0
+
     func locate() -> LocatedPet? {
         let now = CFAbsoluteTimeGetCurrent()
-        // 保存状态变化较慢，100 ms 内无需重复读取同一 JSON 文件。
-        if now - lastOverlayStateReadAt >= 0.10 {
-            lastOverlayStateReadAt = now
+        // 保存状态变化较慢；先按文件签名检查，内容未变化时不读取和解析 JSON。
+        if now - lastOverlayStateCheckAt >= Self.overlayStateCheckInterval {
+            lastOverlayStateCheckAt = now
             refreshStoredOverlayState()
         }
 
@@ -75,7 +85,7 @@ final class PetWindowLocator {
     }
 
     func locateSavedState() -> LocatedPet? {
-        refreshStoredOverlayState()
+        refreshStoredOverlayState(force: true)
         return storedOverlayLocation()
     }
 
@@ -83,7 +93,8 @@ final class PetWindowLocator {
         cachedWindowID = nil
         cachedMascotMetrics = nil
         lastVisualProbeAt = 0
-        lastOverlayStateReadAt = 0
+        lastOverlayStateCheckAt = 0
+        storedStateFileSignature = nil
         storedOverlayLocations = []
         storedDisplayID = nil
         overlayOpen = nil
@@ -118,7 +129,7 @@ final class PetWindowLocator {
         // 这只用于无法识别的 Codex 状态文件版本。没有录屏权限时截图可能不可用，
         // 因此不会使用未经验证的固定透明窗口边距来猜测位置。
         let now = CFAbsoluteTimeGetCurrent()
-        if now - lastVisualProbeAt >= 0.12 {
+        if now - lastVisualProbeAt >= Self.visualProbeRetryInterval {
             lastVisualProbeAt = now
             if let probedInset = probeTopVisualInset(windowID: windowID) {
                 let width = min(224, max(80, quartzRect.width * 163 / 356))
@@ -152,7 +163,7 @@ final class PetWindowLocator {
         return nil
     }
 
-    private func refreshStoredOverlayState() {
+    private func refreshStoredOverlayState(force: Bool = false) {
         let stateURL: URL
         if let override = ProcessInfo.processInfo.environment["CODEX_STATUS_PANEL_STATE_FILE"],
            !override.isEmpty
@@ -166,9 +177,24 @@ final class PetWindowLocator {
             stateURL = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".codex/.codex-global-state.json")
         }
+
+        let resourceValues = try? stateURL.resourceValues(forKeys: [
+            .contentModificationDateKey,
+            .fileSizeKey,
+        ])
+        let signature = StoredStateFileSignature(
+            path: stateURL.standardizedFileURL.path,
+            modificationDate: resourceValues?.contentModificationDate,
+            fileSize: resourceValues?.fileSize
+        )
+        if !force, signature == storedStateFileSignature {
+            return
+        }
+
         guard let data = try? Data(contentsOf: stateURL),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
+        storedStateFileSignature = signature
 
         overlayOpen = root["electron-avatar-overlay-open"] as? Bool
         guard let overlay = root["electron-avatar-overlay-bounds"] as? [String: Any] else {
@@ -345,6 +371,9 @@ final class PetWindowLocator {
     }
 
     private func probeTopVisualInset(windowID: CGWindowID) -> CGFloat? {
+        // 预检只读取当前 TCC 状态，不触发授权弹窗；未授权时让调用方使用几何回退。
+        guard CGPreflightScreenCaptureAccess() else { return nil }
+
         guard let image = CGWindowListCreateImage(
             .null,
             .optionIncludingWindow,

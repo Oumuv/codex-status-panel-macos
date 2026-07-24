@@ -17,7 +17,7 @@ HEALTH_DIR="$HOME/Library/Caches/io.github.mayday-materials.codex-status-panel"
 HEALTH_PATH="$HEALTH_DIR/panel-health.json"
 USER_ID="$(/usr/bin/id -u)"
 DOMAIN="gui/$USER_ID"
-PANEL_VERSION="1.2.2"
+PANEL_VERSION="1.2.4"
 
 pause_before_exit() {
   if [[ -t 0 ]]; then

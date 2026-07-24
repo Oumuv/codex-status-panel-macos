@@ -26,6 +26,6 @@
   "refresh": {
     "quotaSeconds": 300,
     "marketSeconds": 5,
-    "followSeconds": 0.03
+    "followSeconds": 0.05
   }
 }
