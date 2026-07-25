@@ -18,6 +18,9 @@ echo "检查第三方用量 Provider 自测入口..."
   | /usr/bin/grep -q 'usage-provider-self-test:.*errors=17/17'
 echo "检查菜单控制自测入口..."
 "$BIN" --self-test-menu-controls | /usr/bin/grep -q 'menu-controls-self-test: passed'
+echo "检查行情数据自测入口..."
+"$BIN" --self-test-market-data \
+  | /usr/bin/grep -q 'market-data-self-test:.*bounds=pass'
 echo "检查任务进度自测入口..."
 "$BIN" --self-test-task-progress \
   | /usr/bin/grep -q 'task-progress-self-test:.*icons=4/4'
@@ -25,11 +28,12 @@ echo "检查认证回退自测入口..."
 "$BIN" --self-test-authentication-fallback \
   | /usr/bin/grep -q 'authentication-fallback-self-test:.*presentation=3/3'
 echo "检查版本号..."
-"$BIN" --print-panel-config | /usr/bin/grep -q 'version=1.2.4'
+"$BIN" --print-panel-config \
+  | /usr/bin/grep -q 'version=1.2.5.*stockPricesEnabled=.*cryptoSeconds=5.*stockSeconds=30'
 /usr/bin/plutil -extract CFBundleShortVersionString raw "$INFO_PLIST" \
-  | /usr/bin/grep -q '^1.2.4$'
+  | /usr/bin/grep -q '^1.2.5$'
 /usr/bin/plutil -extract CFBundleVersion raw "$INFO_PLIST" \
-  | /usr/bin/grep -q '^6$'
+  | /usr/bin/grep -q '^7$'
 echo "检查 LaunchAgent 正常退出语义..."
 /usr/bin/plutil -extract KeepAlive.SuccessfulExit raw "$PLIST" | /usr/bin/grep -q '^false$'
 echo "检查行情开关健康状态兼容..."
@@ -82,4 +86,4 @@ if /usr/bin/grep -R -q --include='*.swift' '"隐藏"' "$SOURCE_DIR"; then
   exit 1
 fi
 
-echo "v1.2-menu-controls-test: passed"
+echo "v1.2.5-market-data-test: passed"

@@ -54,6 +54,31 @@ func printMarketPriceOnce(symbol: String, label: String) -> Never {
     exit(exitCode)
 }
 
+func printStockQuoteOnce(secid: String) -> Never {
+    let semaphore = DispatchSemaphore(value: 0)
+    var exitCode: Int32 = 1
+    EastMoneyMarketClient().fetch(secid: secid) { result in
+        switch result {
+        case .success(let quote):
+            print(String(
+                format: "%@(%@): %.2f %+.2f%%",
+                quote.name,
+                quote.code,
+                quote.latest,
+                quote.changePercent
+            ))
+            exitCode = 0
+        case .failure(let error):
+            fputs("\(error.localizedDescription)\n", stderr)
+        }
+        semaphore.signal()
+    }
+    if semaphore.wait(timeout: .now() + 12) == .timedOut {
+        fputs("读取 \(secid) 行情超时\n", stderr)
+    }
+    exit(exitCode)
+}
+
 func printPanelConfiguration() -> Never {
     let usageSummary = usageProviderDiagnosticSummary(
         panelConfig.usageProvider
@@ -63,6 +88,11 @@ func printPanelConfiguration() -> Never {
             + "bundle=\(panelBundleIdentifier) "
             + "theme=\(panelConfig.theme.id) "
             + "marketPricesEnabled=\(initialMarketPricesEnabled) "
+            + "stockPricesEnabled=\(initialStockPricesEnabled) "
+            + "cryptoSeconds=\(Int(cryptoRefreshInterval)) "
+            + "stockSeconds=\(Int(stockRefreshInterval)) "
+            + "stockClosedSeconds=\(Int(stockClosedRefreshInterval)) "
+            + "stockCacheWriteSeconds=\(Int(stockCacheWriteInterval)) "
             + "usageProvider=\(usageSummary.provider) "
             + "usageProviderConfigured=\(usageSummary.isConfigured) "
             + "codexConnection=\(panelConfig.widgets.codexConnection) "
@@ -89,21 +119,24 @@ func runMenuControlsSelfTest() -> Never {
         isPanelHiddenByUser: false,
         isCollapsed: false,
         isRefreshing: false,
-        showsMarketPrices: true
+        showsMarketPrices: true,
+        showsStockPrices: true
     )
     let hiddenState = panelMenuControlState(
         isPanelVisible: false,
         isPanelHiddenByUser: true,
         isCollapsed: false,
         isRefreshing: false,
-        showsMarketPrices: false
+        showsMarketPrices: false,
+        showsStockPrices: false
     )
     let refreshingState = panelMenuControlState(
         isPanelVisible: true,
         isPanelHiddenByUser: false,
         isCollapsed: true,
         isRefreshing: true,
-        showsMarketPrices: true
+        showsMarketPrices: true,
+        showsStockPrices: false
     )
     let checks = [
         statusBarSymbolName(for: menuBarDisplayState(
@@ -133,21 +166,24 @@ func runMenuControlsSelfTest() -> Never {
             hidePanelEnabled: true,
             collapseTitle: "折叠面板",
             refreshQuotaEnabled: true,
-            marketPricesEnabled: true
+            marketPricesEnabled: true,
+            stockPricesEnabled: true
         ),
         hiddenState == PanelMenuControlState(
             showPanelEnabled: true,
             hidePanelEnabled: false,
             collapseTitle: "折叠面板",
             refreshQuotaEnabled: true,
-            marketPricesEnabled: false
+            marketPricesEnabled: false,
+            stockPricesEnabled: false
         ),
         refreshingState == PanelMenuControlState(
             showPanelEnabled: false,
             hidePanelEnabled: true,
             collapseTitle: "展开面板",
             refreshQuotaEnabled: false,
-            marketPricesEnabled: true
+            marketPricesEnabled: true,
+            stockPricesEnabled: false
         ),
         resolvedMarketPricesEnabled(
             storedValue: nil,
@@ -176,6 +212,354 @@ func runMenuControlsSelfTest() -> Never {
     }
 
     print("menu-controls-self-test: passed")
+    exit(0)
+}
+
+func runMarketDataSelfTest() -> Never {
+    let fetchedAt = Date(timeIntervalSince1970: 1_774_201_200)
+    let quoteData = Data(#"""
+    {
+      "rc": 0,
+      "data": {
+        "f43": 3560.25,
+        "f47": "123456",
+        "f48": "-",
+        "f57": "000001",
+        "f58": "上证指数",
+        "f169": 23.83,
+        "f170": 0.67
+      }
+    }
+    """#.utf8)
+    let quoteResult = EastMoneyMarketClient.decodeQuote(
+        data: quoteData,
+        secid: "1.000001",
+        fetchedAt: fetchedAt
+    )
+    guard case .success(let quote) = quoteResult,
+          quote.name == "上证指数",
+          quote.latest == 3560.25,
+          quote.volume == 123456,
+          quote.amount == nil,
+          quote.changePercent == 0.67,
+          quote.fetchedAt == fetchedAt
+    else {
+        fputs("market-data-self-test: quote parsing failed\n", stderr)
+        exit(1)
+    }
+
+    let nullData = Data(#"{"rc":0,"data":null}"#.utf8)
+    let invalidQuote = Data(#"{"rc":0,"data":{"f43":"-","f47":"-","f48":"-","f57":"000001","f58":"上证指数","f169":"-","f170":"-"}}"#.utf8)
+    let oversized = Data(
+        repeating: 0,
+        count: EastMoneyMarketClient.maximumResponseBytes + 1
+    )
+    guard case .failure = EastMoneyMarketClient.decodeQuote(
+        data: nullData,
+        secid: "1.000001"
+    ), case .failure = EastMoneyMarketClient.decodeQuote(
+        data: invalidQuote,
+        secid: "1.000001"
+    ), case .failure = EastMoneyMarketClient.decodeQuote(
+        data: oversized,
+        secid: "1.000001"
+    ) else {
+        fputs("market-data-self-test: invalid response handling failed\n", stderr)
+        exit(1)
+    }
+
+    let loader = UsageProviderTestLoader(data: quoteData)
+    var fetchedQuote: StockQuote?
+    let fetchedTask = EastMoneyMarketClient(loader: loader).fetch(
+        secid: "1.000001"
+    ) {
+        if case .success(let value) = $0 { fetchedQuote = value }
+    }
+    let requestURL = loader.capturedRequests.first?.url?.absoluteString ?? ""
+    var redirectProposal = URLRequest(
+        url: URL(string: "https://push2delay.eastmoney.com/api/qt/stock/get")!
+    )
+    redirectProposal.httpMethod = "GET"
+    redirectProposal.setValue("secret", forHTTPHeaderField: "Authorization")
+    redirectProposal.setValue("session=secret", forHTTPHeaderField: "Cookie")
+    let permittedRedirect = permittedHTTPRedirectRequest(
+        from: URL(string: "https://push2.eastmoney.com/api/qt/stock/get"),
+        to: redirectProposal,
+        allowedHosts: [
+            "push2.eastmoney.com",
+            "push2delay.eastmoney.com",
+        ]
+    )
+    let blockedRedirect = permittedHTTPRedirectRequest(
+        from: URL(string: "https://push2.eastmoney.com/api/qt/stock/get"),
+        to: URLRequest(url: URL(string: "https://example.com/redirect")!),
+        allowedHosts: [
+            "push2.eastmoney.com",
+            "push2delay.eastmoney.com",
+        ]
+    )
+    let oversizedLoader = UsageProviderTestLoader(
+        data: nil,
+        error: HTTPDataLoaderError.responseTooLarge
+    )
+    var oversizedFetchError: Error?
+    EastMoneyMarketClient(loader: oversizedLoader).fetch(secid: "1.000001") {
+        if case .failure(let error) = $0 { oversizedFetchError = error }
+    }
+    guard fetchedQuote?.code == "000001",
+          fetchedTask === loader.task,
+          requestURL.contains("push2.eastmoney.com/api/qt/stock/get"),
+          requestURL.contains("secid=1.000001"),
+          requestURL.contains("f43"),
+          permittedRedirect?.url?.host == "push2delay.eastmoney.com",
+          permittedRedirect?.value(forHTTPHeaderField: "Authorization") == nil,
+          permittedRedirect?.value(forHTTPHeaderField: "Cookie") == nil,
+          blockedRedirect == nil,
+          oversizedFetchError as? EastMoneyMarketClientError
+            == .responseTooLarge("1.000001")
+    else {
+        fputs("market-data-self-test: request construction failed\n", stderr)
+        exit(1)
+    }
+
+    let newConfigJSON = #"""
+    {
+      "version": 1,
+      "theme": {"id":"market","displayName":"Market","title":"Codex","backgroundImage":"quota-panel-background.png"},
+      "widgets": {"codexQuota":true,"codexConnection":true,"followStatus":true,"cryptoPrices":true,"stockPrices":true},
+      "markets": {"stockQuotes":[{"secid":"1.000001","name":"上证指数","badge":"沪","enabled":true}]},
+      "tracking": {"mode":"follow-current-codex-desktop","gapPoints":14,"mascotTopPaddingPoints":7,"fallback":"top-right"},
+      "refresh": {"quotaSeconds":300,"cryptoSeconds":5,"stockSeconds":15,"stockClosedSeconds":60,"stockCacheWriteSeconds":60,"followSeconds":0.05}
+    }
+    """#
+    let legacyConfigJSON = #"""
+    {
+      "version": 1,
+      "theme": {"id":"market","displayName":"Market","title":"Codex","backgroundImage":"quota-panel-background.png"},
+      "widgets": {"codexQuota":true,"codexConnection":true,"followStatus":true,"marketPrices":true},
+      "tracking": {"mode":"follow-current-codex-desktop","gapPoints":14,"mascotTopPaddingPoints":7,"fallback":"top-right"},
+      "refresh": {"quotaSeconds":300,"marketSeconds":7,"followSeconds":0.05}
+    }
+    """#
+    let newConfig = try? decodePanelConfig(from: Data(newConfigJSON.utf8))
+    let legacyConfig = try? decodePanelConfig(from: Data(legacyConfigJSON.utf8))
+    guard newConfig?.widgets.cryptoPrices == true,
+          newConfig?.widgets.stockPrices == true,
+          newConfig?.refresh.stockSeconds == 15,
+          legacyConfig?.widgets.cryptoPrices == true,
+          legacyConfig?.widgets.stockPrices == false,
+          legacyConfig?.refresh.cryptoSeconds == 7,
+          legacyConfig?.refresh.stockSeconds == 30
+    else {
+        fputs("market-data-self-test: config compatibility failed\n", stderr)
+        exit(1)
+    }
+
+    func refreshConfig(
+        field: String,
+        current: Int,
+        replacement: String
+    ) -> Result<PanelConfig, Error> {
+        let json = newConfigJSON.replacingOccurrences(
+            of: "\"\(field)\":\(current)",
+            with: "\"\(field)\":\(replacement)"
+        )
+        do {
+            return .success(try decodePanelConfig(from: Data(json.utf8)))
+        } catch {
+            return .failure(error)
+        }
+    }
+    let refreshSpecs = [
+        ("cryptoSeconds", 5, 5),
+        ("stockSeconds", 15, 15),
+        ("stockClosedSeconds", 60, 60),
+        ("stockCacheWriteSeconds", 60, 60),
+    ]
+    for (field, current, minimum) in refreshSpecs {
+        guard case .success = refreshConfig(
+            field: field,
+            current: current,
+            replacement: "\(minimum)"
+        ), case .success = refreshConfig(
+            field: field,
+            current: current,
+            replacement: "86400"
+        ), case .failure(let lowError) = refreshConfig(
+            field: field,
+            current: current,
+            replacement: "\(minimum - 1)"
+        ), case .failure(let highError) = refreshConfig(
+            field: field,
+            current: current,
+            replacement: "86401"
+        ), lowError.localizedDescription.contains("refresh.\(field)"),
+        lowError.localizedDescription.contains("\(minimum)...86400"),
+        highError.localizedDescription.contains("refresh.\(field)"),
+        highError.localizedDescription.contains("\(minimum)...86400") else {
+            fputs("market-data-self-test: \(field) bounds failed\n", stderr)
+            exit(1)
+        }
+    }
+    guard case .failure(let nonFiniteError) = refreshConfig(
+        field: "cryptoSeconds",
+        current: 5,
+        replacement: "1e309"
+    ), nonFiniteError.localizedDescription.contains("refresh.cryptoSeconds"),
+    nonFiniteError.localizedDescription.contains("5...86400") else {
+        fputs("market-data-self-test: non-finite interval failed\n", stderr)
+        exit(1)
+    }
+
+    let duplicateMarkets = Data(#"{"stockQuotes":[{"secid":"1.000001","enabled":true},{"secid":"1.000001","enabled":true}]}"#.utf8)
+    let tooManyMarkets = Data(#"{"stockQuotes":[{"secid":"1.000001"},{"secid":"0.399001"},{"secid":"0.399006"},{"secid":"1.000300"},{"secid":"1.000016"},{"secid":"1.000688"}]}"#.utf8)
+    let nonASCIIStockCode = Data(#"{"stockQuotes":[{"secid":"1.０００００１"}]}"#.utf8)
+    let orderedMarkets = try? JSONDecoder().decode(
+        PanelMarkets.self,
+        from: Data(#"{"stockQuotes":[{"secid":"0.399006"},{"secid":"1.000001"},{"secid":"0.399001"}]}"#.utf8)
+    )
+    guard (try? JSONDecoder().decode(
+        PanelMarkets.self,
+        from: duplicateMarkets
+    )) == nil,
+    (try? JSONDecoder().decode(
+        PanelMarkets.self,
+        from: tooManyMarkets
+    )) == nil,
+    (try? JSONDecoder().decode(
+        PanelMarkets.self,
+        from: nonASCIIStockCode
+    )) == nil,
+    orderedMarkets?.stockQuotes.map(\.secid)
+        == ["0.399006", "1.000001", "0.399001"] else {
+        fputs("market-data-self-test: stock config bounds failed\n", stderr)
+        exit(1)
+    }
+
+    let iso = ISO8601DateFormatter()
+    guard let preOpen = iso.date(from: "2026-07-27T01:29:00Z"),
+          let morning = iso.date(from: "2026-07-27T01:30:00Z"),
+          let lunch = iso.date(from: "2026-07-27T03:30:00Z"),
+          let afternoon = iso.date(from: "2026-07-27T05:00:00Z"),
+          let closed = iso.date(from: "2026-07-27T07:00:00Z"),
+          let weekend = iso.date(from: "2026-07-25T02:00:00Z"),
+          stockSessionPeriod(at: preOpen) == .preOpen,
+          stockSessionPeriod(at: morning) == .morningTrading,
+          stockSessionPeriod(at: lunch) == .lunchClosed,
+          stockSessionPeriod(at: afternoon) == .afternoonTrading,
+          stockSessionPeriod(at: closed) == .closed,
+          stockSessionPeriod(at: weekend) == .weekend,
+          nextStockSessionBoundary(after: preOpen) == morning
+    else {
+        fputs("market-data-self-test: session schedule failed\n", stderr)
+        exit(1)
+    }
+
+    var activityTracker = StockActivityTracker()
+    activityTracker.reset(signature: nil)
+    let firstObservation = activityTracker.observe(
+        signature: "stable",
+        at: fetchedAt
+    )
+    let unchanged1 = activityTracker.observe(
+        signature: "stable",
+        at: fetchedAt.addingTimeInterval(30)
+    )
+    let unchanged2 = activityTracker.observe(
+        signature: "stable",
+        at: fetchedAt.addingTimeInterval(60)
+    )
+    let stale = activityTracker.observe(
+        signature: "stable",
+        at: fetchedAt.addingTimeInterval(120)
+    )
+    let recovered = activityTracker.observe(
+        signature: "changed",
+        at: fetchedAt.addingTimeInterval(150)
+    )
+    guard firstObservation == .verifying,
+          unchanged1 == .verifying,
+          unchanged2 == .verifying,
+          stale == .stale,
+          recovered == .trading,
+          activityTracker.unchangedCount == 0,
+          activityTracker.unchangedSince == nil else {
+        fputs("market-data-self-test: activity tracking failed\n", stderr)
+        exit(1)
+    }
+
+    let cacheDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(
+            "codex-status-panel-stock-cache-\(UUID().uuidString)",
+            isDirectory: true
+        )
+    let cacheURL = cacheDirectory.appendingPathComponent("stock-quotes.json")
+    let cache = StockQuoteCache(fileURL: cacheURL)
+    var firstCacheSize = Int.max
+    do {
+        try cache.save(quotes: [quote], savedAt: fetchedAt)
+        firstCacheSize = (try cacheURL.resourceValues(
+            forKeys: [.fileSizeKey]
+        )).fileSize ?? Int.max
+        try cache.save(quotes: [quote], savedAt: fetchedAt.addingTimeInterval(1))
+    } catch {
+        fputs("market-data-self-test: cache write failed: \(error)\n", stderr)
+        exit(1)
+    }
+    let cached = cache.load(allowedSecIDs: ["1.000001"])
+    let cacheFiles = (try? FileManager.default.contentsOfDirectory(
+        atPath: cacheDirectory.path
+    )) ?? []
+    let cacheSize = (try? cacheURL.resourceValues(forKeys: [.fileSizeKey]))?
+        .fileSize ?? Int.max
+    guard cached?.quotes == [quote],
+          cacheFiles == ["stock-quotes.json"],
+          cacheSize == firstCacheSize,
+          cacheSize <= StockQuoteCache.maximumBytes
+    else {
+        fputs("market-data-self-test: bounded cache failed\n", stderr)
+        exit(1)
+    }
+    let unknownQuote = StockQuote(
+        secid: "0.399001",
+        code: "399001",
+        name: "深证成指",
+        latest: 10_842.18,
+        change: -34.5,
+        changePercent: -0.32,
+        volume: 654_321,
+        amount: 98_765,
+        fetchedAt: fetchedAt
+    )
+    do {
+        try cache.save(
+            quotes: [quote, unknownQuote],
+            savedAt: fetchedAt.addingTimeInterval(2)
+        )
+    } catch {
+        fputs("market-data-self-test: unknown cache setup failed: \(error)\n", stderr)
+        exit(1)
+    }
+    guard cache.load(allowedSecIDs: ["1.000001"])?.quotes == [quote] else {
+        fputs("market-data-self-test: unknown cache filtering failed\n", stderr)
+        exit(1)
+    }
+    try? Data("{invalid".utf8).write(to: cacheURL, options: .atomic)
+    guard cache.load(allowedSecIDs: ["1.000001"]) == nil else {
+        fputs("market-data-self-test: damaged cache handling failed\n", stderr)
+        exit(1)
+    }
+    try? Data(
+        repeating: 0,
+        count: StockQuoteCache.maximumBytes + 1
+    ).write(to: cacheURL, options: .atomic)
+    guard cache.load(allowedSecIDs: ["1.000001"]) == nil else {
+        fputs("market-data-self-test: oversized cache handling failed\n", stderr)
+        exit(1)
+    }
+    try? FileManager.default.removeItem(at: cacheDirectory)
+
+    print("market-data-self-test: parser=pass; config=pass; schedule=pass; cache=pass; bounds=pass")
     exit(0)
 }
 
@@ -1325,16 +1709,46 @@ func renderPreviewOnce(
             startedAt: Date()
         ),
     ])
+    let previewStockConfigurations = Array(
+        PanelMarkets.defaults.stockQuotes.prefix(2)
+    )
+    let previewStockQuotes = [
+        StockQuote(
+            secid: "1.000001",
+            code: "000001",
+            name: "上证指数",
+            latest: 3_560.25,
+            change: 23.83,
+            changePercent: 0.67,
+            volume: 123_456,
+            amount: 987_654_321,
+            fetchedAt: Date()
+        ),
+        StockQuote(
+            secid: "0.399001",
+            code: "399001",
+            name: "深证成指",
+            latest: 10_842.18,
+            change: -35.20,
+            changePercent: -0.32,
+            volume: 456_789,
+            amount: 123_456_789,
+            fetchedAt: Date()
+        ),
+    ]
     let previewSize = collapsed
         ? collapsedPanelSize
         : panelSizeForTaskRows(
             previewTaskProgress.rowCount,
-            showsMarketPrices: true
+            showsMarketPrices: true,
+            showsStockPrices: true,
+            stockRowCount: previewStockConfigurations.count
         )
     let view = QuotaPanelView(frame: NSRect(origin: .zero, size: previewSize))
     view.pointerSide = .bottom
     view.isCollapsed = collapsed
     view.showsMarketPrices = true
+    view.showsStockPrices = true
     view.taskProgress = previewTaskProgress
     let presentation = previewQuotaPresentation(for: usageMode)
     if let presentation {
@@ -1353,6 +1767,19 @@ func renderPreviewOnce(
     view.ethPrice = 3_420.18
     view.ethPriceDirection = -1
     view.ethStatusText = "5秒"
+    view.stockQuotePresentations = zip(
+        previewStockConfigurations,
+        previewStockQuotes
+    ).map {
+        StockQuotePresentation(
+            configuration: $0.0,
+            quote: $0.1,
+            isCached: false,
+            isOffline: false
+        )
+    }
+    view.stockMarketState = .trading
+    view.stockUpdatedText = "14:32"
     view.layoutSubtreeIfNeeded()
 
     let scale: CGFloat = 2

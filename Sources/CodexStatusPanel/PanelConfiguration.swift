@@ -4,7 +4,7 @@
 import AppKit
 import Foundation
 
-let panelVersion = "1.2.4"
+let panelVersion = "1.2.5"
 let defaultBundleIdentifier = "io.github.mayday-materials.codex-status-panel"
 let panelBundleIdentifier = Bundle.main.bundleIdentifier ?? defaultBundleIdentifier
 let panelClientName = "codex-status-panel"
@@ -13,9 +13,18 @@ private func isFalseEnvironmentValue(_ rawValue: String) -> Bool {
     ["0", "false", "no", "off"].contains(rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
 }
 
-private func defaultMarketPricesEnabledFromEnvironment() -> Bool {
+private func defaultCryptoPricesEnabledFromEnvironment() -> Bool {
     guard let rawValue = ProcessInfo.processInfo.environment["CODEX_STATUS_PANEL_SHOW_MARKET_PRICES"] else {
-        return true
+        return false
+    }
+    return !isFalseEnvironmentValue(rawValue)
+}
+
+private func defaultStockPricesEnabledFromEnvironment() -> Bool {
+    guard let rawValue = ProcessInfo.processInfo.environment[
+        "CODEX_STATUS_PANEL_SHOW_STOCK_PRICES"
+    ] else {
+        return false
     }
     return !isFalseEnvironmentValue(rawValue)
 }
@@ -27,11 +36,12 @@ struct PanelConfig: Decodable {
     var usageProvider: UsageProviderConfiguration?
     var theme: PanelTheme
     var widgets: PanelWidgets
+    var markets: PanelMarkets
     var tracking: PanelTracking
     var refresh: PanelRefresh
 
     private enum CodingKeys: String, CodingKey {
-        case version, usageProvider, theme, widgets, tracking, refresh
+        case version, usageProvider, theme, widgets, markets, tracking, refresh
     }
 
     init(
@@ -39,6 +49,7 @@ struct PanelConfig: Decodable {
         usageProvider: UsageProviderConfiguration?,
         theme: PanelTheme,
         widgets: PanelWidgets,
+        markets: PanelMarkets,
         tracking: PanelTracking,
         refresh: PanelRefresh
     ) {
@@ -46,6 +57,7 @@ struct PanelConfig: Decodable {
         self.usageProvider = usageProvider
         self.theme = theme
         self.widgets = widgets
+        self.markets = markets
         self.tracking = tracking
         self.refresh = refresh
     }
@@ -55,6 +67,10 @@ struct PanelConfig: Decodable {
         version = try container.decode(Int.self, forKey: .version)
         theme = try container.decode(PanelTheme.self, forKey: .theme)
         widgets = try container.decode(PanelWidgets.self, forKey: .widgets)
+        markets = try container.decodeIfPresent(
+            PanelMarkets.self,
+            forKey: .markets
+        ) ?? .defaults
         tracking = try container.decode(PanelTracking.self, forKey: .tracking)
         refresh = try container.decode(PanelRefresh.self, forKey: .refresh)
 
@@ -90,8 +106,10 @@ struct PanelConfig: Decodable {
             codexQuota: true,
             codexConnection: true,
             followStatus: true,
-            marketPrices: defaultMarketPricesEnabledFromEnvironment()
+            cryptoPrices: defaultCryptoPricesEnabledFromEnvironment(),
+            stockPrices: defaultStockPricesEnabledFromEnvironment()
         ),
+        markets: .defaults,
         tracking: PanelTracking(
             mode: "follow-current-codex-desktop",
             gapPoints: 14,
@@ -100,7 +118,10 @@ struct PanelConfig: Decodable {
         ),
         refresh: PanelRefresh(
             quotaSeconds: 300,
-            marketSeconds: 5,
+            cryptoSeconds: 5,
+            stockSeconds: 30,
+            stockClosedSeconds: 300,
+            stockCacheWriteSeconds: 300,
             followSeconds: 0.05
         )
     )
@@ -287,7 +308,192 @@ struct PanelWidgets: Decodable {
     var codexQuota: Bool
     var codexConnection: Bool
     var followStatus: Bool
-    var marketPrices: Bool
+    var cryptoPrices: Bool
+    var stockPrices: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case codexQuota
+        case codexConnection
+        case followStatus
+        case cryptoPrices
+        case marketPrices
+        case stockPrices
+    }
+
+    init(
+        codexQuota: Bool,
+        codexConnection: Bool,
+        followStatus: Bool,
+        cryptoPrices: Bool,
+        stockPrices: Bool
+    ) {
+        self.codexQuota = codexQuota
+        self.codexConnection = codexConnection
+        self.followStatus = followStatus
+        self.cryptoPrices = cryptoPrices
+        self.stockPrices = stockPrices
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        codexQuota = try container.decode(Bool.self, forKey: .codexQuota)
+        codexConnection = try container.decode(Bool.self, forKey: .codexConnection)
+        followStatus = try container.decode(Bool.self, forKey: .followStatus)
+        cryptoPrices = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .cryptoPrices
+        ) ?? container.decodeIfPresent(
+            Bool.self,
+            forKey: .marketPrices
+        ) ?? false
+        stockPrices = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .stockPrices
+        ) ?? false
+    }
+}
+
+struct PanelConfigurationValidationError: LocalizedError, Equatable {
+    let path: String
+    let reason: String
+
+    var errorDescription: String? {
+        "panel-config: \(path) \(reason)"
+    }
+}
+
+func isValidStockSecID(_ value: String) -> Bool {
+    let parts = value.split(separator: ".", omittingEmptySubsequences: false)
+    guard parts.count == 2,
+          parts[0] == "0" || parts[0] == "1",
+          parts[1].utf8.count == 6,
+          parts[1].utf8.allSatisfy({ $0 >= 48 && $0 <= 57 })
+    else { return false }
+    return true
+}
+
+struct StockQuoteConfiguration: Decodable, Equatable {
+    let secid: String
+    let name: String?
+    let badge: String?
+    let enabled: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case secid, name, badge, enabled
+    }
+
+    init(
+        secid: String,
+        name: String?,
+        badge: String?,
+        enabled: Bool
+    ) {
+        self.secid = secid
+        self.name = name
+        self.badge = badge
+        self.enabled = enabled
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let index = decoder.codingPath.last?.intValue ?? 0
+        let path = "markets.stockQuotes[\(index)]"
+        let rawSecID = try container.decode(String.self, forKey: .secid)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isValidStockSecID(rawSecID) else {
+            throw PanelConfigurationValidationError(
+                path: "\(path).secid",
+                reason: "必须是 0|1.六位代码"
+            )
+        }
+
+        let rawName = try container.decodeIfPresent(String.self, forKey: .name)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let rawName, rawName.count > 32 {
+            throw PanelConfigurationValidationError(
+                path: "\(path).name",
+                reason: "最多 32 个字符"
+            )
+        }
+
+        let rawBadge = try container.decodeIfPresent(String.self, forKey: .badge)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let rawBadge, rawBadge.count > 2 {
+            throw PanelConfigurationValidationError(
+                path: "\(path).badge",
+                reason: "最多 2 个字符"
+            )
+        }
+
+        secid = rawSecID
+        name = rawName?.isEmpty == false ? rawName : nil
+        badge = rawBadge?.isEmpty == false ? rawBadge : nil
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled)
+            ?? true
+    }
+}
+
+struct PanelMarkets: Decodable, Equatable {
+    var stockQuotes: [StockQuoteConfiguration]
+
+    private enum CodingKeys: String, CodingKey {
+        case stockQuotes
+    }
+
+    init(stockQuotes: [StockQuoteConfiguration]) {
+        self.stockQuotes = stockQuotes
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let quotes = try container.decodeIfPresent(
+            [StockQuoteConfiguration].self,
+            forKey: .stockQuotes
+        ) ?? Self.defaults.stockQuotes
+        var seen = Set<String>()
+        for (index, quote) in quotes.enumerated() {
+            guard seen.insert(quote.secid).inserted else {
+                throw PanelConfigurationValidationError(
+                    path: "markets.stockQuotes[\(index)].secid",
+                    reason: "与前面的配置重复"
+                )
+            }
+        }
+        guard quotes.filter(\.enabled).count <= maximumVisibleStockRows else {
+            throw PanelConfigurationValidationError(
+                path: "markets.stockQuotes",
+                reason: "最多启用 \(maximumVisibleStockRows) 项"
+            )
+        }
+        stockQuotes = quotes
+    }
+
+    static let defaults = PanelMarkets(stockQuotes: [
+        StockQuoteConfiguration(
+            secid: "1.000001",
+            name: "上证指数",
+            badge: "沪",
+            enabled: true
+        ),
+        StockQuoteConfiguration(
+            secid: "0.399001",
+            name: "深证成指",
+            badge: "深",
+            enabled: true
+        ),
+        StockQuoteConfiguration(
+            secid: "0.399006",
+            name: "创业板指",
+            badge: "创",
+            enabled: true
+        ),
+        StockQuoteConfiguration(
+            secid: "1.000300",
+            name: "沪深300",
+            badge: "沪",
+            enabled: true
+        ),
+    ])
 }
 
 struct PanelTracking: Decodable {
@@ -299,8 +505,130 @@ struct PanelTracking: Decodable {
 
 struct PanelRefresh: Decodable {
     var quotaSeconds: TimeInterval
-    var marketSeconds: TimeInterval
+    var cryptoSeconds: TimeInterval
+    var stockSeconds: TimeInterval
+    var stockClosedSeconds: TimeInterval
+    var stockCacheWriteSeconds: TimeInterval
     var followSeconds: TimeInterval
+
+    private enum CodingKeys: String, CodingKey {
+        case quotaSeconds
+        case cryptoSeconds
+        case marketSeconds
+        case stockSeconds
+        case stockClosedSeconds
+        case stockCacheWriteSeconds
+        case followSeconds
+    }
+
+    init(
+        quotaSeconds: TimeInterval,
+        cryptoSeconds: TimeInterval,
+        stockSeconds: TimeInterval,
+        stockClosedSeconds: TimeInterval,
+        stockCacheWriteSeconds: TimeInterval,
+        followSeconds: TimeInterval
+    ) {
+        self.quotaSeconds = quotaSeconds
+        self.cryptoSeconds = cryptoSeconds
+        self.stockSeconds = stockSeconds
+        self.stockClosedSeconds = stockClosedSeconds
+        self.stockCacheWriteSeconds = stockCacheWriteSeconds
+        self.followSeconds = followSeconds
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        quotaSeconds = try container.decode(
+            TimeInterval.self,
+            forKey: .quotaSeconds
+        )
+        followSeconds = try container.decode(
+            TimeInterval.self,
+            forKey: .followSeconds
+        )
+        cryptoSeconds = try Self.configuredInterval(
+            container,
+            key: .cryptoSeconds,
+            legacyKey: .marketSeconds,
+            default: 5,
+            path: "refresh.cryptoSeconds",
+            minimum: 5
+        )
+        stockSeconds = try Self.configuredInterval(
+            container,
+            key: .stockSeconds,
+            default: 30,
+            path: "refresh.stockSeconds",
+            minimum: 15
+        )
+        stockClosedSeconds = try Self.configuredInterval(
+            container,
+            key: .stockClosedSeconds,
+            default: 300,
+            path: "refresh.stockClosedSeconds",
+            minimum: 60
+        )
+        stockCacheWriteSeconds = try Self.configuredInterval(
+            container,
+            key: .stockCacheWriteSeconds,
+            default: 300,
+            path: "refresh.stockCacheWriteSeconds",
+            minimum: 60
+        )
+    }
+
+    private static func configuredInterval(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        key: CodingKeys,
+        legacyKey: CodingKeys? = nil,
+        default defaultValue: TimeInterval,
+        path: String,
+        minimum: TimeInterval
+    ) throws -> TimeInterval {
+        let value: TimeInterval
+        do {
+            if let configured = try container.decodeIfPresent(
+                TimeInterval.self,
+                forKey: key
+            ) {
+                value = configured
+            } else if let legacyKey,
+                      let legacy = try container.decodeIfPresent(
+                        TimeInterval.self,
+                        forKey: legacyKey
+                      )
+            {
+                value = legacy
+            } else {
+                value = defaultValue
+            }
+        } catch {
+            throw intervalError(path: path, minimum: minimum)
+        }
+        return try interval(value, path: path, minimum: minimum)
+    }
+
+    private static func interval(
+        _ value: TimeInterval,
+        path: String,
+        minimum: TimeInterval
+    ) throws -> TimeInterval {
+        guard value.isFinite, value >= minimum, value <= 86_400 else {
+            throw intervalError(path: path, minimum: minimum)
+        }
+        return value
+    }
+
+    private static func intervalError(
+        path: String,
+        minimum: TimeInterval
+    ) -> PanelConfigurationValidationError {
+        PanelConfigurationValidationError(
+            path: path,
+            reason: "必须在 \(Int(minimum))...86400 秒之间"
+        )
+    }
 }
 
 private struct LoadedPanelConfig {
@@ -446,8 +774,17 @@ func reloadPanelConfig() throws -> PanelConfig {
 var refreshInterval: TimeInterval {
     max(1, panelConfig.refresh.quotaSeconds)
 }
-var btcRefreshInterval: TimeInterval {
-    max(1, panelConfig.refresh.marketSeconds)
+var cryptoRefreshInterval: TimeInterval {
+    panelConfig.refresh.cryptoSeconds
+}
+var stockRefreshInterval: TimeInterval {
+    panelConfig.refresh.stockSeconds
+}
+var stockClosedRefreshInterval: TimeInterval {
+    panelConfig.refresh.stockClosedSeconds
+}
+var stockCacheWriteInterval: TimeInterval {
+    panelConfig.refresh.stockCacheWriteSeconds
 }
 let taskProgressRefreshInterval: TimeInterval = 2
 func configuredMarketPricesEnabled(for config: PanelConfig) -> Bool {
@@ -456,7 +793,7 @@ func configuredMarketPricesEnabled(for config: PanelConfig) -> Bool {
     ] {
         return !isFalseEnvironmentValue(rawValue)
     }
-    return config.widgets.marketPrices
+    return config.widgets.cryptoPrices
 }
 let marketPricesPreferenceKey = "showsMarketPrices"
 func resolvedMarketPricesEnabled(
@@ -472,6 +809,24 @@ let initialMarketPricesEnabled = resolvedMarketPricesEnabled(
     ) as? Bool,
     configuredDefault: configuredMarketPricesEnabled(for: panelConfig)
 )
+func configuredStockPricesEnabled(for config: PanelConfig) -> Bool {
+    if let rawValue = ProcessInfo.processInfo.environment[
+        "CODEX_STATUS_PANEL_SHOW_STOCK_PRICES"
+    ] {
+        return !isFalseEnvironmentValue(rawValue)
+    }
+    return config.widgets.stockPrices
+}
+let stockPricesPreferenceKey = "showsStockPrices"
+let initialStockPricesEnabled = resolvedMarketPricesEnabled(
+    storedValue: UserDefaults.standard.object(
+        forKey: stockPricesPreferenceKey
+    ) as? Bool,
+    configuredDefault: configuredStockPricesEnabled(for: panelConfig)
+)
+var enabledStockQuoteConfigurations: [StockQuoteConfiguration] {
+    panelConfig.markets.stockQuotes.filter(\.enabled)
+}
 // 20 Hz 足以保持跟随平滑，同时避免高频窗口查询持续占用主线程。
 var followInterval: TimeInterval {
     max(0.05, panelConfig.refresh.followSeconds)
@@ -481,25 +836,40 @@ let panelVerticalCanvasInset: CGFloat = 4
 let panelPointerLength: CGFloat = 10
 let taskProgressRowHeight: CGFloat = 23
 let marketPriceRowHeight: CGFloat = 23
+let stockMarketHeaderHeight: CGFloat = 20
 let maximumVisibleTaskRows = 5
+let maximumVisibleStockRows = 5
 private let baseExpandedPanelHeight: CGFloat = 120
 func panelSizeForTaskRows(
     _ count: Int,
-    showsMarketPrices: Bool
+    showsMarketPrices: Bool,
+    showsStockPrices: Bool = false,
+    stockRowCount: Int = 0
 ) -> NSSize {
     // 至少保留一行状态，最多展示 maximumVisibleTaskRows 行，避免窗口无限增高。
     let safeCount = max(1, min(maximumVisibleTaskRows, count))
     let marketHeight = showsMarketPrices ? marketPriceRowHeight * 2 : 0
+    let safeStockCount = max(
+        1,
+        min(maximumVisibleStockRows, stockRowCount)
+    )
+    let stockHeight = showsStockPrices
+        ? stockMarketHeaderHeight
+            + marketPriceRowHeight * CGFloat(safeStockCount)
+        : 0
     return NSSize(
         width: 232,
         height: baseExpandedPanelHeight
             + taskProgressRowHeight * CGFloat(safeCount)
             + marketHeight
+            + stockHeight
     )
 }
 let expandedPanelSize = panelSizeForTaskRows(
     1,
-    showsMarketPrices: initialMarketPricesEnabled
+    showsMarketPrices: initialMarketPricesEnabled,
+    showsStockPrices: initialStockPricesEnabled,
+    stockRowCount: enabledStockQuoteConfigurations.count
 )
 let collapsedPanelSize = NSSize(width: 72, height: 48)
 var panelPetGap: CGFloat {

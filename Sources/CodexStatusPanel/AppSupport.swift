@@ -78,6 +78,7 @@ struct PanelMenuControlState: Equatable {
     let collapseTitle: String
     let refreshQuotaEnabled: Bool
     let marketPricesEnabled: Bool
+    let stockPricesEnabled: Bool
 }
 
 /// 纯函数：把当前运行状态转换成菜单项是否可用及其文案，便于独立自测。
@@ -86,14 +87,16 @@ func panelMenuControlState(
     isPanelHiddenByUser: Bool,
     isCollapsed: Bool,
     isRefreshing: Bool,
-    showsMarketPrices: Bool
+    showsMarketPrices: Bool,
+    showsStockPrices: Bool = false
 ) -> PanelMenuControlState {
     PanelMenuControlState(
         showPanelEnabled: isPanelHiddenByUser || !isPanelVisible,
         hidePanelEnabled: isPanelVisible && !isPanelHiddenByUser,
         collapseTitle: collapsedMenuItemTitle(isCollapsed: isCollapsed),
         refreshQuotaEnabled: !isRefreshing,
-        marketPricesEnabled: showsMarketPrices
+        marketPricesEnabled: showsMarketPrices,
+        stockPricesEnabled: showsStockPrices
     )
 }
 
@@ -228,6 +231,8 @@ final class RuntimeHealthWriter {
         codexConnectionStatus: String,
         followStatus: String,
         marketPricesEnabled: Bool,
+        stockPricesEnabled: Bool,
+        stockMarketState: String,
         panelHeight: CGFloat,
         gap: CGFloat? = nil,
         centerError: CGFloat? = nil,
@@ -242,6 +247,8 @@ final class RuntimeHealthWriter {
             codexConnectionStatus,
             followStatus,
             String(marketPricesEnabled),
+            String(stockPricesEnabled),
+            stockMarketState,
             String(format: "%.1f", panelHeight),
         ].joined(separator: "|")
         guard force || signature != lastSignature || now - lastWriteAt >= 15 else { return }
@@ -255,6 +262,9 @@ final class RuntimeHealthWriter {
             "status": status,
             "panelVisible": panelVisible,
             "marketPricesEnabled": marketPricesEnabled,
+            "cryptoPricesEnabled": marketPricesEnabled,
+            "stockPricesEnabled": stockPricesEnabled,
+            "stockMarketState": stockMarketState,
             "panelHeightPoints": panelHeight,
             "updatedAt": ISO8601DateFormatter().string(from: Date()),
         ]

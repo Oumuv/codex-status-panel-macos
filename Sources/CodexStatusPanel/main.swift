@@ -9,6 +9,7 @@ let cliFlags: Set<String> = [
     "--print-quota",
     "--print-btc",
     "--print-eth",
+    "--print-stock",
     "--print-panel-location",
     "--print-saved-panel-location",
     "--self-test-placement",
@@ -16,6 +17,7 @@ let cliFlags: Set<String> = [
     "--self-test-task-progress",
     "--self-test-authentication-fallback",
     "--self-test-usage-provider",
+    "--self-test-market-data",
     "--print-panel-config",
     "--print-task-progress",
     "--render-preview",
@@ -34,6 +36,14 @@ if CommandLine.arguments.contains("--print-btc") {
 
 if CommandLine.arguments.contains("--print-eth") {
     printMarketPriceOnce(symbol: "ETHUSDT", label: "ETH/USDT")
+}
+
+if let stockFlag = CommandLine.arguments.firstIndex(of: "--print-stock") {
+    guard CommandLine.arguments.indices.contains(stockFlag + 1) else {
+        fputs("用法：CodexStatusPanel --print-stock <secid>\n", stderr)
+        exit(1)
+    }
+    printStockQuoteOnce(secid: CommandLine.arguments[stockFlag + 1])
 }
 
 if CommandLine.arguments.contains("--print-panel-location") {
@@ -62,6 +72,10 @@ if CommandLine.arguments.contains("--self-test-authentication-fallback") {
 
 if CommandLine.arguments.contains("--self-test-usage-provider") {
     runUsageProviderSelfTest()
+}
+
+if CommandLine.arguments.contains("--self-test-market-data") {
+    runMarketDataSelfTest()
 }
 
 if CommandLine.arguments.contains("--print-panel-config") {

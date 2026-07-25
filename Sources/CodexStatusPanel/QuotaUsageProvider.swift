@@ -169,8 +169,31 @@ struct BoundedHTTPResponseBuffer {
     }
 }
 
-private enum HTTPDataLoaderError: Error {
+enum HTTPDataLoaderError: Error {
     case responseTooLarge
+}
+
+func permittedHTTPRedirectRequest(
+    from sourceURL: URL?,
+    to proposedRequest: URLRequest,
+    allowedHosts: Set<String>
+) -> URLRequest? {
+    guard let sourceHost = sourceURL?.host?.lowercased(),
+          let targetURL = proposedRequest.url,
+          targetURL.scheme?.lowercased() == "https",
+          targetURL.port == nil || targetURL.port == 443,
+          let targetHost = targetURL.host?.lowercased(),
+          allowedHosts.contains(sourceHost),
+          allowedHosts.contains(targetHost),
+          targetURL.user == nil,
+          targetURL.password == nil,
+          proposedRequest.httpMethod == nil || proposedRequest.httpMethod == "GET"
+    else { return nil }
+
+    var sanitized = proposedRequest
+    sanitized.setValue(nil, forHTTPHeaderField: "Authorization")
+    sanitized.setValue(nil, forHTTPHeaderField: "Cookie")
+    return sanitized
 }
 
 /// 使用 data delegate 流式收集响应；超过上限时立即取消，不让产品代码
@@ -188,6 +211,7 @@ final class BoundedURLSessionDataLoader: NSObject,
     private final class RequestState {
         var buffer: BoundedHTTPResponseBuffer
         var response: URLResponse?
+        var redirectCount = 0
         let completion: (Data?, URLResponse?, Error?) -> Void
 
         init(
@@ -202,6 +226,8 @@ final class BoundedURLSessionDataLoader: NSObject,
     }
 
     private let maximumResponseBytes: Int
+    private let allowedRedirectHosts: Set<String>
+    private let maximumRedirects: Int
     private let stateLock = NSLock()
     private var requestStates: [Int: RequestState] = [:]
     private let delegateQueue: OperationQueue = {
@@ -221,8 +247,16 @@ final class BoundedURLSessionDataLoader: NSObject,
         )
     }()
 
-    init(maximumResponseBytes: Int) {
+    init(
+        maximumResponseBytes: Int,
+        allowedRedirectHosts: Set<String> = [],
+        maximumRedirects: Int = 0
+    ) {
         self.maximumResponseBytes = max(0, maximumResponseBytes)
+        self.allowedRedirectHosts = Set(
+            allowedRedirectHosts.map { $0.lowercased() }
+        )
+        self.maximumRedirects = max(0, maximumRedirects)
         super.init()
     }
 
@@ -328,7 +362,21 @@ final class BoundedURLSessionDataLoader: NSObject,
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        completionHandler(nil)
+        var redirectedRequest: URLRequest?
+        stateLock.lock()
+        if let state = requestStates[task.taskIdentifier],
+           state.redirectCount < maximumRedirects,
+           let permitted = permittedHTTPRedirectRequest(
+            from: response.url,
+            to: request,
+            allowedHosts: allowedRedirectHosts
+           )
+        {
+            state.redirectCount += 1
+            redirectedRequest = permitted
+        }
+        stateLock.unlock()
+        completionHandler(redirectedRequest)
     }
 }
 

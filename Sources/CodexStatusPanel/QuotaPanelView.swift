@@ -45,6 +45,21 @@ final class QuotaPanelView: NSView {
     var showsMarketPrices = initialMarketPricesEnabled {
         didSet { needsDisplay = true }
     }
+    var showsStockPrices = initialStockPricesEnabled {
+        didSet {
+            toolTip = showsStockPrices
+                ? "A 股数据来源：东方财富。行情可能延迟，数据不构成投资建议。"
+                : nil
+            needsDisplay = true
+        }
+    }
+    var stockQuotePresentations: [StockQuotePresentation] = [] {
+        didSet { needsDisplay = true }
+    }
+    var stockMarketState: StockMarketDisplayState = .loading {
+        didSet { needsDisplay = true }
+    }
+    var stockUpdatedText = "--" { didSet { needsDisplay = true } }
     var btcPrice: Double? { didSet { needsDisplay = true } }
     var btcPriceDirection = 0 { didSet { needsDisplay = true } }
     var btcStatusText = "读取中…" { didSet { needsDisplay = true } }
@@ -373,6 +388,7 @@ final class QuotaPanelView: NSView {
         }
         let taskSectionHeight = taskProgressRowHeight
             * CGFloat(max(1, taskItems.count))
+        var nextMarketY = bodyRect.minY + 100 + taskSectionHeight
 
         if showsMarketPrices {
             drawMarketPriceRow(
@@ -382,7 +398,7 @@ final class QuotaPanelView: NSView {
                 price: btcPrice,
                 direction: btcPriceDirection,
                 statusText: btcStatusText,
-                y: bodyRect.minY + 100 + taskSectionHeight,
+                y: nextMarketY,
                 separatorY: bodyRect.minY + 93 + taskSectionHeight,
                 contentX: contentX,
                 contentWidth: contentWidth
@@ -394,15 +410,47 @@ final class QuotaPanelView: NSView {
                 price: ethPrice,
                 direction: ethPriceDirection,
                 statusText: ethStatusText,
-                y: bodyRect.minY + 100
-                    + taskSectionHeight
-                    + marketPriceRowHeight,
-                separatorY: bodyRect.minY + 93
-                    + taskSectionHeight
-                    + marketPriceRowHeight,
+                y: nextMarketY + marketPriceRowHeight,
+                separatorY: nextMarketY + marketPriceRowHeight - 7,
                 contentX: contentX,
                 contentWidth: contentWidth
             )
+            nextMarketY += marketPriceRowHeight * 2
+        }
+
+        if showsStockPrices {
+            drawStockMarketHeader(
+                y: nextMarketY,
+                separatorY: nextMarketY - 7,
+                contentX: contentX,
+                contentWidth: contentWidth
+            )
+            let stockRowY = nextMarketY + stockMarketHeaderHeight
+            if stockQuotePresentations.isEmpty {
+                drawText(
+                    "未配置 A 股行情",
+                    in: NSRect(
+                        x: contentX,
+                        y: stockRowY + 1,
+                        width: contentWidth,
+                        height: 15
+                    ),
+                    font: .systemFont(ofSize: 9.5, weight: .medium),
+                    color: NSColor.white.withAlphaComponent(0.58)
+                )
+            } else {
+                for (index, presentation) in stockQuotePresentations.enumerated() {
+                    drawStockQuoteRow(
+                        presentation,
+                        y: stockRowY
+                            + CGFloat(index) * marketPriceRowHeight,
+                        separatorY: stockRowY
+                            + CGFloat(index) * marketPriceRowHeight - 7,
+                        contentX: contentX,
+                        contentWidth: contentWidth
+                    )
+                }
+            }
         }
     }
 
@@ -1001,7 +1049,7 @@ final class QuotaPanelView: NSView {
         )
 
         if let price {
-            let formattedPrice = Self.btcPriceFormatter.string(from: NSNumber(value: price)) ?? "--"
+            let formattedPrice = Self.marketPriceFormatter.string(from: NSNumber(value: price)) ?? "--"
             drawText(
                 formattedPrice,
                 in: NSRect(x: contentX + 78, y: y - 1.5, width: 76, height: 17),
@@ -1026,6 +1074,209 @@ final class QuotaPanelView: NSView {
             color: NSColor.white.withAlphaComponent(0.54),
             alignment: .right
         )
+    }
+
+    private func drawStockMarketHeader(
+        y: CGFloat,
+        separatorY: CGFloat,
+        contentX: CGFloat,
+        contentWidth: CGFloat
+    ) {
+        let separator = NSBezierPath()
+        separator.move(to: NSPoint(x: contentX, y: separatorY))
+        separator.line(to: NSPoint(x: contentX + contentWidth, y: separatorY))
+        NSColor.white.withAlphaComponent(0.17).setStroke()
+        separator.lineWidth = 0.75
+        separator.stroke()
+
+        drawText(
+            "A股 · 东方财富",
+            in: NSRect(x: contentX, y: y + 1, width: 90, height: 14),
+            font: .systemFont(ofSize: 8.8, weight: .semibold),
+            color: NSColor.white.withAlphaComponent(0.70)
+        )
+        let stateColor = stockMarketStateColor(stockMarketState)
+        drawSystemSymbol(
+            named: stockMarketState.symbolName,
+            in: NSRect(x: contentX + 91, y: y + 1, width: 11, height: 11),
+            color: stateColor
+        )
+        drawText(
+            stockMarketState.text,
+            in: NSRect(x: contentX + 105, y: y + 1, width: 53, height: 14),
+            font: .systemFont(ofSize: 8.2, weight: .medium),
+            color: stateColor
+        )
+        drawText(
+            stockUpdatedText,
+            in: NSRect(
+                x: contentX + 158,
+                y: y + 1,
+                width: contentWidth - 158,
+                height: 14
+            ),
+            font: .monospacedDigitSystemFont(ofSize: 7.8, weight: .regular),
+            color: NSColor.white.withAlphaComponent(0.50),
+            alignment: .right
+        )
+    }
+
+    private func drawStockQuoteRow(
+        _ presentation: StockQuotePresentation,
+        y: CGFloat,
+        separatorY: CGFloat,
+        contentX: CGFloat,
+        contentWidth: CGFloat
+    ) {
+        let separator = NSBezierPath()
+        separator.move(to: NSPoint(x: contentX, y: separatorY))
+        separator.line(to: NSPoint(x: contentX + contentWidth, y: separatorY))
+        NSColor.white.withAlphaComponent(0.11).setStroke()
+        separator.lineWidth = 0.75
+        separator.stroke()
+
+        let isDimmed = stockMarketState.dimsQuotes
+            || presentation.isCached
+            || presentation.isOffline
+        let alpha: CGFloat = isDimmed ? 0.68 : 1
+        let detailWidth: CGFloat = 43
+        let detailX = contentX + contentWidth - detailWidth
+        let priceX = contentX + 74
+        let priceWidth = max(0, detailX - priceX - 4)
+        let iconRect = NSRect(x: contentX, y: y, width: 15, height: 15)
+        stockBadgeColor(for: presentation).withAlphaComponent(alpha).setFill()
+        NSBezierPath(ovalIn: iconRect).fill()
+        drawText(
+            presentation.badge,
+            in: NSRect(
+                x: iconRect.minX,
+                y: iconRect.minY + 0.7,
+                width: iconRect.width,
+                height: 13
+            ),
+            font: .systemFont(
+                ofSize: presentation.badge.count > 1 ? 7.2 : 9.2,
+                weight: .bold
+            ),
+            color: NSColor.white.withAlphaComponent(alpha),
+            alignment: .center
+        )
+        drawText(
+            presentation.displayName,
+            in: NSRect(x: contentX + 20, y: y, width: 58, height: 15),
+            font: .systemFont(ofSize: 9.2, weight: .semibold),
+            color: NSColor.white.withAlphaComponent(0.80 * alpha)
+        )
+
+        if let quote = presentation.quote {
+            let formatted = Self.marketPriceFormatter.string(
+                from: NSNumber(value: quote.latest)
+            ) ?? "--"
+            drawText(
+                formatted,
+                in: NSRect(x: priceX, y: y - 1.5, width: priceWidth, height: 17),
+                font: .monospacedDigitSystemFont(ofSize: 10.6, weight: .bold),
+                color: marketPriceColor(direction: presentation.direction)
+                    .withAlphaComponent(alpha),
+                alignment: .right
+            )
+            let detail = presentation.isOffline
+                ? "离线"
+                : String(format: "%+.2f%%", quote.changePercent)
+            drawText(
+                detail,
+                in: NSRect(
+                    x: detailX,
+                    y: y + 1,
+                    width: detailWidth,
+                    height: 14
+                ),
+                font: .monospacedDigitSystemFont(ofSize: 8.4, weight: .semibold),
+                color: presentation.isOffline
+                    ? NSColor.white.withAlphaComponent(0.48)
+                    : marketPriceColor(direction: presentation.direction)
+                        .withAlphaComponent(alpha),
+                alignment: .right
+            )
+        } else {
+            drawText(
+                "--",
+                in: NSRect(x: priceX, y: y - 1.5, width: priceWidth, height: 17),
+                font: .monospacedDigitSystemFont(ofSize: 10.6, weight: .bold),
+                color: NSColor.white.withAlphaComponent(0.62),
+                alignment: .right
+            )
+            drawText(
+                presentation.isOffline ? "离线" : "读取中",
+                in: NSRect(
+                    x: detailX,
+                    y: y + 1,
+                    width: detailWidth,
+                    height: 14
+                ),
+                font: .systemFont(ofSize: 8.2, weight: .regular),
+                color: NSColor.white.withAlphaComponent(0.48),
+                alignment: .right
+            )
+        }
+    }
+
+    private func drawSystemSymbol(
+        named name: String,
+        in rect: NSRect,
+        color: NSColor
+    ) {
+        let base = NSImage.SymbolConfiguration(pointSize: 9, weight: .medium)
+        let tinted = base.applying(
+            NSImage.SymbolConfiguration(hierarchicalColor: color)
+        )
+        guard let image = NSImage(
+            systemSymbolName: name,
+            accessibilityDescription: stockMarketState.text
+        )?.withSymbolConfiguration(tinted) else { return }
+        image.draw(in: rect)
+    }
+
+    private func stockBadgeColor(
+        for presentation: StockQuotePresentation
+    ) -> NSColor {
+        if presentation.badge == "创" {
+            return NSColor(
+                calibratedRed: 0.56,
+                green: 0.38,
+                blue: 0.88,
+                alpha: 1
+            )
+        }
+        if presentation.configuration.secid.hasPrefix("1.") {
+            return NSColor(
+                calibratedRed: 0.84,
+                green: 0.36,
+                blue: 0.29,
+                alpha: 1
+            )
+        }
+        return NSColor(
+            calibratedRed: 0.25,
+            green: 0.48,
+            blue: 0.84,
+            alpha: 1
+        )
+    }
+
+    private func stockMarketStateColor(
+        _ state: StockMarketDisplayState
+    ) -> NSColor {
+        switch state {
+        case .trading:
+            return NSColor(calibratedRed: 0.20, green: 0.72, blue: 1, alpha: 1)
+        case .stale:
+            return NSColor(calibratedRed: 1, green: 0.72, blue: 0.20, alpha: 1)
+        case .offline:
+            return NSColor(calibratedRed: 1, green: 0.55, blue: 0.33, alpha: 1)
+        default:
+            return NSColor.white.withAlphaComponent(0.58)
+        }
     }
 
     private func taskProgressColor(for kind: TaskProgressKind) -> NSColor {
@@ -1066,9 +1317,9 @@ final class QuotaPanelView: NSView {
     private func marketPriceColor(direction: Int) -> NSColor {
         switch direction {
         case 1:
-            return NSColor(calibratedRed: 0.24, green: 0.86, blue: 0.58, alpha: 1)
-        case -1:
             return NSColor(calibratedRed: 1.0, green: 0.39, blue: 0.43, alpha: 1)
+        case -1:
+            return NSColor(calibratedRed: 0.24, green: 0.86, blue: 0.58, alpha: 1)
         default:
             return NSColor.white.withAlphaComponent(0.94)
         }
@@ -1107,7 +1358,7 @@ final class QuotaPanelView: NSView {
         return shadow
     }()
 
-    private static let btcPriceFormatter: NumberFormatter = {
+    private static let marketPriceFormatter: NumberFormatter = {
         let formatter = NumberFormatter()
         formatter.locale = Locale(identifier: "en_US")
         formatter.numberStyle = .decimal

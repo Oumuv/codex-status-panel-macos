@@ -12,6 +12,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let taskProgressReader = CodexTaskProgressReader()
     private let btcPriceClient = MarketPriceClient(symbol: "BTCUSDT")
     private let ethPriceClient = MarketPriceClient(symbol: "ETHUSDT")
+    private let stockMarketClient = EastMoneyMarketClient()
+    private let stockQuoteCache = StockQuoteCache()
     private let locator = PetWindowLocator()
     private let healthWriter = RuntimeHealthWriter()
     private let quotaView = QuotaPanelView(frame: NSRect(origin: .zero, size: expandedPanelSize))
@@ -22,13 +24,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusMenu = NSMenu()
     private let codexStatusMenuItem = NSMenuItem()
     private let followStatusMenuItem = NSMenuItem()
+    private let stockStatusMenuItem = NSMenuItem()
     private let showPanelMenuItem = NSMenuItem(title: "显示面板", action: #selector(showPanelFromMenu(_:)), keyEquivalent: "")
     private let hidePanelMenuItem = NSMenuItem(title: "隐藏面板", action: #selector(hidePanelFromMenu(_:)), keyEquivalent: "")
     private let collapsePanelMenuItem = NSMenuItem(title: "折叠面板", action: #selector(toggleCollapsedFromMenu(_:)), keyEquivalent: "")
     private let refreshQuotaMenuItem = NSMenuItem(title: "立即刷新额度", action: #selector(refreshQuotaFromMenu(_:)), keyEquivalent: "r")
     private let toggleMarketPricesMenuItem = NSMenuItem(
-        title: "显示行情列表",
+        title: "显示币价（BTC/ETH）",
         action: #selector(toggleMarketPricesFromMenu(_:)),
+        keyEquivalent: ""
+    )
+    private let toggleStockPricesMenuItem = NSMenuItem(
+        title: "显示 A 股行情",
+        action: #selector(toggleStockPricesFromMenu(_:)),
         keyEquivalent: ""
     )
     private let resetFollowMenuItem = NSMenuItem(title: "重置跟随位置", action: #selector(resetFollowPositionFromMenu(_:)), keyEquivalent: "")
@@ -37,15 +45,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var refreshTimer: Timer?
     private var taskProgressTimer: Timer?
     private var btcRefreshTimer: Timer?
+    private var stockRefreshTimer: Timer?
+    private var stockCacheWriteTimer: Timer?
     private var followTimer: Timer?
     private var isRefreshing = false
     private var quotaRefreshGeneration = 0
     private var isRefreshingTaskProgress = false
     private var isRefreshingBTCPrice = false
     private var isRefreshingETHPrice = false
+    private var isRefreshingStockPrices = false
     private var showsMarketPrices = initialMarketPricesEnabled
+    private var showsStockPrices = initialStockPricesEnabled
     private var lastBTCPrice: Double?
     private var lastETHPrice: Double?
+    private var stockRefreshGeneration = 0
+    private var pendingStockRequestCount = 0
+    private var stockBatchSuccessCount = 0
+    private var stockBatchHadMarketChange = false
+    private var stockRequestTasks: [HTTPDataTasking] = []
+    private var stockQuotesBySecID: [String: StockQuote] = [:]
+    private var stockCachedSecIDs = Set<String>()
+    private var stockOfflineSecIDs = Set<String>()
+    private var stockMarketState: StockMarketDisplayState = .loading
+    private var stockActivityTracker = StockActivityTracker()
+    private var lastStockUpdatedAt: Date?
+    private var stockCacheDirty = false
+    private var lastStockCacheWriteAt: Date?
     private var codexConnectionStatus = "disconnected"
     private var followHealthStatus = "waiting-for-pet"
     private var lastLocationSource: String?
@@ -69,9 +94,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory)
         reportPanelConfigWarnings()
         quotaView.quotaSourceName = quotaProvider.sourceDisplayName
+        quotaView.showsMarketPrices = showsMarketPrices
+        quotaView.showsStockPrices = showsStockPrices
+        applyStockConfiguration(loadCache: true)
         makeStatusItem()
         makePanel()
-        quotaView.showsMarketPrices = showsMarketPrices
         writeHealth(status: "started", panelVisible: false, locationSource: nil, force: true)
         followPet()
         refreshQuota()
@@ -95,6 +122,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshTimer?.invalidate()
         taskProgressTimer?.invalidate()
         btcRefreshTimer?.invalidate()
+        stockRefreshTimer?.invalidate()
+        stockCacheWriteTimer?.invalidate()
+        cancelStockRequests()
         followTimer?.invalidate()
         writeHealth(status: "terminated", panelVisible: false, locationSource: nil, force: true)
     }
@@ -104,6 +134,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshTimer?.invalidate()
         btcRefreshTimer?.invalidate()
         btcRefreshTimer = nil
+        stockRefreshTimer?.invalidate()
+        stockRefreshTimer = nil
+        stockCacheWriteTimer?.invalidate()
+        stockCacheWriteTimer = nil
 
         // 定时器会持有闭包；使用 weak self 避免闭包反过来强持有 AppDelegate。
         followTimer = Timer.scheduledTimer(
@@ -120,12 +154,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if showsMarketPrices {
             btcRefreshTimer = Timer.scheduledTimer(
-                withTimeInterval: btcRefreshInterval,
+                withTimeInterval: cryptoRefreshInterval,
                 repeats: true
             ) { [weak self] _ in
                 self?.refreshBTCPrice()
                 self?.refreshETHPrice()
             }
+        }
+        if showsStockPrices {
+            refreshStockPrices()
+        }
+        if stockCacheDirty {
+            scheduleStockCacheWriteIfNeeded()
         }
     }
 
@@ -139,8 +179,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         codexStatusMenuItem.isEnabled = false
         followStatusMenuItem.isEnabled = false
+        stockStatusMenuItem.isEnabled = false
         statusMenu.addItem(codexStatusMenuItem)
         statusMenu.addItem(followStatusMenuItem)
+        statusMenu.addItem(stockStatusMenuItem)
         statusMenu.addItem(.separator())
 
         for item in [
@@ -149,6 +191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             collapsePanelMenuItem,
             refreshQuotaMenuItem,
             toggleMarketPricesMenuItem,
+            toggleStockPricesMenuItem,
             resetFollowMenuItem,
             openConfigMenuItem,
             reloadConfigMenuItem,
@@ -180,6 +223,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let quotaTitle = "\(quotaView.quotaSourceName)：\(quotaView.connectionText) · 额度：\(quotaUpdatedText)"
+        let stockTitle: String
+        if showsStockPrices {
+            let updated = lastStockUpdatedAt.map(Self.stockTimeFormatter.string)
+                ?? "--"
+            stockTitle = "A股：\(stockMarketState.text) · \(updated)"
+        } else {
+            stockTitle = "A股：未显示"
+        }
         let followTitle: String
         if isPanelHiddenByUser {
             followTitle = "面板：已隐藏"
@@ -193,27 +244,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             isPanelHiddenByUser: isPanelHiddenByUser,
             isCollapsed: quotaView.isCollapsed,
             isRefreshing: isRefreshing,
-            showsMarketPrices: showsMarketPrices
+            showsMarketPrices: showsMarketPrices,
+            showsStockPrices: showsStockPrices
         )
         // 只有菜单显示内容真正变化时才更新 AppKit 对象，减少高频跟随期间的无效工作。
         let signature = [
             quotaTitle,
             followTitle,
+            stockTitle,
             String(controlState.showPanelEnabled),
             String(controlState.hidePanelEnabled),
             controlState.collapseTitle,
             String(controlState.refreshQuotaEnabled),
             String(controlState.marketPricesEnabled),
+            String(controlState.stockPricesEnabled),
         ].joined(separator: "|")
 
         if force || signature != lastStatusMenuSignature {
             codexStatusMenuItem.title = quotaTitle
             followStatusMenuItem.title = followTitle
+            stockStatusMenuItem.title = stockTitle
             showPanelMenuItem.isEnabled = controlState.showPanelEnabled
             hidePanelMenuItem.isEnabled = controlState.hidePanelEnabled
             collapsePanelMenuItem.title = controlState.collapseTitle
             refreshQuotaMenuItem.isEnabled = controlState.refreshQuotaEnabled
             toggleMarketPricesMenuItem.state = controlState.marketPricesEnabled
+                ? .on
+                : .off
+            toggleStockPricesMenuItem.state = controlState.stockPricesEnabled
                 ? .on
                 : .off
             lastStatusMenuSignature = signature
@@ -332,6 +390,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setMarketPricesEnabled(!showsMarketPrices)
     }
 
+    @objc private func toggleStockPricesFromMenu(_ sender: Any?) {
+        setStockPricesEnabled(!showsStockPrices)
+    }
+
     private func setMarketPricesEnabled(
         _ enabled: Bool,
         persistPreference: Bool = true
@@ -352,7 +414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             refreshETHPrice()
             if btcRefreshTimer == nil {
                 btcRefreshTimer = Timer.scheduledTimer(
-                    withTimeInterval: btcRefreshInterval,
+                    withTimeInterval: cryptoRefreshInterval,
                     repeats: true
                 ) { [weak self] _ in
                     self?.refreshBTCPrice()
@@ -364,13 +426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             btcRefreshTimer = nil
         }
 
-        currentExpandedPanelSize = panelSizeForTaskRows(
-            quotaView.taskProgress.rowCount,
-            showsMarketPrices: enabled
-        )
-        if !quotaView.isCollapsed {
-            panel.setContentSize(currentExpandedPanelSize)
-        }
+        updateExpandedPanelSize()
         if !isPanelHiddenByUser {
             followPet(forceStandaloneFallback: isManualStandaloneEnabled)
         }
@@ -381,6 +437,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             force: true
         )
         updateStatusMenu(force: true)
+    }
+
+    private func setStockPricesEnabled(
+        _ enabled: Bool,
+        persistPreference: Bool = true
+    ) {
+        if showsStockPrices == enabled {
+            quotaView.showsStockPrices = enabled
+            updateExpandedPanelSize()
+            updateStatusMenu()
+            return
+        }
+
+        showsStockPrices = enabled
+        if persistPreference {
+            UserDefaults.standard.set(enabled, forKey: stockPricesPreferenceKey)
+        }
+        quotaView.showsStockPrices = enabled
+        stockRefreshGeneration += 1
+        isRefreshingStockPrices = false
+        pendingStockRequestCount = 0
+        cancelStockRequests()
+        stockRefreshTimer?.invalidate()
+        stockRefreshTimer = nil
+
+        if enabled {
+            refreshStockPrices()
+        }
+
+        updateExpandedPanelSize()
+        if !isPanelHiddenByUser {
+            followPet(forceStandaloneFallback: isManualStandaloneEnabled)
+        }
+        writeHealth(
+            status: enabled ? "stock-prices-shown" : "stock-prices-hidden",
+            panelVisible: panel.isVisible,
+            locationSource: lastLocationSource,
+            force: true
+        )
+        updateStatusMenu(force: true)
+    }
+
+    private func updateExpandedPanelSize() {
+        let nextSize = panelSizeForTaskRows(
+            quotaView.taskProgress.rowCount,
+            showsMarketPrices: showsMarketPrices,
+            showsStockPrices: showsStockPrices,
+            stockRowCount: enabledStockQuoteConfigurations.count
+        )
+        guard nextSize != currentExpandedPanelSize else { return }
+        currentExpandedPanelSize = nextSize
+        guard panel != nil else { return }
+        if !quotaView.isCollapsed {
+            panel.setContentSize(nextSize)
+        }
     }
 
     @objc private func resetFollowPositionFromMenu(_ sender: Any?) {
@@ -405,12 +516,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do {
             let reloadedConfig = try reloadPanelConfig()
             quotaRefreshGeneration += 1
+            stockRefreshGeneration += 1
             isRefreshing = false
+            isRefreshingStockPrices = false
+            pendingStockRequestCount = 0
+            cancelStockRequests()
             quotaProvider = makeQuotaUsageProvider(
                 configuration: reloadedConfig.usageProvider
             )
             quotaView.reloadPanelConfiguration()
             quotaView.quotaSourceName = quotaProvider.sourceDisplayName
+            applyStockConfiguration(loadCache: true)
 
             if previousUsageProvider != reloadedConfig.usageProvider {
                 quotaView.quotaPresentation = nil
@@ -430,6 +546,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
             setMarketPricesEnabled(
                 marketPricesEnabled,
+                persistPreference: false
+            )
+            let stockPricesEnabled = resolvedMarketPricesEnabled(
+                storedValue: UserDefaults.standard.object(
+                    forKey: stockPricesPreferenceKey
+                ) as? Bool,
+                configuredDefault: configuredStockPricesEnabled(
+                    for: reloadedConfig
+                )
+            )
+            setStockPricesEnabled(
+                stockPricesEnabled,
                 persistPreference: false
             )
             restartConfigurableTimers()
@@ -641,7 +769,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.quotaView.taskProgress = snapshot
                 let nextSize = panelSizeForTaskRows(
                     snapshot.rowCount,
-                    showsMarketPrices: self.showsMarketPrices
+                    showsMarketPrices: self.showsMarketPrices,
+                    showsStockPrices: self.showsStockPrices,
+                    stockRowCount: enabledStockQuoteConfigurations.count
                 )
                 guard nextSize != self.currentExpandedPanelSize else {
                     return
@@ -675,6 +805,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             codexConnectionStatus: codexConnectionStatus,
             followStatus: followHealthStatus,
             marketPricesEnabled: showsMarketPrices,
+            stockPricesEnabled: showsStockPrices,
+            stockMarketState: stockMarketState.rawValue,
             panelHeight: currentExpandedPanelSize.height,
             gap: gap,
             centerError: centerError,
@@ -700,7 +832,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     }
                     self.lastBTCPrice = price
                     self.quotaView.btcPrice = price
-                    self.quotaView.btcStatusText = "5秒"
+                    self.quotaView.btcStatusText = Self.intervalText(
+                        cryptoRefreshInterval
+                    )
                 case .failure:
                     self.quotaView.btcStatusText = self.quotaView.btcPrice == nil ? "重试中" : "暂离线"
                 }
@@ -726,7 +860,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     }
                     self.lastETHPrice = price
                     self.quotaView.ethPrice = price
-                    self.quotaView.ethStatusText = "5秒"
+                    self.quotaView.ethStatusText = Self.intervalText(
+                        cryptoRefreshInterval
+                    )
                 case .failure:
                     self.quotaView.ethStatusText = self.quotaView.ethPrice == nil ? "重试中" : "暂离线"
                 }
@@ -734,10 +870,292 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func applyStockConfiguration(loadCache: Bool) {
+        let configurations = enabledStockQuoteConfigurations
+        let allowedSecIDs = Set(configurations.map(\.secid))
+        stockQuotesBySecID = stockQuotesBySecID.filter {
+            allowedSecIDs.contains($0.key)
+        }
+        stockCachedSecIDs.formIntersection(allowedSecIDs)
+        stockOfflineSecIDs.formIntersection(allowedSecIDs)
+
+        if loadCache,
+           let snapshot = stockQuoteCache.load(allowedSecIDs: allowedSecIDs)
+        {
+            for quote in snapshot.quotes where stockQuotesBySecID[quote.secid] == nil {
+                stockQuotesBySecID[quote.secid] = quote
+                stockCachedSecIDs.insert(quote.secid)
+            }
+            if !snapshot.quotes.isEmpty {
+                lastStockCacheWriteAt = snapshot.savedAt
+                lastStockUpdatedAt = snapshot.savedAt
+                stockMarketState = .cached
+            }
+        }
+
+        if configurations.isEmpty {
+            stockMarketState = .unconfigured
+        } else if stockQuotesBySecID.isEmpty {
+            stockMarketState = .loading
+        }
+        stockActivityTracker.reset(signature: stockActivitySignature(
+            configurations: configurations
+        ))
+        updateStockPresentations()
+        updateExpandedPanelSize()
+    }
+
+    private func updateStockPresentations() {
+        quotaView.stockQuotePresentations = enabledStockQuoteConfigurations.map {
+            StockQuotePresentation(
+                configuration: $0,
+                quote: stockQuotesBySecID[$0.secid],
+                isCached: stockCachedSecIDs.contains($0.secid),
+                isOffline: stockOfflineSecIDs.contains($0.secid)
+            )
+        }
+        quotaView.stockMarketState = stockMarketState
+        quotaView.stockUpdatedText = lastStockUpdatedAt.map(
+            Self.stockShortTimeFormatter.string
+        ) ?? "--"
+    }
+
+    private func refreshStockPrices() {
+        guard showsStockPrices, !isRefreshingStockPrices else { return }
+        let configurations = enabledStockQuoteConfigurations
+        guard !configurations.isEmpty else {
+            stockMarketState = .unconfigured
+            updateStockPresentations()
+            updateStatusMenu()
+            return
+        }
+
+        isRefreshingStockPrices = true
+        let generation = stockRefreshGeneration
+        let period = stockSessionPeriod(at: Date())
+        if !period.expectsTrading {
+            stockMarketState = period.displayState
+        } else if stockMarketState != .trading && stockMarketState != .stale {
+            stockMarketState = .verifying
+        }
+        pendingStockRequestCount = configurations.count
+        stockBatchSuccessCount = 0
+        stockBatchHadMarketChange = false
+        updateStockPresentations()
+
+        for configuration in configurations {
+            let task = stockMarketClient.fetch(secid: configuration.secid) {
+                [weak self] result in
+                DispatchQueue.main.async {
+                    guard let self,
+                          self.stockRefreshGeneration == generation,
+                          self.showsStockPrices
+                    else { return }
+
+                    self.pendingStockRequestCount -= 1
+                    switch result {
+                    case .success(let quote):
+                        self.stockBatchSuccessCount += 1
+                        if let previous = self.stockQuotesBySecID[quote.secid] {
+                            if !quote.hasSameMarketValues(as: previous) {
+                                self.stockBatchHadMarketChange = true
+                            }
+                        } else {
+                            self.stockBatchHadMarketChange = true
+                        }
+                        self.stockQuotesBySecID[quote.secid] = quote
+                        self.stockCachedSecIDs.remove(quote.secid)
+                        self.stockOfflineSecIDs.remove(quote.secid)
+                        if self.lastStockUpdatedAt == nil
+                            || quote.fetchedAt > self.lastStockUpdatedAt!
+                        {
+                            self.lastStockUpdatedAt = quote.fetchedAt
+                        }
+                    case .failure(let error):
+                        self.stockOfflineSecIDs.insert(configuration.secid)
+                        fputs(
+                            "stock-market: \(error.localizedDescription)\n",
+                            stderr
+                        )
+                    }
+
+                    if self.pendingStockRequestCount == 0 {
+                        self.finishStockRefresh(
+                            period: period,
+                            expectedCount: configurations.count
+                        )
+                    } else {
+                        self.updateStockPresentations()
+                    }
+                }
+            }
+            if let task {
+                stockRequestTasks.append(task)
+            }
+        }
+    }
+
+    private func finishStockRefresh(
+        period: StockSessionPeriod,
+        expectedCount: Int
+    ) {
+        isRefreshingStockPrices = false
+        stockRequestTasks.removeAll()
+        let now = Date()
+
+        if stockBatchSuccessCount == 0 {
+            stockMarketState = .offline
+        } else if !period.expectsTrading {
+            stockMarketState = period.displayState
+            stockActivityTracker.reset(
+                signature: stockActivitySignature(
+                    configurations: enabledStockQuoteConfigurations
+                ) ?? stockActivityTracker.lastSignature
+            )
+        } else if stockBatchSuccessCount < expectedCount {
+            stockMarketState = stockActivityTracker.hasObservedActivity
+                ? .trading : .verifying
+        } else if let signature = stockActivitySignature(
+            configurations: enabledStockQuoteConfigurations
+        ) {
+            stockMarketState = stockActivityTracker.observe(
+                signature: signature,
+                at: now
+            )
+        }
+
+        if stockBatchHadMarketChange {
+            markStockCacheDirty()
+        }
+        updateStockPresentations()
+        updateStatusMenu(force: true)
+        writeHealth(
+            status: "stock-market-\(stockMarketState.rawValue)",
+            panelVisible: panel.isVisible,
+            locationSource: lastLocationSource
+        )
+        scheduleNextStockRefresh()
+    }
+
+    private func stockActivitySignature(
+        configurations: [StockQuoteConfiguration]
+    ) -> String? {
+        let signatures = configurations.compactMap {
+            stockQuotesBySecID[$0.secid]?.activitySignature
+        }
+        guard signatures.count == configurations.count,
+              !signatures.isEmpty
+        else { return nil }
+        return signatures.joined(separator: "||")
+    }
+
+    private func cancelStockRequests() {
+        stockRequestTasks.forEach { $0.cancel() }
+        stockRequestTasks.removeAll()
+    }
+
+    private func scheduleNextStockRefresh() {
+        stockRefreshTimer?.invalidate()
+        stockRefreshTimer = nil
+        guard showsStockPrices,
+              !enabledStockQuoteConfigurations.isEmpty
+        else { return }
+
+        let now = Date()
+        var interval = stockMarketState.usesClosedRefreshInterval
+            ? stockClosedRefreshInterval
+            : stockRefreshInterval
+        if let boundary = nextStockSessionBoundary(after: now) {
+            interval = min(interval, max(1, boundary.timeIntervalSince(now)))
+        }
+        stockRefreshTimer = Timer.scheduledTimer(
+            withTimeInterval: interval,
+            repeats: false
+        ) { [weak self] _ in
+            self?.stockRefreshTimer = nil
+            self?.refreshStockPrices()
+        }
+    }
+
+    private func markStockCacheDirty() {
+        stockCacheDirty = true
+        scheduleStockCacheWriteIfNeeded()
+    }
+
+    private func scheduleStockCacheWriteIfNeeded() {
+        guard stockCacheDirty, stockCacheWriteTimer == nil else { return }
+        guard let lastStockCacheWriteAt else {
+            flushStockCache()
+            return
+        }
+        let remaining = stockCacheWriteInterval
+            - Date().timeIntervalSince(lastStockCacheWriteAt)
+        if remaining <= 0 {
+            flushStockCache()
+            return
+        }
+        stockCacheWriteTimer = Timer.scheduledTimer(
+            withTimeInterval: remaining,
+            repeats: false
+        ) { [weak self] _ in
+            self?.stockCacheWriteTimer = nil
+            self?.flushStockCache()
+        }
+    }
+
+    private func flushStockCache() {
+        stockCacheWriteTimer?.invalidate()
+        stockCacheWriteTimer = nil
+        guard stockCacheDirty else { return }
+        let quotes = enabledStockQuoteConfigurations.compactMap {
+            stockQuotesBySecID[$0.secid]
+        }
+        guard !quotes.isEmpty else { return }
+
+        let now = Date()
+        do {
+            try stockQuoteCache.save(quotes: quotes, savedAt: now)
+            stockCacheDirty = false
+        } catch {
+            fputs(
+                "stock-cache: 无法写入：\(error.localizedDescription)\n",
+                stderr
+            )
+        }
+        // 成功或失败都从当前时刻重新计时，避免受管目录持续失败时形成写盘循环。
+        lastStockCacheWriteAt = now
+        if stockCacheDirty {
+            scheduleStockCacheWriteIfNeeded()
+        }
+    }
+
+    private static func intervalText(_ seconds: TimeInterval) -> String {
+        if seconds.rounded() == seconds {
+            return "\(Int(seconds))秒"
+        }
+        return String(format: "%.1f秒", seconds)
+    }
+
     private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "zh_CN")
         formatter.timeZone = .current
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+
+    private static let stockTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter
+    }()
+
+    private static let stockShortTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
         formatter.dateFormat = "HH:mm"
         return formatter
     }()

@@ -15,7 +15,16 @@
     "codexQuota": true,
     "codexConnection": true,
     "followStatus": true,
-    "marketPrices": false
+    "cryptoPrices": false,
+    "stockPrices": false
+  },
+  "markets": {
+    "stockQuotes": [
+      {"secid": "1.000001", "name": "上证指数", "badge": "沪", "enabled": true},
+      {"secid": "0.399001", "name": "深证成指", "badge": "深", "enabled": true},
+      {"secid": "0.399006", "name": "创业板指", "badge": "创", "enabled": true},
+      {"secid": "1.000300", "name": "沪深300", "badge": "沪", "enabled": true}
+    ]
   },
   "tracking": {
     "mode": "follow-current-codex-desktop",
@@ -25,7 +34,10 @@
   },
   "refresh": {
     "quotaSeconds": 300,
-    "marketSeconds": 5,
+    "cryptoSeconds": 5,
+    "stockSeconds": 30,
+    "stockClosedSeconds": 300,
+    "stockCacheWriteSeconds": 300,
     "followSeconds": 0.05
   }
 }
