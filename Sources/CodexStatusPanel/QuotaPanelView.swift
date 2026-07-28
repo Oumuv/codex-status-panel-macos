@@ -24,7 +24,10 @@ final class QuotaPanelView: NSView {
 
     // didSet 是属性观察器：属性被赋新值后自动执行，用于通知 AppKit 重新绘制。
     var quotaPresentation: QuotaPresentation? {
-        didSet { needsDisplay = true }
+        didSet {
+            needsDisplay = true
+            window?.invalidateCursorRects(for: self)
+        }
     }
     var quotaSourceName = "Codex" { didSet { needsDisplay = true } }
     var statusText = "正在读取额度…" { didSet { needsDisplay = true } }
@@ -91,10 +94,13 @@ final class QuotaPanelView: NSView {
         }
     }
     var onToggleCollapsed: (() -> Void)?
+    var onCycleRateLimit: (() -> Void)?
     private var hideButtonTrackingArea: NSTrackingArea?
     private var isHideButtonHovered = false
     private var runningTaskBadgeViews: [NSImageView] = []
     private var runningTaskBadgeAnimationsEnabled = false
+    // 临时关闭运行任务 GIF 角标，用于排查动画对 CPU 占用的影响。
+    private let showsRunningTaskBadgeAnimation = false
     private var windowVisibilityObservers: [NSObjectProtocol] = []
 
     // lazy 属性第一次使用时才加载资源；重新加载配置时会主动替换该缓存。
@@ -111,6 +117,7 @@ final class QuotaPanelView: NSView {
         hasUsageProviderConfiguration = panelConfig.usageProvider != nil
         backgroundImage = loadBackgroundImage()
         needsDisplay = true
+        window?.invalidateCursorRects(for: self)
     }
 
     private lazy var completedTaskIcon: NSImage? = taskIcon(
@@ -180,7 +187,8 @@ final class QuotaPanelView: NSView {
         }
         runningTaskBadgeViews.removeAll(keepingCapacity: true)
 
-        guard !isCollapsed,
+        guard showsRunningTaskBadgeAnimation,
+              !isCollapsed,
               window != nil,
               let animation = runningTaskBadgeAnimation
         else { return }
@@ -486,6 +494,14 @@ final class QuotaPanelView: NSView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         let bodyRect = panelBodyRect()
+        if !isCollapsed,
+           panelConfig.widgets.codexQuota,
+           quotaPresentation?.hasSwitchableRateLimits == true,
+           quotaValueRect(in: bodyRect).contains(point)
+        {
+            onCycleRateLimit?()
+            return
+        }
         if isCollapsed || hideButtonRect(in: bodyRect).contains(point) {
             onToggleCollapsed?()
             return
@@ -499,8 +515,23 @@ final class QuotaPanelView: NSView {
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        let clickableRect = isCollapsed ? bounds : hideButtonRect(in: panelBodyRect())
-        addCursorRect(clickableRect, cursor: .pointingHand)
+        if isCollapsed {
+            addCursorRect(bounds, cursor: .pointingHand)
+            return
+        }
+        let bodyRect = panelBodyRect()
+        addCursorRect(
+            hideButtonRect(in: bodyRect),
+            cursor: .pointingHand
+        )
+        if panelConfig.widgets.codexQuota,
+           quotaPresentation?.hasSwitchableRateLimits == true
+        {
+            addCursorRect(
+                quotaValueRect(in: bodyRect),
+                cursor: .pointingHand
+            )
+        }
     }
 
     private func panelBodyRect() -> NSRect {
@@ -534,6 +565,31 @@ final class QuotaPanelView: NSView {
         NSRect(x: bodyRect.maxX - 48, y: bodyRect.minY + 7, width: 38, height: 18)
     }
 
+    private func quotaValueRect(in bodyRect: NSRect) -> NSRect {
+        let contentX = bodyRect.minX + 14
+        let contentWidth = bodyRect.width - 28
+        return quotaValueRect(
+            bodyMinY: bodyRect.minY,
+            x: contentX,
+            width: contentWidth
+        )
+    }
+
+    private func quotaValueRect(
+        bodyMinY: CGFloat,
+        x: CGFloat,
+        width: CGFloat
+    ) -> NSRect {
+        let valueStart = x + 56
+        let valueRight = x + width - 48
+        return NSRect(
+            x: valueStart,
+            y: bodyMinY + 10,
+            width: max(0, valueRight - valueStart),
+            height: 16
+        )
+    }
+
     private func draw(
         presentation: QuotaPresentation,
         bodyMinY: CGFloat,
@@ -541,19 +597,26 @@ final class QuotaPanelView: NSView {
         width: CGFloat
     ) {
         let top = bodyMinY + 10
-        let valueStart = x + 68
-        let valueRight = x + width - 48
+        let valueRect = quotaValueRect(
+            bodyMinY: bodyMinY,
+            x: x,
+            width: width
+        )
 
         drawText(
             presentation.sourceName,
-            in: NSRect(x: x, y: top, width: 64, height: 16),
+            in: NSRect(x: x, y: top, width: 52, height: 16),
             font: .systemFont(ofSize: 10.8, weight: .semibold),
             color: NSColor.white.withAlphaComponent(0.88)
         )
         let topValueText: String?
         if presentation.showsInlineUsageMetrics {
             topValueText = presentation.progressPercent.map {
-                "剩余 \(max(0, min(100, $0)))%"
+                let percent = max(0, min(100, $0))
+                if let option = presentation.selectedRateLimitOption {
+                    return "\(option.compactDisplayName)·剩余\(percent)%"
+                }
+                return "剩余 \(percent)%"
             }
         } else {
             topValueText = presentation.valueText
@@ -561,7 +624,7 @@ final class QuotaPanelView: NSView {
         if let topValueText {
             drawText(
                 topValueText,
-                in: NSRect(x: valueStart, y: top, width: valueRight - valueStart, height: 16),
+                in: valueRect,
                 font: .monospacedDigitSystemFont(ofSize: 10.8, weight: .semibold),
                 color: quotaValueColor(for: presentation),
                 alignment: .right

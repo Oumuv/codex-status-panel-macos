@@ -146,6 +146,10 @@ func collapsedMenuItemTitle(isCollapsed: Bool) -> String {
     isCollapsed ? "展开面板" : "折叠面板"
 }
 
+func panelVisibilityMenuItemTitle(showPanelEnabled: Bool) -> String {
+    showPanelEnabled ? "显示面板" : "隐藏面板"
+}
+
 struct PanelPlacement {
     let origin: NSPoint
     let pointerCenterX: CGFloat

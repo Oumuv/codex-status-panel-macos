@@ -22,13 +22,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var panel: NSPanel!
     private var statusItem: NSStatusItem?
     private let statusMenu = NSMenu()
+    private let statusDetailsMenuItem = NSMenuItem(
+        title: "状态",
+        action: nil,
+        keyEquivalent: ""
+    )
+    private let statusDetailsMenu = NSMenu(title: "状态")
     private let codexStatusMenuItem = NSMenuItem()
     private let followStatusMenuItem = NSMenuItem()
     private let stockStatusMenuItem = NSMenuItem()
-    private let showPanelMenuItem = NSMenuItem(title: "显示面板", action: #selector(showPanelFromMenu(_:)), keyEquivalent: "")
-    private let hidePanelMenuItem = NSMenuItem(title: "隐藏面板", action: #selector(hidePanelFromMenu(_:)), keyEquivalent: "")
+    private let panelMenuItem = NSMenuItem(
+        title: "面板",
+        action: nil,
+        keyEquivalent: ""
+    )
+    private let panelMenu = NSMenu(title: "面板")
+    private let togglePanelVisibilityMenuItem = NSMenuItem(
+        title: "隐藏面板",
+        action: #selector(togglePanelVisibilityFromMenu(_:)),
+        keyEquivalent: ""
+    )
     private let collapsePanelMenuItem = NSMenuItem(title: "折叠面板", action: #selector(toggleCollapsedFromMenu(_:)), keyEquivalent: "")
     private let refreshQuotaMenuItem = NSMenuItem(title: "立即刷新额度", action: #selector(refreshQuotaFromMenu(_:)), keyEquivalent: "r")
+    private let quotaMenuItem = NSMenuItem(
+        title: "额度",
+        action: nil,
+        keyEquivalent: ""
+    )
+    private let quotaMenu = NSMenu(title: "额度")
+    private let displayContentMenuItem = NSMenuItem(
+        title: "显示内容",
+        action: nil,
+        keyEquivalent: ""
+    )
+    private let displayContentMenu = NSMenu(title: "显示内容")
     private let toggleMarketPricesMenuItem = NSMenuItem(
         title: "显示币价（BTC/ETH）",
         action: #selector(toggleMarketPricesFromMenu(_:)),
@@ -40,6 +67,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         keyEquivalent: ""
     )
     private let resetFollowMenuItem = NSMenuItem(title: "重置跟随位置", action: #selector(resetFollowPositionFromMenu(_:)), keyEquivalent: "")
+    private let configurationMenuItem = NSMenuItem(
+        title: "配置",
+        action: nil,
+        keyEquivalent: ""
+    )
+    private let configurationMenu = NSMenu(title: "配置")
     private let openConfigMenuItem = NSMenuItem(title: "打开配置文件", action: #selector(openConfigFileFromMenu(_:)), keyEquivalent: ",")
     private let reloadConfigMenuItem = NSMenuItem(title: "重新加载配置", action: #selector(reloadConfigFromMenu(_:)), keyEquivalent: "")
     private var refreshTimer: Timer?
@@ -177,17 +210,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusMenu.delegate = self
 
-        codexStatusMenuItem.isEnabled = false
-        followStatusMenuItem.isEnabled = false
-        stockStatusMenuItem.isEnabled = false
-        statusMenu.addItem(codexStatusMenuItem)
-        statusMenu.addItem(followStatusMenuItem)
-        statusMenu.addItem(stockStatusMenuItem)
-        statusMenu.addItem(.separator())
-
         for item in [
-            showPanelMenuItem,
-            hidePanelMenuItem,
+            togglePanelVisibilityMenuItem,
             collapsePanelMenuItem,
             refreshQuotaMenuItem,
             toggleMarketPricesMenuItem,
@@ -197,9 +221,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             reloadConfigMenuItem,
         ] {
             item.target = self
-            statusMenu.addItem(item)
         }
 
+        for item in [
+            codexStatusMenuItem,
+            followStatusMenuItem,
+            stockStatusMenuItem,
+        ] {
+            item.isEnabled = false
+            statusDetailsMenu.addItem(item)
+        }
+        statusDetailsMenuItem.submenu = statusDetailsMenu
+
+        panelMenu.addItem(togglePanelVisibilityMenuItem)
+        panelMenu.addItem(collapsePanelMenuItem)
+        panelMenu.addItem(resetFollowMenuItem)
+        panelMenuItem.submenu = panelMenu
+
+        quotaMenuItem.submenu = quotaMenu
+
+        displayContentMenu.addItem(toggleMarketPricesMenuItem)
+        displayContentMenu.addItem(toggleStockPricesMenuItem)
+        displayContentMenuItem.submenu = displayContentMenu
+
+        configurationMenu.addItem(openConfigMenuItem)
+        configurationMenu.addItem(reloadConfigMenuItem)
+        configurationMenuItem.submenu = configurationMenu
+
+        for item in [
+            statusDetailsMenuItem,
+            panelMenuItem,
+            quotaMenuItem,
+            displayContentMenuItem,
+            configurationMenuItem,
+        ] {
+            statusMenu.addItem(item)
+        }
         statusMenu.addItem(.separator())
         let quitItem = NSMenuItem(title: "退出", action: #selector(quitFromMenu(_:)), keyEquivalent: "q")
         quitItem.target = self
@@ -222,6 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             quotaUpdatedText = quotaView.statusText
         }
 
+        let statusSummaryTitle = "状态：\(quotaView.quotaSourceName) \(quotaView.connectionText)"
         let quotaTitle = "\(quotaView.quotaSourceName)：\(quotaView.connectionText) · 额度：\(quotaUpdatedText)"
         let stockTitle: String
         if showsStockPrices {
@@ -247,25 +305,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             showsMarketPrices: showsMarketPrices,
             showsStockPrices: showsStockPrices
         )
+        let rateLimitOptions = quotaView.quotaPresentation?.rateLimitOptions
+            ?? []
+        let selectedRateLimitID = quotaView.quotaPresentation?
+            .selectedRateLimitID
+        let panelVisibilityTitle = panelVisibilityMenuItemTitle(
+            showPanelEnabled: controlState.showPanelEnabled
+        )
+        let rateLimitSignature = rateLimitOptions.map {
+            "\($0.id):\($0.displayName)"
+        }.joined(separator: ",") + "|" + (selectedRateLimitID ?? "")
         // 只有菜单显示内容真正变化时才更新 AppKit 对象，减少高频跟随期间的无效工作。
         let signature = [
+            statusSummaryTitle,
             quotaTitle,
             followTitle,
             stockTitle,
-            String(controlState.showPanelEnabled),
-            String(controlState.hidePanelEnabled),
+            panelVisibilityTitle,
             controlState.collapseTitle,
             String(controlState.refreshQuotaEnabled),
             String(controlState.marketPricesEnabled),
             String(controlState.stockPricesEnabled),
+            rateLimitSignature,
         ].joined(separator: "|")
 
         if force || signature != lastStatusMenuSignature {
+            statusDetailsMenuItem.title = statusSummaryTitle
             codexStatusMenuItem.title = quotaTitle
             followStatusMenuItem.title = followTitle
             stockStatusMenuItem.title = stockTitle
-            showPanelMenuItem.isEnabled = controlState.showPanelEnabled
-            hidePanelMenuItem.isEnabled = controlState.hidePanelEnabled
+            togglePanelVisibilityMenuItem.title = panelVisibilityTitle
+            togglePanelVisibilityMenuItem.isEnabled = controlState.showPanelEnabled
+                || controlState.hidePanelEnabled
             collapsePanelMenuItem.title = controlState.collapseTitle
             refreshQuotaMenuItem.isEnabled = controlState.refreshQuotaEnabled
             toggleMarketPricesMenuItem.state = controlState.marketPricesEnabled
@@ -274,9 +345,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             toggleStockPricesMenuItem.state = controlState.stockPricesEnabled
                 ? .on
                 : .off
+            updateQuotaRateLimitMenu(
+                options: rateLimitOptions,
+                selectedID: selectedRateLimitID
+            )
             lastStatusMenuSignature = signature
         }
         updateStatusBarIcon()
+    }
+
+    private func updateQuotaRateLimitMenu(
+        options: [QuotaRateLimitOption],
+        selectedID: String?
+    ) {
+        quotaMenu.removeAllItems()
+        quotaMenu.addItem(refreshQuotaMenuItem)
+
+        guard !options.isEmpty else {
+            quotaMenuItem.title = "额度"
+            return
+        }
+
+        let selected = options.first { $0.id == selectedID }
+            ?? options[0]
+        quotaMenuItem.title = "额度：\(selected.displayName)"
+        guard options.count > 1 else { return }
+
+        quotaMenu.addItem(.separator())
+
+        for option in options {
+            let item = NSMenuItem(
+                title: "\(option.displayName)额度",
+                action: #selector(selectQuotaRateLimitFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = option.id
+            item.state = option.id == selected.id ? .on : .off
+            quotaMenu.addItem(item)
+        }
     }
 
     private func updateStatusBarIcon() {
@@ -332,6 +439,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         quotaView.onToggleCollapsed = { [weak self] in
             self?.toggleCollapsed()
         }
+        quotaView.onCycleRateLimit = { [weak self] in
+            self?.cycleQuotaRateLimit()
+        }
     }
 
     private func toggleCollapsed() {
@@ -356,14 +466,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusMenu()
     }
 
-    @objc private func showPanelFromMenu(_ sender: Any?) {
+    @objc private func togglePanelVisibilityFromMenu(_ sender: Any?) {
+        if isPanelHiddenByUser || panel?.isVisible != true {
+            showPanelFromMenu(sender)
+        } else {
+            hidePanelFromMenu(sender)
+        }
+    }
+
+    private func showPanelFromMenu(_ sender: Any?) {
         isPanelHiddenByUser = false
         isManualStandaloneEnabled = true
         followPet(forceStandaloneFallback: true)
         updateStatusMenu()
     }
 
-    @objc private func hidePanelFromMenu(_ sender: Any?) {
+    private func hidePanelFromMenu(_ sender: Any?) {
         isManualStandaloneEnabled = false
         isPanelHiddenByUser = true
         quotaView.setRunningTaskBadgeAnimationsEnabled(false)
@@ -384,6 +502,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func refreshQuotaFromMenu(_ sender: Any?) {
         refreshQuota()
         updateStatusMenu()
+    }
+
+    @objc private func selectQuotaRateLimitFromMenu(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        selectQuotaRateLimit(id: id)
+    }
+
+    private func selectQuotaRateLimit(id: String) {
+        guard let current = quotaView.quotaPresentation else { return }
+        let selected = current.selectingRateLimit(id: id)
+        guard selected.selectedRateLimitID != current.selectedRateLimitID else {
+            updateStatusMenu(force: true)
+            return
+        }
+        quotaView.quotaPresentation = selected
+        updateStatusMenu(force: true)
+    }
+
+    private func cycleQuotaRateLimit() {
+        guard let current = quotaView.quotaPresentation else { return }
+        let selected = current.cyclingRateLimit()
+        guard selected.selectedRateLimitID != current.selectedRateLimitID else {
+            return
+        }
+        quotaView.quotaPresentation = selected
+        updateStatusMenu(force: true)
     }
 
     @objc private func toggleMarketPricesFromMenu(_ sender: Any?) {

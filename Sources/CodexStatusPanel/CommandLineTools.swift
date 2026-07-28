@@ -161,6 +161,8 @@ func runMenuControlsSelfTest() -> Never {
         )) == "bolt.circle",
         collapsedMenuItemTitle(isCollapsed: false) == "折叠面板",
         collapsedMenuItemTitle(isCollapsed: true) == "展开面板",
+        panelVisibilityMenuItemTitle(showPanelEnabled: true) == "显示面板",
+        panelVisibilityMenuItemTitle(showPanelEnabled: false) == "隐藏面板",
         visibleExpandedState == PanelMenuControlState(
             showPanelEnabled: false,
             hidePanelEnabled: true,
@@ -1368,6 +1370,7 @@ private func sub2APIProviderChecks() -> (
 
     let quotaData = Data(#"{"mode":"quota_limited","isValid":true,"quota":{"limit":100,"used":6,"remaining":94,"unit":"USD"},"usage":{"today":{"total_tokens":123456789}}}"#.utf8)
     let rateData = Data(#"{"mode":"quota_limited","isValid":true,"unit":"USD","rate_limits":[{"window":"5h","limit":20,"used":12,"remaining":8,"reset_at":"2026-07-25T00:00:00Z"},{"window":"1d","limit":100,"used":10,"remaining":90}],"usage":{"today":{"total_tokens":123456789}}}"#.utf8)
+    let switchableRateData = Data(#"{"mode":"quota_limited","isValid":true,"unit":"USD","quota":{"limit":100,"used":6,"remaining":94},"rate_limits":[{"window":"1d","limit":200,"used":19.5068814,"remaining":180.4931186,"reset_at":"2026-07-29T00:00:00+08:00"},{"window":"7d","limit":2000,"used":197.780476,"remaining":1802.219524,"reset_at":"2026-07-31T00:00:00+08:00"}],"usage":{"today":{"total_tokens":123456789}}}"#.utf8)
     let subscriptionData = Data(#"{"mode":"unrestricted","isValid":true,"planName":"Pro","unit":"USD","subscription":{"daily_usage_usd":2,"daily_limit_usd":10,"weekly_usage_usd":70,"weekly_limit_usd":100,"monthly_usage_usd":5,"monthly_limit_usd":100,"weekly_window_start":"2026-07-20T00:00:00Z"},"usage":{"today":{"total_tokens":123456789}}}"#.utf8)
     let zeroWalletData = Data(#"{"mode":"unrestricted","isValid":true,"unit":"USD","balance":0,"usage":{"today":{"total_tokens":0}}}"#.utf8)
     let walletWithoutUsageData = Data(#"{"mode":"unrestricted","isValid":true,"unit":"USD","balance":9.99}"#.utf8)
@@ -1383,6 +1386,10 @@ private func sub2APIProviderChecks() -> (
     )
     let rate = try? Sub2APIUsageMapper.presentation(
         from: rateData,
+        now: fixedNow
+    )
+    let switchableRate = try? Sub2APIUsageMapper.presentation(
+        from: switchableRateData,
         now: fixedNow
     )
     let subscription = try? Sub2APIUsageMapper.presentation(
@@ -1401,6 +1408,25 @@ private func sub2APIProviderChecks() -> (
         from: extremeQuotaData,
         now: fixedNow
     )
+    let weeklyRate: QuotaPresentation?
+    if let switchableRate,
+       let option = switchableRate.rateLimitOptions.first(where: {
+           $0.displayName == "7 天"
+       })
+    {
+        weeklyRate = switchableRate.selectingRateLimit(id: option.id)
+    } else {
+        weeklyRate = nil
+    }
+    let refreshedWeeklyRate: QuotaPresentation?
+    if let switchableRate, let weeklyRate {
+        refreshedWeeklyRate = quotaPresentationAfterRefresh(
+            previous: weeklyRate,
+            result: .success(switchableRate)
+        )
+    } else {
+        refreshedWeeklyRate = nil
+    }
     var boundedBuffer = BoundedHTTPResponseBuffer(maximumBytes: 4)
     let acceptedAtLimit = boundedBuffer.append(Data(repeating: 1, count: 4))
     let rejectedPastLimit = !boundedBuffer.append(Data([2]))
@@ -1508,6 +1534,26 @@ private func sub2APIProviderChecks() -> (
                 && rate?.detailText == "今日已用 $10.00"
                 && rate?.dailyTokenText == "今日Token 1.23亿"
                 && rate?.showsInlineUsageMetrics == true,
+            switchableRate?.valueText == "剩余 $180.49"
+                && switchableRate?.progressPercent == 90
+                && switchableRate?.detailText == "今日已用 $19.51"
+                && switchableRate?.rateLimitOptions.map(\.displayName)
+                    == ["1 天", "7 天"]
+                && switchableRate?.selectedRateLimitOption?.displayName
+                    == "1 天",
+            weeklyRate?.valueText == "剩余 $1802.22"
+                && weeklyRate?.progressPercent == 90
+                && weeklyRate?.detailText == "今日已用 $19.51"
+                && weeklyRate?.selectedRateLimitOption?.displayName
+                    == "7 天",
+            switchableRate?.cyclingRateLimit() == weeklyRate,
+            weeklyRate?.cyclingRateLimit()
+                .selectedRateLimitOption?.displayName == "1 天",
+            refreshedWeeklyRate?.selectedRateLimitOption?.displayName
+                == "7 天"
+                && refreshedWeeklyRate?.valueText == "剩余 $1802.22",
+            switchableRate?.selectingRateLimit(id: "missing")
+                == switchableRate,
             subscription?.valueText == "剩余 $30.00"
                 && subscription?.detailText == "今日已用 $2.00"
                 && subscription?.dailyTokenText == "今日Token 1.23亿"
@@ -1630,8 +1676,46 @@ enum PreviewUsageMode: String {
     case unconfigured
     case sub2apiWallet = "sub2api-wallet"
     case sub2apiEmptyWallet = "sub2api-empty-wallet"
+    case sub2apiRate1d = "sub2api-rate-1d"
+    case sub2apiRate7d = "sub2api-rate-7d"
     case sub2apiWarning = "sub2api-warning"
     case sub2apiDanger = "sub2api-danger"
+}
+
+private func previewSub2APIRateLimitPresentation(
+    selectedIndex: Int
+) -> QuotaPresentation {
+    let options = [
+        QuotaRateLimitOption(
+            id: "1d",
+            displayName: "1 天",
+            valueText: "剩余 $180.49",
+            progressPercent: 90,
+            isDepleted: false
+        ),
+        QuotaRateLimitOption(
+            id: "7d",
+            displayName: "7 天",
+            valueText: "剩余 $1802.22",
+            progressPercent: 90,
+            isDepleted: false
+        ),
+    ]
+    let first = options[0]
+    let presentation = QuotaPresentation(
+        sourceName: "Sub2API",
+        valueText: first.valueText,
+        progressPercent: first.progressPercent,
+        detailText: "今日已用 $19.51",
+        dailyTokenText: "今日Token 1.23亿",
+        showsInlineUsageMetrics: true,
+        rateLimitOptions: options,
+        selectedRateLimitID: first.id,
+        isDepleted: false
+    )
+    return presentation.selectingRateLimit(
+        id: options[min(max(0, selectedIndex), options.count - 1)].id
+    )
 }
 
 private func previewQuotaPresentation(
@@ -1668,6 +1752,10 @@ private func previewQuotaPresentation(
             showsInlineUsageMetrics: true,
             isDepleted: true
         )
+    case .sub2apiRate1d:
+        return previewSub2APIRateLimitPresentation(selectedIndex: 0)
+    case .sub2apiRate7d:
+        return previewSub2APIRateLimitPresentation(selectedIndex: 1)
     case .sub2apiWarning:
         return QuotaPresentation(
             sourceName: "Sub2API",

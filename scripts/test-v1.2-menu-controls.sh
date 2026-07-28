@@ -71,9 +71,10 @@ if [[ "$PREVIEW_USAGE_STATUS" -eq 0 ]] \
   echo "缺少 --render-preview 输出路径时没有以失败状态返回用法提示" >&2
   exit 1
 fi
-echo "检查六种用量预览..."
+echo "检查八种用量预览..."
 for PREVIEW_MODE in \
-  codex unconfigured sub2api-wallet sub2api-empty-wallet sub2api-warning sub2api-danger; do
+  codex unconfigured sub2api-wallet sub2api-empty-wallet \
+  sub2api-rate-1d sub2api-rate-7d sub2api-warning sub2api-danger; do
   PREVIEW_PATH="$TMP_HOME/$PREVIEW_MODE.png"
   "$BIN" --render-preview "$PREVIEW_PATH" \
     --preview-usage "$PREVIEW_MODE" >/dev/null
