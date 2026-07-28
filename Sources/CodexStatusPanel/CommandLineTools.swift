@@ -114,6 +114,20 @@ func printTaskProgressOnce() -> Never {
 }
 
 func runMenuControlsSelfTest() -> Never {
+    let redrawView = QuotaPanelView(
+        frame: NSRect(origin: .zero, size: expandedPanelSize)
+    )
+    var redrawRequestCount = 0
+    let redrawObservation = redrawView.observe(\.needsDisplay) { _, _ in
+        redrawRequestCount += 1
+    }
+    redrawView.followStatusText = "跟随中"
+    let followStatusDoesNotInvalidatePanel = redrawRequestCount == 0
+    let followStatusValueUpdated = redrawView.followStatusText == "跟随中"
+    redrawView.statusText = "已更新"
+    let renderedStatusInvalidatesPanel = redrawRequestCount > 0
+    withExtendedLifetime(redrawObservation) {}
+
     let visibleExpandedState = panelMenuControlState(
         isPanelVisible: true,
         isPanelHiddenByUser: false,
@@ -138,6 +152,16 @@ func runMenuControlsSelfTest() -> Never {
         showsMarketPrices: true,
         showsStockPrices: false
     )
+    let redrawChecks = [
+        ("follow-status-invalidated-panel", followStatusDoesNotInvalidatePanel),
+        ("follow-status-value-not-updated", followStatusValueUpdated),
+        ("rendered-status-did-not-invalidate-panel", renderedStatusInvalidatesPanel),
+    ]
+    if let failedRedrawCheck = redrawChecks.first(where: { !$0.1 }) {
+        fputs("menu-controls-self-test: failed (\(failedRedrawCheck.0))\n", stderr)
+        exit(1)
+    }
+
     let checks = [
         statusBarSymbolName(for: menuBarDisplayState(
             isRefreshing: true,

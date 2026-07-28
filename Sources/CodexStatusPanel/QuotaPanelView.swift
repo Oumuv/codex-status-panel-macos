@@ -32,7 +32,8 @@ final class QuotaPanelView: NSView {
     var quotaSourceName = "Codex" { didSet { needsDisplay = true } }
     var statusText = "正在读取额度…" { didSet { needsDisplay = true } }
     var connectionText = "连接中" { didSet { needsDisplay = true } }
-    var followStatusText = "定位中" { didSet { needsDisplay = true } }
+    // 仅供状态菜单读取，不参与面板绘制；高频跟随更新不能触发重绘。
+    var followStatusText = "定位中"
     var hasUsageProviderConfiguration = panelConfig.usageProvider != nil {
         didSet { needsDisplay = true }
     }
