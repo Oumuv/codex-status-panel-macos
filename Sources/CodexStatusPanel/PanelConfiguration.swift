@@ -4,7 +4,16 @@
 import AppKit
 import Foundation
 
-let panelVersion = "1.2.5"
+let panelVersion: String = {
+    guard let version = Bundle.main.object(
+        forInfoDictionaryKey: "CFBundleShortVersionString"
+    ) as? String,
+        !version.isEmpty
+    else {
+        fatalError("应用 Info.plist 缺少 CFBundleShortVersionString")
+    }
+    return version
+}()
 let defaultBundleIdentifier = "io.github.mayday-materials.codex-status-panel"
 let panelBundleIdentifier = Bundle.main.bundleIdentifier ?? defaultBundleIdentifier
 let panelClientName = "codex-status-panel"

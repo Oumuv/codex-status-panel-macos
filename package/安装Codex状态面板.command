@@ -4,6 +4,7 @@ setopt ERR_EXIT PIPE_FAIL NO_UNSET
 
 ROOT="${0:A:h}"
 APP_SOURCE="$ROOT/panel/Codex 状态面板.app"
+APP_INFO_PLIST="$APP_SOURCE/Contents/Info.plist"
 APP_DEST="$HOME/Applications/Codex 状态面板.app"
 APP_BINARY="$APP_DEST/Contents/MacOS/CodexStatusPanel"
 LABEL="io.github.mayday-materials.codex-status-panel"
@@ -17,7 +18,6 @@ HEALTH_DIR="$HOME/Library/Caches/io.github.mayday-materials.codex-status-panel"
 HEALTH_PATH="$HEALTH_DIR/panel-health.json"
 USER_ID="$(/usr/bin/id -u)"
 DOMAIN="gui/$USER_ID"
-PANEL_VERSION="1.2.5"
 
 pause_before_exit() {
   if [[ -t 0 ]]; then
@@ -118,8 +118,6 @@ terminate_existing_panel_processes() {
     || fail "旧版面板进程无法终止，已停止覆盖安装以避免产生重复实例。"
 }
 
-echo "正在安装 Codex 状态面板（macOS Universal 开源版 $PANEL_VERSION）…"
-
 MACOS_VERSION="$(/usr/bin/sw_vers -productVersion)"
 MACOS_MAJOR="${MACOS_VERSION%%.*}"
 MACOS_REMAINDER="${MACOS_VERSION#*.}"
@@ -128,10 +126,19 @@ if (( MACOS_MAJOR < 12 || (MACOS_MAJOR == 12 && MACOS_MINOR < 3) )); then
   fail "需要 macOS 12.3 或更高版本，当前版本为 $MACOS_VERSION。"
 fi
 
-[[ -d "$APP_SOURCE" && -x "$APP_SOURCE/Contents/MacOS/CodexStatusPanel" ]] \
+[[ -d "$APP_SOURCE" && -x "$APP_SOURCE/Contents/MacOS/CodexStatusPanel" \
+      && -f "$APP_INFO_PLIST" ]] \
   || fail "面板 App 文件不完整，请重新解压整个分享包。"
 [[ -f "$PLIST_SOURCE" && -f "$CONFIG_SOURCE" ]] \
   || fail "启动项模板或默认配置缺失，请重新解压整个分享包。"
+PANEL_VERSION="$(
+  /usr/bin/plutil -extract CFBundleShortVersionString raw \
+    "$APP_INFO_PLIST" 2>/dev/null
+)" || fail "无法读取面板 App 的版本信息，请重新下载分享包。"
+[[ -n "$PANEL_VERSION" ]] \
+  || fail "面板 App 的版本信息为空，请重新下载分享包。"
+
+echo "正在安装 Codex 状态面板（macOS Universal 开源版 $PANEL_VERSION）…"
 
 ARCH="$(/usr/bin/uname -m)"
 [[ "$ARCH" == "arm64" || "$ARCH" == "x86_64" ]] \

@@ -719,6 +719,316 @@ func runPlacementSelfTest() -> Never {
     exit(0)
 }
 
+private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
+    let fileManager = FileManager.default
+    let fixtureDirectory = fileManager.temporaryDirectory.appendingPathComponent(
+        "codex-status-panel-task-progress-\(UUID().uuidString)",
+        isDirectory: true
+    )
+    try fileManager.createDirectory(
+        at: fixtureDirectory,
+        withIntermediateDirectories: true
+    )
+    defer { try? fileManager.removeItem(at: fixtureDirectory) }
+
+    let sessionMetadata = #"{"type":"session_meta","payload":{"thread_source":"user"}}"#
+    let userMessage = #"{"type":"event_msg","payload":{"type":"user_message","message":"阶段二增量任务"}}"#
+    let started = #"{"type":"event_msg","payload":{"type":"task_started"}}"#
+    let completed = #"{"type":"event_msg","payload":{"type":"task_complete"}}"#
+    let taskFailed = #"{"type":"event_msg","payload":{"type":"task_failed"}}"#
+    let aborted = #"{"type":"event_msg","payload":{"type":"turn_aborted"}}"#
+    let request = #"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call-stage-2"}}"#
+    let response = #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-stage-2"}}"#
+    let noUnreadState = CodexTaskProgressReader.UnreadThreadState(
+        ids: [],
+        isAvailable: false
+    )
+    var clockOffset: TimeInterval = 0
+    var failures: [String] = []
+
+    func nextDate() -> Date {
+        clockOffset += 1
+        return now.addingTimeInterval(clockOffset)
+    }
+
+    @discardableResult
+    func setModificationDate(for url: URL) throws -> Date {
+        let date = nextDate()
+        try fileManager.setAttributes(
+            [.modificationDate: date],
+            ofItemAtPath: url.path
+        )
+        return date
+    }
+
+    @discardableResult
+    func writeLines(_ lines: [String], to url: URL) throws -> Date {
+        let text = lines.joined(separator: "\n") + "\n"
+        try Data(text.utf8).write(to: url, options: .atomic)
+        return try setModificationDate(for: url)
+    }
+
+    @discardableResult
+    func append(_ data: Data, to url: URL) throws -> Date {
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+        return try setModificationDate(for: url)
+    }
+
+    @discardableResult
+    func overwriteInPlace(_ lines: [String], at url: URL) throws -> Date {
+        let data = Data((lines.joined(separator: "\n") + "\n").utf8)
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: data)
+        return try setModificationDate(for: url)
+    }
+
+    func makeReader(
+        urls: @escaping () -> [URL]
+    ) -> CodexTaskProgressReader {
+        CodexTaskProgressReader(
+            rolloutURLsProvider: urls,
+            threadTitlesOverride: [:],
+            unreadStateOverride: noUnreadState
+        )
+    }
+
+    func record(_ name: String, _ condition: @autoclosure () -> Bool) {
+        if !condition() { failures.append(name) }
+    }
+
+    let lifecycleURL = fixtureDirectory.appendingPathComponent("lifecycle.jsonl")
+    try writeLines([sessionMetadata, userMessage, started], to: lifecycleURL)
+    let lifecycleReader = makeReader { [lifecycleURL] }
+    let initial = lifecycleReader.read(at: nextDate())
+    record(
+        "initial-rebuild",
+        initial.kind == .running
+            && initial.items.first?.title == "阶段二增量任务"
+            && lifecycleReader.lastReadDiagnostics.fullRebuildCount == 1
+            && lifecycleReader.lastReadDiagnostics.bytesRead > 0
+    )
+
+    let unchanged = lifecycleReader.read(at: nextDate())
+    record(
+        "unchanged-zero-read",
+        unchanged == initial
+            && lifecycleReader.lastReadDiagnostics.bytesRead == 0
+            && lifecycleReader.lastReadDiagnostics.cacheHitCount == 1
+    )
+
+    let requestData = Data((request + "\n").utf8)
+    try append(requestData, to: lifecycleURL)
+    let waiting = lifecycleReader.read(at: nextDate())
+    record(
+        "append-waiting",
+        waiting.kind == .waitingForInput
+            && lifecycleReader.lastReadDiagnostics.bytesRead == requestData.count
+            && lifecycleReader.lastReadDiagnostics.incrementalReadCount == 1
+            && lifecycleReader.lastReadDiagnostics.fullRebuildCount == 0
+    )
+
+    let responseData = Data((response + "\n").utf8)
+    try append(responseData, to: lifecycleURL)
+    let resumed = lifecycleReader.read(at: nextDate())
+    record(
+        "append-resumed",
+        resumed.kind == .running
+            && lifecycleReader.lastReadDiagnostics.bytesRead == responseData.count
+            && lifecycleReader.lastReadDiagnostics.incrementalReadCount == 1
+    )
+
+    let completedData = Data((completed + "\n").utf8)
+    try append(completedData, to: lifecycleURL)
+    let completedSnapshot = lifecycleReader.read(at: nextDate())
+    record(
+        "append-completed",
+        completedSnapshot.kind == .completed
+            && lifecycleReader.lastReadDiagnostics.bytesRead == completedData.count
+            && lifecycleReader.lastReadDiagnostics.incrementalReadCount == 1
+    )
+
+    let partialURL = fixtureDirectory.appendingPathComponent("partial.jsonl")
+    try writeLines([sessionMetadata, started], to: partialURL)
+    let partialReader = makeReader { [partialURL] }
+    _ = partialReader.read(at: nextDate())
+    let requestBytes = Data(request.utf8)
+    let splitIndex = requestBytes.count / 2
+    let firstHalf = requestBytes.subdata(in: 0..<splitIndex)
+    let secondHalf = requestBytes.subdata(in: splitIndex..<requestBytes.count)
+        + Data("\n".utf8)
+    try append(firstHalf, to: partialURL)
+    let partialSnapshot = partialReader.read(at: nextDate())
+    let firstHalfWasBuffered = partialSnapshot.kind == .running
+        && partialReader.lastReadDiagnostics.completeLineCount == 0
+    try append(secondHalf, to: partialURL)
+    let completedPartialSnapshot = partialReader.read(at: nextDate())
+    record(
+        "partial-line-once",
+        firstHalfWasBuffered
+            && completedPartialSnapshot.kind == .waitingForInput
+            && partialReader.lastReadDiagnostics.completeLineCount == 1
+            && partialReader.lastReadDiagnostics.bytesRead == secondHalf.count
+    )
+
+    let truncatedURL = fixtureDirectory.appendingPathComponent("truncated.jsonl")
+    try writeLines([sessionMetadata, userMessage, started], to: truncatedURL)
+    let truncatedReader = makeReader { [truncatedURL] }
+    _ = truncatedReader.read(at: nextDate())
+    let truncatedTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"截断后任务"}}"#
+    try overwriteInPlace(
+        [sessionMetadata, truncatedTitle, started],
+        at: truncatedURL
+    )
+    let truncatedSnapshot = truncatedReader.read(at: nextDate())
+    record(
+        "truncated-rebuild",
+        truncatedSnapshot.items.first?.title == "截断后任务"
+            && truncatedReader.lastReadDiagnostics.fullRebuildCount == 1
+    )
+
+    let replacedURL = fixtureDirectory.appendingPathComponent("replaced.jsonl")
+    try writeLines([sessionMetadata, userMessage, started], to: replacedURL)
+    let replacedReader = makeReader { [replacedURL] }
+    _ = replacedReader.read(at: nextDate())
+    try fileManager.removeItem(at: replacedURL)
+    let replacementTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"替换后任务"}}"#
+    try writeLines([sessionMetadata, replacementTitle, started], to: replacedURL)
+    let replacedSnapshot = replacedReader.read(at: nextDate())
+    record(
+        "same-path-replacement",
+        replacedSnapshot.items.first?.title == "替换后任务"
+            && replacedReader.lastReadDiagnostics.fullRebuildCount == 1
+    )
+
+    let oversizedURL = fixtureDirectory.appendingPathComponent("oversized.jsonl")
+    try writeLines([sessionMetadata, started], to: oversizedURL)
+    let oversizedReader = makeReader { [oversizedURL] }
+    _ = oversizedReader.read(at: nextDate())
+    let oversizedRecord = "{\"type\":\"noop\",\"padding\":\""
+        + String(repeating: "x", count: 1_048_576 + 1_024)
+        + "\"}\n"
+    try append(Data(oversizedRecord.utf8), to: oversizedURL)
+    let oversizedSnapshot = oversizedReader.read(at: nextDate())
+    record(
+        "oversized-bounded-rebuild",
+        oversizedSnapshot.kind == .running
+            && oversizedReader.lastReadDiagnostics.fullRebuildCount == 1
+            && oversizedReader.lastReadDiagnostics.incrementalReadCount == 0
+            && oversizedReader.lastReadDiagnostics.bytesRead <= 1_048_576
+    )
+
+    let irrelevantURL = fixtureDirectory.appendingPathComponent("irrelevant.jsonl")
+    try writeLines([sessionMetadata, started], to: irrelevantURL)
+    let irrelevantReader = makeReader { [irrelevantURL] }
+    _ = irrelevantReader.read(at: nextDate())
+    let irrelevantRecord = "{\"type\":\"noop\",\"padding\":\""
+        + String(repeating: "界", count: 170_000)
+        + "\"}\n"
+    let irrelevantData = Data(irrelevantRecord.utf8)
+    try append(irrelevantData, to: irrelevantURL)
+    let irrelevantSnapshot = irrelevantReader.read(at: nextDate())
+    record(
+        "irrelevant-byte-filter",
+        irrelevantSnapshot.kind == .running
+            && irrelevantReader.lastReadDiagnostics.bytesRead == irrelevantData.count
+            && irrelevantReader.lastReadDiagnostics.incrementalReadCount == 1
+            && irrelevantReader.lastReadDiagnostics.stringFilterLineCount == 0
+            && irrelevantReader.lastReadDiagnostics.jsonDecodingAttemptCount == 0
+    )
+
+    let middleURL = fixtureDirectory.appendingPathComponent("middle.jsonl")
+    let middleTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"中段读取任务"}}"#
+    let middleData = Data(
+        (String(repeating: "x", count: 1_048_576 + 4_096)
+            + "\n\(middleTitle)\n\(started)\n").utf8
+    )
+    try middleData.write(to: middleURL, options: .atomic)
+    try setModificationDate(for: middleURL)
+    let middleReader = makeReader { [middleURL] }
+    let middleSnapshot = middleReader.read(at: nextDate())
+    record(
+        "middle-first-line-discarded",
+        middleSnapshot.items.first?.title == "中段读取任务"
+            && middleReader.lastReadDiagnostics.bytesRead <= 1_048_576
+    )
+
+    let firstCacheURL = fixtureDirectory.appendingPathComponent("cache-1.jsonl")
+    let secondCacheURL = fixtureDirectory.appendingPathComponent("cache-2.jsonl")
+    let firstCacheTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"缓存一"}}"#
+    let secondCacheTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"缓存二"}}"#
+    try writeLines([sessionMetadata, firstCacheTitle, started], to: firstCacheURL)
+    try writeLines([sessionMetadata, secondCacheTitle, started], to: secondCacheURL)
+    var cachedURLs = [firstCacheURL]
+    let evictionReader = makeReader { cachedURLs }
+    _ = evictionReader.read(at: nextDate())
+    cachedURLs = [secondCacheURL]
+    let secondCacheSnapshot = evictionReader.read(at: nextDate())
+    record(
+        "cache-eviction",
+        secondCacheSnapshot.items.first?.title == "缓存二"
+            && evictionReader.lastReadDiagnostics.cacheEntryCount == 1
+    )
+
+    let spacedErrorURL = fixtureDirectory.appendingPathComponent("spaced-error.jsonl")
+    let spacedError = #"{"type" : "event_msg", "payload" : {"type" : "error"}}"#
+    try writeLines([sessionMetadata, spacedError], to: spacedErrorURL)
+    let spacedErrorReader = makeReader { [spacedErrorURL] }
+    record(
+        "spaced-error-marker",
+        spacedErrorReader.read(at: nextDate()).kind == .failed
+    )
+
+    let semanticURL = fixtureDirectory.appendingPathComponent("semantic.jsonl")
+    let unicodeTitle = #"{"type" : "event_msg", "payload" : {"type" : "user_message", "message" : "蓝色小龙任务"}}"#
+    let semanticLines = [unicodeTitle, started, request, response, completed]
+    try writeLines([sessionMetadata] + semanticLines, to: semanticURL)
+    let semanticReader = makeReader { [semanticURL] }
+    let semanticSnapshot = semanticReader.read(at: nextDate())
+    let referenceSnapshot = CodexTaskProgressReader.parse(
+        lines: semanticLines,
+        modificationDate: try semanticURL.resourceValues(
+            forKeys: [.contentModificationDateKey]
+        ).contentModificationDate ?? now,
+        now: nextDate()
+    )
+    record("semantic-equivalence", semanticSnapshot == referenceSnapshot)
+
+    let failedURL = fixtureDirectory.appendingPathComponent("task-failed.jsonl")
+    try writeLines([sessionMetadata, started], to: failedURL)
+    let failedReader = makeReader { [failedURL] }
+    _ = failedReader.read(at: nextDate())
+    let taskFailedData = Data((taskFailed + "\n").utf8)
+    try append(taskFailedData, to: failedURL)
+    let failedSnapshot = failedReader.read(at: nextDate())
+    record(
+        "append-task-failed",
+        failedSnapshot.kind == .failed
+            && failedReader.lastReadDiagnostics.bytesRead == taskFailedData.count
+            && failedReader.lastReadDiagnostics.incrementalReadCount == 1
+    )
+
+    let abortedURL = fixtureDirectory.appendingPathComponent("turn-aborted.jsonl")
+    try writeLines([sessionMetadata, started], to: abortedURL)
+    let abortedReader = makeReader { [abortedURL] }
+    _ = abortedReader.read(at: nextDate())
+    let abortedData = Data((aborted + "\n").utf8)
+    try append(abortedData, to: abortedURL)
+    let abortedSnapshot = abortedReader.read(at: nextDate())
+    record(
+        "append-turn-aborted",
+        abortedSnapshot.kind == .failed
+            && abortedReader.lastReadDiagnostics.bytesRead == abortedData.count
+            && abortedReader.lastReadDiagnostics.incrementalReadCount == 1
+    )
+
+    return failures
+}
+
 func runTaskProgressSelfTest() -> Never {
     let now = Date()
     let started = #"{"type":"event_msg","payload":{"type":"task_started"}}"#
@@ -814,56 +1124,25 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    let largeRolloutURL = FileManager.default.temporaryDirectory
-        .appendingPathComponent(
-            "rollout-2026-07-23T12-02-00-66666666-6666-4666-8666-666666666666.jsonl"
-        )
-    let largeMetadata = "{\"type\":\"session_meta\",\"payload\":{"
-        + "\"thread_source\":\"user\",\"padding\":\""
-        + String(repeating: "x", count: 40 * 1_024)
-        + "\"}}"
-    let largeTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"大文件运行任务"}}"#
-    let largeNoopTail = String(
-        repeating: #"{"type":"noop","payload":{}}"# + "\n",
-        count: 12_000
-    )
-    let previousRolloutOverride = ProcessInfo.processInfo.environment[
-        "CODEX_STATUS_PANEL_TASK_ROLLOUT_FILE"
-    ]
+    let incrementalFailures: [String]
     do {
-        try Data(
-            "\(largeMetadata)\n\(largeTitle)\n\(started)\n\(largeNoopTail)".utf8
-        ).write(to: largeRolloutURL)
-        try FileManager.default.setAttributes(
-            [.modificationDate: now.addingTimeInterval(-31 * 60)],
-            ofItemAtPath: largeRolloutURL.path
-        )
-        setenv(
-            "CODEX_STATUS_PANEL_TASK_ROLLOUT_FILE",
-            largeRolloutURL.path,
-            1
-        )
-        let largeRolloutSnapshot = CodexTaskProgressReader().read()
-        guard largeRolloutSnapshot.items.contains(where: {
-            $0.title == "大文件运行任务" && $0.kind == .running
-        }) else {
-            fputs("large rollout task discovery failed\n", stderr)
-            exit(1)
-        }
+        incrementalFailures = try taskProgressIncrementalFailures(now: now)
     } catch {
-        fputs("large rollout fixture failed: \(error.localizedDescription)\n", stderr)
+        fputs(
+            "task progress incremental fixture failed: \(error.localizedDescription)\n",
+            stderr
+        )
         exit(1)
     }
-    if let previousRolloutOverride {
-        setenv(
-            "CODEX_STATUS_PANEL_TASK_ROLLOUT_FILE",
-            previousRolloutOverride,
-            1
+    guard incrementalFailures.isEmpty else {
+        fputs(
+            "task progress incremental checks failed: "
+                + incrementalFailures.joined(separator: ", ")
+                + "\n",
+            stderr
         )
-    } else {
-        unsetenv("CODEX_STATUS_PANEL_TASK_ROLLOUT_FILE")
+        exit(1)
     }
-    try? FileManager.default.removeItem(at: largeRolloutURL)
 
     let truncated = TaskProgressSnapshot.displaying((0..<7).map { index in
         TaskProgressItem(title: "任务 \(index + 1)", kind: .running, startedAt: now)
@@ -934,7 +1213,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=7/7; title=pass; visibility=pass; filtering=pass; large-rollout=pass; animation=4/4; list=pass; layout=pass; icons=4/4")
+    print("task-progress-self-test: lifecycle=7/7; title=pass; visibility=pass; filtering=pass; incremental=16/16; animation=4/4; list=pass; layout=pass; icons=4/4")
     exit(0)
 }
 
