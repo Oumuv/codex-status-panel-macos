@@ -1116,9 +1116,19 @@ func runTaskProgressSelfTest() -> Never {
     let userMetadata = #"{"type":"session_meta","payload":{"thread_source":"user","source":{"cli":{}}}}"#
     let subagentMetadata = #"{"type":"session_meta","payload":{"thread_source":"subagent","source":{"subagent":{"thread_spawn":{}}}}}"#
     let automationMetadata = #"{"type":"session_meta","payload":{"thread_source":"automation","source":"vscode"}}"#
+    var boundarySplitMetadata = Data((subagentMetadata + "\n").utf8)
+    boundarySplitMetadata.append(Data(
+        repeating: 0x78,
+        count: 262_144 - boundarySplitMetadata.count - 1
+    ))
+    // 模拟 256 KiB 读取块在三字节 UTF-8 字符首字节后截断。
+    boundarySplitMetadata.append(0xE7)
     guard CodexTaskProgressReader.isUserVisibleSessionMetadata(line: userMetadata),
           !CodexTaskProgressReader.isUserVisibleSessionMetadata(line: subagentMetadata),
-          !CodexTaskProgressReader.isUserVisibleSessionMetadata(line: automationMetadata)
+          !CodexTaskProgressReader.isUserVisibleSessionMetadata(line: automationMetadata),
+          !CodexTaskProgressReader.isUserVisibleSessionMetadata(
+              data: boundarySplitMetadata
+          )
     else {
         fputs("task non-user session filtering failed\n", stderr)
         exit(1)

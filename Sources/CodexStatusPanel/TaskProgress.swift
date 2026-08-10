@@ -690,8 +690,15 @@ final class CodexTaskProgressReader {
     }
 
     static func isUserVisibleSessionMetadata(line: String) -> Bool {
-        guard let data = line.data(using: .utf8),
-              let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        isUserVisibleSessionMetadata(data: Data(line.utf8))
+    }
+
+    static func isUserVisibleSessionMetadata(data: Data) -> Bool {
+        let lineEnd = data.firstIndex(of: 0x0A) ?? data.endIndex
+        let firstLineData = data.subdata(in: data.startIndex..<lineEnd)
+        guard let record = try? JSONSerialization.jsonObject(
+            with: firstLineData
+        ) as? [String: Any],
               record["type"] as? String == "session_meta",
               let payload = record["payload"] as? [String: Any]
         else {
@@ -925,16 +932,8 @@ final class CodexTaskProgressReader {
         if let handle = try? FileHandle(forReadingFrom: url) {
             // defer 会在当前作用域退出时执行，确保所有分支都能关闭文件句柄。
             defer { try? handle.close() }
-            if let data = try? handle.read(upToCount: 262_144),
-               let text = String(data: data, encoding: .utf8),
-               let firstLine = text.split(
-                   separator: "\n",
-                   maxSplits: 1
-               ).first
-            {
-                isVisible = Self.isUserVisibleSessionMetadata(
-                    line: String(firstLine)
-                )
+            if let data = try? handle.read(upToCount: 262_144) {
+                isVisible = Self.isUserVisibleSessionMetadata(data: data)
             }
         }
         cachedRolloutVisibility[url.path] = isVisible
