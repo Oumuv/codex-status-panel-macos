@@ -26,6 +26,9 @@ EXPECTED_BUILD_NUMBER="$(
 echo "检查第三方用量 Provider 自测入口..."
 "$BIN" --self-test-usage-provider \
   | /usr/bin/grep -q 'usage-provider-self-test:.*errors=17/17'
+echo "检查新旧 Codex 桌宠状态兼容..."
+"$BIN" --self-test-placement \
+  | /usr/bin/grep -q 'legacy-state=pass; compact-state=pass; anchor-state=pass; self-window=pass'
 echo "检查菜单控制自测入口..."
 "$BIN" --self-test-menu-controls | /usr/bin/grep -q 'menu-controls-self-test: passed'
 echo "检查行情数据自测入口..."

@@ -12,6 +12,7 @@ let cliFlags: Set<String> = [
     "--print-stock",
     "--print-panel-location",
     "--print-saved-panel-location",
+    "--print-pet-window-diagnostics",
     "--self-test-placement",
     "--self-test-menu-controls",
     "--self-test-task-progress",
@@ -52,6 +53,10 @@ if CommandLine.arguments.contains("--print-panel-location") {
 
 if CommandLine.arguments.contains("--print-saved-panel-location") {
     printPanelPlacementOnce(savedStateOnly: true)
+}
+
+if CommandLine.arguments.contains("--print-pet-window-diagnostics") {
+    printPetWindowDiagnostics()
 }
 
 if CommandLine.arguments.contains("--self-test-placement") {

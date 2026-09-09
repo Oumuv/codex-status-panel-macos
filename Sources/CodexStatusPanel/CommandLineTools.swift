@@ -590,6 +590,8 @@ func runMarketDataSelfTest() -> Never {
 }
 
 func printPanelPlacementOnce(savedStateOnly: Bool = false) -> Never {
+    // CLI 路径也可能需要读取 NSScreen；先显式完成 AppKit 应用初始化。
+    _ = NSApplication.shared
     let locator = PetWindowLocator()
     let result = savedStateOnly ? locator.locateSavedState() : locator.locate()
     guard let location = result else {
@@ -613,6 +615,16 @@ func printPanelPlacementOnce(savedStateOnly: Bool = false) -> Never {
             + "gap=\(String(format: "%.1f", placement.actualGap)) "
             + "centerError=\(String(format: "%.1f", placement.centerError))"
     )
+    exit(0)
+}
+
+func printPetWindowDiagnostics() -> Never {
+    let diagnostics = PetWindowLocator().windowDiagnostics()
+    if diagnostics.isEmpty {
+        print("pet-window-diagnostics: 没有可见的 Codex/ChatGPT 窗口")
+    } else {
+        diagnostics.forEach { print($0) }
+    }
     exit(0)
 }
 
@@ -679,6 +691,13 @@ func runPlacementSelfTest() -> Never {
         }
     }
 
+    guard PetWindowLocator.stateCompatibilitySelfTest(),
+          PetWindowLocator.candidateOwnershipSelfTest()
+    else {
+        fputs("pet-state-compatibility: state parsing or self-window rejection failed\n", stderr)
+        exit(1)
+    }
+
     let staleStateURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("codex-panel-stale-display-state-\(UUID().uuidString).json")
     let staleState = #"{"electron-avatar-overlay-open":true,"electron-avatar-overlay-bounds":{"x":500,"y":300,"displayId":2,"placement":"top-end","byDisplayId":{"3":{"x":100,"y":300,"width":356,"height":320,"displayId":3,"placement":"top-end","mascot":{"left":221,"top":196,"width":107,"height":116}}}}}"#
@@ -715,7 +734,7 @@ func runPlacementSelfTest() -> Never {
         exit(1)
     }
 
-    print("placement-self-test: 8/8 passed; gap=14.0; centerError=0.0")
+    print("placement-self-test: 13/13 passed; legacy-state=pass; compact-state=pass; anchor-state=pass; self-window=pass; gap=14.0; centerError=0.0")
     exit(0)
 }
 
