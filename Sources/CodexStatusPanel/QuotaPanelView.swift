@@ -118,7 +118,9 @@ final class QuotaPanelView: NSView {
     var allowsWindowDragging = false {
         didSet {
             guard allowsWindowDragging != oldValue else { return }
+            needsDisplay = true
             window?.invalidateCursorRects(for: self)
+            window?.invalidateShadow()
         }
     }
     var onToggleCollapsed: (() -> Void)?
@@ -301,34 +303,36 @@ final class QuotaPanelView: NSView {
         bodyPath.lineWidth = 1
         bodyPath.stroke()
 
-        let arrow = NSBezierPath()
-        switch pointerSide {
-        case .left:
-            let centerY = bodyRect.midY
-            arrow.move(to: NSPoint(x: bodyRect.minX + 1, y: centerY - 8))
-            arrow.line(to: NSPoint(x: panelVerticalCanvasInset, y: centerY))
-            arrow.line(to: NSPoint(x: bodyRect.minX + 1, y: centerY + 8))
-        case .right:
-            let centerY = bodyRect.midY
-            arrow.move(to: NSPoint(x: bodyRect.maxX - 1, y: centerY - 8))
-            arrow.line(to: NSPoint(x: bounds.maxX - panelVerticalCanvasInset, y: centerY))
-            arrow.line(to: NSPoint(x: bodyRect.maxX - 1, y: centerY + 8))
-        case .bottom:
-            let requestedCenterX = pointerCenterX ?? bodyRect.midX
-            let centerX = min(
-                max(requestedCenterX, bodyRect.minX + 12),
-                bodyRect.maxX - 12
-            )
-            arrow.move(to: NSPoint(x: centerX - 8, y: bodyRect.maxY - 1))
-            arrow.line(to: NSPoint(x: centerX, y: bounds.maxY - panelVerticalCanvasInset))
-            arrow.line(to: NSPoint(x: centerX + 8, y: bodyRect.maxY - 1))
+        if !allowsWindowDragging {
+            let arrow = NSBezierPath()
+            switch pointerSide {
+            case .left:
+                let centerY = bodyRect.midY
+                arrow.move(to: NSPoint(x: bodyRect.minX + 1, y: centerY - 8))
+                arrow.line(to: NSPoint(x: panelVerticalCanvasInset, y: centerY))
+                arrow.line(to: NSPoint(x: bodyRect.minX + 1, y: centerY + 8))
+            case .right:
+                let centerY = bodyRect.midY
+                arrow.move(to: NSPoint(x: bodyRect.maxX - 1, y: centerY - 8))
+                arrow.line(to: NSPoint(x: bounds.maxX - panelVerticalCanvasInset, y: centerY))
+                arrow.line(to: NSPoint(x: bodyRect.maxX - 1, y: centerY + 8))
+            case .bottom:
+                let requestedCenterX = pointerCenterX ?? bodyRect.midX
+                let centerX = min(
+                    max(requestedCenterX, bodyRect.minX + 12),
+                    bodyRect.maxX - 12
+                )
+                arrow.move(to: NSPoint(x: centerX - 8, y: bodyRect.maxY - 1))
+                arrow.line(to: NSPoint(x: centerX, y: bounds.maxY - panelVerticalCanvasInset))
+                arrow.line(to: NSPoint(x: centerX + 8, y: bodyRect.maxY - 1))
+            }
+            arrow.close()
+            background.setFill()
+            arrow.fill()
+            border.setStroke()
+            arrow.lineWidth = 1
+            arrow.stroke()
         }
-        arrow.close()
-        background.setFill()
-        arrow.fill()
-        border.setStroke()
-        arrow.lineWidth = 1
-        arrow.stroke()
 
         if isCollapsed {
             let label = "展开"
