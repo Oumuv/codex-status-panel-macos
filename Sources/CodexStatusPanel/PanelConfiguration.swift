@@ -805,6 +805,7 @@ func configuredMarketPricesEnabled(for config: PanelConfig) -> Bool {
     return config.widgets.cryptoPrices
 }
 let marketPricesPreferenceKey = "showsMarketPrices"
+let standalonePanelOriginPreferenceKey = "standalonePanelOrigin"
 func resolvedMarketPricesEnabled(
     storedValue: Bool?,
     configuredDefault: Bool

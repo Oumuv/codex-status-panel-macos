@@ -691,6 +691,38 @@ func runPlacementSelfTest() -> Never {
         }
     }
 
+    let primaryScreen = NSRect(x: 0, y: 0, width: 1_512, height: 982)
+    let secondaryScreen = NSRect(x: -1_920, y: -98, width: 1_920, height: 1_080)
+    let standaloneSize = NSSize(width: 232, height: 143)
+    let savedSecondaryOrigin = NSPoint(x: -500, y: 400)
+    guard standalonePanelOrigin(
+        savedOrigin: savedSecondaryOrigin,
+        panelSize: standaloneSize,
+        screenVisibleFrames: [primaryScreen, secondaryScreen],
+        preferredScreenVisibleFrame: primaryScreen
+    ) == savedSecondaryOrigin else {
+        fputs("standalone-placement: saved secondary position was not preserved\n", stderr)
+        exit(1)
+    }
+    guard standalonePanelOrigin(
+        savedOrigin: NSPoint(x: 5_000, y: 5_000),
+        panelSize: standaloneSize,
+        screenVisibleFrames: [primaryScreen, secondaryScreen],
+        preferredScreenVisibleFrame: primaryScreen
+    ) == NSPoint(x: 1_256, y: 815) else {
+        fputs("standalone-placement: offscreen position did not use preferred screen\n", stderr)
+        exit(1)
+    }
+    guard standalonePanelOrigin(
+        savedOrigin: NSPoint(x: 1_450, y: 950),
+        panelSize: standaloneSize,
+        screenVisibleFrames: [primaryScreen, secondaryScreen],
+        preferredScreenVisibleFrame: secondaryScreen
+    ) == NSPoint(x: 1_272, y: 831) else {
+        fputs("standalone-placement: partially visible position was not constrained\n", stderr)
+        exit(1)
+    }
+
     guard PetWindowLocator.stateCompatibilitySelfTest(),
           PetWindowLocator.candidateOwnershipSelfTest()
     else {
@@ -734,7 +766,7 @@ func runPlacementSelfTest() -> Never {
         exit(1)
     }
 
-    print("placement-self-test: 13/13 passed; legacy-state=pass; compact-state=pass; anchor-state=pass; self-window=pass; gap=14.0; centerError=0.0")
+    print("placement-self-test: 13/13 passed; standalone=3/3; legacy-state=pass; compact-state=pass; anchor-state=pass; self-window=pass; gap=14.0; centerError=0.0")
     exit(0)
 }
 

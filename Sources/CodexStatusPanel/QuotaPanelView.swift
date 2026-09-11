@@ -94,8 +94,15 @@ final class QuotaPanelView: NSView {
             window?.invalidateShadow()
         }
     }
+    var allowsWindowDragging = false {
+        didSet {
+            guard allowsWindowDragging != oldValue else { return }
+            window?.invalidateCursorRects(for: self)
+        }
+    }
     var onToggleCollapsed: (() -> Void)?
     var onCycleRateLimit: (() -> Void)?
+    var onWindowDragCompleted: (() -> Void)?
     private var hideButtonTrackingArea: NSTrackingArea?
     private var isHideButtonHovered = false
     private var runningTaskBadgeViews: [NSImageView] = []
@@ -503,11 +510,27 @@ final class QuotaPanelView: NSView {
             onCycleRateLimit?()
             return
         }
-        if isCollapsed || hideButtonRect(in: bodyRect).contains(point) {
+        if !isCollapsed, hideButtonRect(in: bodyRect).contains(point) {
             onToggleCollapsed?()
             return
         }
-        super.mouseDown(with: event)
+
+        guard allowsWindowDragging, let window else {
+            if isCollapsed {
+                onToggleCollapsed?()
+                return
+            }
+            super.mouseDown(with: event)
+            return
+        }
+
+        let initialOrigin = window.frame.origin
+        window.performDrag(with: event)
+        if window.frame.origin != initialOrigin {
+            onWindowDragCompleted?()
+        } else if isCollapsed {
+            onToggleCollapsed?()
+        }
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
@@ -517,8 +540,14 @@ final class QuotaPanelView: NSView {
     override func resetCursorRects() {
         super.resetCursorRects()
         if isCollapsed {
-            addCursorRect(bounds, cursor: .pointingHand)
+            addCursorRect(
+                bounds,
+                cursor: allowsWindowDragging ? .openHand : .pointingHand
+            )
             return
+        }
+        if allowsWindowDragging {
+            addCursorRect(bounds, cursor: .openHand)
         }
         let bodyRect = panelBodyRect()
         addCursorRect(

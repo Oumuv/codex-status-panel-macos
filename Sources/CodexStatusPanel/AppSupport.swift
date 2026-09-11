@@ -157,6 +157,76 @@ struct PanelPlacement {
     let centerError: CGFloat
 }
 
+/// 恢复独立面板位置时优先保留用户坐标；坐标失效后才回退到首选屏幕右上角。
+func standalonePanelOrigin(
+    savedOrigin: NSPoint?,
+    panelSize: NSSize,
+    screenVisibleFrames: [NSRect],
+    preferredScreenVisibleFrame: NSRect?
+) -> NSPoint? {
+    let visibleFrames = screenVisibleFrames.filter {
+        $0.width > 0 && $0.height > 0
+    }
+    guard !visibleFrames.isEmpty else { return nil }
+
+    if let savedOrigin,
+       savedOrigin.x.isFinite,
+       savedOrigin.y.isFinite
+    {
+        let savedFrame = NSRect(origin: savedOrigin, size: panelSize)
+        let bestMatch = visibleFrames
+            .map { frame -> (frame: NSRect, visibleArea: CGFloat) in
+                let intersection = frame.intersection(savedFrame)
+                let area = intersection.isNull
+                    ? 0
+                    : intersection.width * intersection.height
+                return (frame, area)
+            }
+            .max { $0.visibleArea < $1.visibleArea }
+        if let bestMatch, bestMatch.visibleArea > 0 {
+            return constrainedPanelOrigin(
+                savedOrigin,
+                panelSize: panelSize,
+                screenVisibleFrame: bestMatch.frame
+            )
+        }
+    }
+
+    let fallbackFrame = preferredScreenVisibleFrame.flatMap { preferred in
+        visibleFrames.first(where: { $0 == preferred })
+    } ?? visibleFrames[0]
+    let defaultOrigin = NSPoint(
+        x: fallbackFrame.maxX - panelSize.width - 24,
+        y: fallbackFrame.maxY - panelSize.height - 24
+    )
+    return constrainedPanelOrigin(
+        defaultOrigin,
+        panelSize: panelSize,
+        screenVisibleFrame: fallbackFrame
+    )
+}
+
+private func constrainedPanelOrigin(
+    _ origin: NSPoint,
+    panelSize: NSSize,
+    screenVisibleFrame: NSRect
+) -> NSPoint {
+    let minX = screenVisibleFrame.minX + panelScreenMargin
+    let maxX = max(
+        minX,
+        screenVisibleFrame.maxX - panelSize.width - panelScreenMargin
+    )
+    let minY = screenVisibleFrame.minY + panelScreenMargin
+    let maxY = max(
+        minY,
+        screenVisibleFrame.maxY - panelSize.height - panelScreenMargin
+    )
+    return NSPoint(
+        x: min(max(origin.x, minX), maxX).rounded(),
+        y: min(max(origin.y, minY), maxY).rounded()
+    )
+}
+
 /// 让面板指针尽量对准桌宠可见区域的水平中心，并维持配置中的垂直间距。
 /// 全部计算使用 AppKit 逻辑点，因此 Retina 或缩放屏幕上的视觉距离保持一致。
 func panelPlacement(

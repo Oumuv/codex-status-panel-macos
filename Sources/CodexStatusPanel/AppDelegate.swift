@@ -108,8 +108,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var followHealthStatus = "waiting-for-pet"
     private var lastLocationSource: String?
     private var lastQuotaUpdatedAt: Date?
+    private var cachedCodexDesktopRunning = false
+    private var nextCodexDesktopCheckAt: CFAbsoluteTime = 0
     private var isPanelHiddenByUser = false
-    private var isManualStandaloneEnabled = false
+    private var isStandalonePanelActive = false
     private var lastStatusMenuSignature = ""
     private var lastStatusBarDisplayState: MenuBarDisplayState?
     private lazy var statusBarIconImage: NSImage? = {
@@ -431,7 +433,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.level = .statusBar
         panel.hidesOnDeactivate = false
         panel.ignoresMouseEvents = false
-        panel.isMovable = false
+        panel.isMovable = true
         panel.isReleasedWhenClosed = false
         panel.isFloatingPanel = true
         panel.becomesKeyOnlyIfNeeded = true
@@ -441,6 +443,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         quotaView.onCycleRateLimit = { [weak self] in
             self?.cycleQuotaRateLimit()
+        }
+        quotaView.onWindowDragCompleted = { [weak self] in
+            self?.saveStandalonePanelOrigin()
         }
     }
 
@@ -461,7 +466,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         panel.invalidateShadow()
         if !isPanelHiddenByUser {
-            followPet(forceStandaloneFallback: isManualStandaloneEnabled)
+            followPet()
         }
         updateStatusMenu()
     }
@@ -476,14 +481,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func showPanelFromMenu(_ sender: Any?) {
         isPanelHiddenByUser = false
-        isManualStandaloneEnabled = true
-        followPet(forceStandaloneFallback: true)
+        followPet()
         updateStatusMenu()
     }
 
     private func hidePanelFromMenu(_ sender: Any?) {
-        isManualStandaloneEnabled = false
         isPanelHiddenByUser = true
+        isStandalonePanelActive = false
+        quotaView.allowsWindowDragging = false
         quotaView.setRunningTaskBadgeAnimationsEnabled(false)
         if panel.isVisible {
             panel.orderOut(nil)
@@ -572,7 +577,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         updateExpandedPanelSize()
         if !isPanelHiddenByUser {
-            followPet(forceStandaloneFallback: isManualStandaloneEnabled)
+            followPet()
         }
         writeHealth(
             status: enabled ? "market-prices-shown" : "market-prices-hidden",
@@ -612,7 +617,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         updateExpandedPanelSize()
         if !isPanelHiddenByUser {
-            followPet(forceStandaloneFallback: isManualStandaloneEnabled)
+            followPet()
         }
         writeHealth(
             status: enabled ? "stock-prices-shown" : "stock-prices-hidden",
@@ -640,8 +645,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func resetFollowPositionFromMenu(_ sender: Any?) {
         locator.reset()
+        UserDefaults.standard.removeObject(
+            forKey: standalonePanelOriginPreferenceKey
+        )
         isPanelHiddenByUser = false
-        isManualStandaloneEnabled = false
+        isStandalonePanelActive = false
         followPet()
         updateStatusMenu()
     }
@@ -708,7 +716,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             locator.reset()
             refreshQuota()
             if !isPanelHiddenByUser {
-                followPet(forceStandaloneFallback: isManualStandaloneEnabled)
+                followPet()
             }
             updateStatusMenu(force: true)
         } catch {
@@ -730,9 +738,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.terminate(sender)
     }
 
-    private func followPet(forceStandaloneFallback: Bool = false) {
-        // 这是跟随功能的状态分支：用户隐藏 → 找不到桌宠时回退/等待 → 找到后精确跟随。
+    private func followPet() {
+        // 这是跟随功能的状态分支：用户隐藏 → 找不到桌宠时独立显示 → 找到后精确跟随。
         guard !isPanelHiddenByUser else {
+            isStandalonePanelActive = false
+            quotaView.allowsWindowDragging = false
             quotaView.setRunningTaskBadgeAnimationsEnabled(false)
             if panel.isVisible {
                 panel.orderOut(nil)
@@ -745,29 +755,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        guard let pet = locator.locate() else {
-            lastLocationSource = nil
-            if forceStandaloneFallback || isManualStandaloneEnabled || shouldShowStandalonePanel() {
-                showStandalonePanel()
-                quotaView.followStatusText = "固定显示"
-                followHealthStatus = "screen-fallback"
-                lastLocationSource = "screen-fallback"
-                writeHealth(
-                    status: "fallback-visible",
-                    panelVisible: true,
-                    locationSource: "screen-fallback"
-                )
-            } else {
-                quotaView.setRunningTaskBadgeAnimationsEnabled(false)
-                panel.orderOut(nil)
-                quotaView.followStatusText = "等待桌宠"
-                followHealthStatus = "waiting-for-pet"
-                writeHealth(status: "waiting-for-codex", panelVisible: false, locationSource: nil)
-            }
+        let pet = isCodexDesktopRunning() ? locator.locate() : nil
+        guard let pet else {
+            showStandalonePanel()
+            quotaView.followStatusText = "固定显示"
+            followHealthStatus = "screen-fallback"
+            lastLocationSource = "screen-fallback"
+            writeHealth(
+                status: "fallback-visible",
+                panelVisible: true,
+                locationSource: "screen-fallback"
+            )
             updateStatusMenu()
             return
         }
 
+        isStandalonePanelActive = false
+        quotaView.allowsWindowDragging = false
         quotaView.followStatusText = "跟随中"
         followHealthStatus = "following-pet"
         lastLocationSource = pet.source
@@ -801,10 +805,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusMenu()
     }
 
-    private func shouldShowStandalonePanel() -> Bool {
-        if let overlayOpen = locator.overlayOpen { return overlayOpen }
-
-        return NSWorkspace.shared.runningApplications.contains { application in
+    private func isCodexDesktopRunning() -> Bool {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now >= nextCodexDesktopCheckAt else {
+            return cachedCodexDesktopRunning
+        }
+        nextCodexDesktopCheckAt = now + 1
+        cachedCodexDesktopRunning = NSWorkspace.shared.runningApplications.contains { application in
             let name = application.localizedName?.lowercased() ?? ""
             let bundleID = application.bundleIdentifier?.lowercased() ?? ""
             return name == "codex"
@@ -812,22 +819,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 || bundleID.contains("openai.codex")
                 || bundleID.contains("openai.chat")
         }
+        return cachedCodexDesktopRunning
     }
 
     private func showStandalonePanel() {
-        let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
-            ?? NSScreen.main
-            ?? NSScreen.screens.first
-        guard let screen else { return }
-
-        let visible = screen.visibleFrame
+        let wasAlreadyStandalone = isStandalonePanelActive
+        let screens = NSScreen.screens
+        let preferredScreen = preferredStandaloneScreen(from: screens)
         let currentPanelSize = quotaView.isCollapsed
             ? collapsedPanelSize
             : currentExpandedPanelSize
-        let origin = NSPoint(
-            x: (visible.maxX - currentPanelSize.width - 24).rounded(),
-            y: (visible.maxY - currentPanelSize.height - 24).rounded()
-        )
+        let savedOrigin = wasAlreadyStandalone
+            ? panel.frame.origin
+            : storedStandalonePanelOrigin()
+        guard let origin = standalonePanelOrigin(
+            savedOrigin: savedOrigin,
+            panelSize: currentPanelSize,
+            screenVisibleFrames: screens.map(\.visibleFrame),
+            preferredScreenVisibleFrame: preferredScreen?.visibleFrame
+        ) else { return }
+
+        isStandalonePanelActive = true
+        quotaView.allowsWindowDragging = true
         quotaView.pointerSide = .bottom
         quotaView.pointerCenterX = currentPanelSize.width / 2
         if panel.frame.origin != origin {
@@ -837,6 +850,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             panel.orderFrontRegardless()
         }
         quotaView.setRunningTaskBadgeAnimationsEnabled(true)
+    }
+
+    private func preferredStandaloneScreen(from screens: [NSScreen]) -> NSScreen? {
+        if panel.isVisible,
+           let currentScreen = screens.max(by: {
+               visibleArea(of: panel.frame, on: $0)
+                   < visibleArea(of: panel.frame, on: $1)
+           }),
+           visibleArea(of: panel.frame, on: currentScreen) > 0
+        {
+            return currentScreen
+        }
+        return screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
+            ?? NSScreen.main
+            ?? screens.first
+    }
+
+    private func visibleArea(of rect: NSRect, on screen: NSScreen) -> CGFloat {
+        let intersection = screen.visibleFrame.intersection(rect)
+        guard !intersection.isNull else { return 0 }
+        return intersection.width * intersection.height
+    }
+
+    private func storedStandalonePanelOrigin() -> NSPoint? {
+        guard let rawValue = UserDefaults.standard.string(
+            forKey: standalonePanelOriginPreferenceKey
+        ) else { return nil }
+        let origin = NSPointFromString(rawValue)
+        guard origin.x.isFinite, origin.y.isFinite else { return nil }
+        return origin
+    }
+
+    private func saveStandalonePanelOrigin() {
+        guard isStandalonePanelActive else { return }
+        UserDefaults.standard.set(
+            NSStringFromPoint(panel.frame.origin),
+            forKey: standalonePanelOriginPreferenceKey
+        )
     }
 
     private func refreshQuota() {
@@ -926,9 +977,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.panel.setContentSize(nextSize)
                 }
                 if !self.isPanelHiddenByUser {
-                    self.followPet(
-                        forceStandaloneFallback: self.isManualStandaloneEnabled
-                    )
+                    self.followPet()
                 }
             }
         }
