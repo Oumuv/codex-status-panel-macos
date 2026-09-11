@@ -20,6 +20,9 @@ EXPECTED_VERSION="$(
 EXPECTED_BUILD_NUMBER="$(
   /usr/bin/plutil -extract CFBundleVersion raw "$INFO_PLIST"
 )"
+EXPECTED_AUTOMATION_USAGE="$(
+  /usr/bin/plutil -extract NSAppleEventsUsageDescription raw "$INFO_PLIST"
+)"
 
 "$ROOT/scripts/build.sh" >/dev/null
 
@@ -51,9 +54,14 @@ BUILT_VERSION="$(
 BUILT_BUILD_NUMBER="$(
   /usr/bin/plutil -extract CFBundleVersion raw "$BUILT_INFO_PLIST"
 )"
+BUILT_AUTOMATION_USAGE="$(
+  /usr/bin/plutil -extract NSAppleEventsUsageDescription raw "$BUILT_INFO_PLIST"
+)"
 if [[ "$BUILT_VERSION" != "$EXPECTED_VERSION" \
-      || "$BUILT_BUILD_NUMBER" != "$EXPECTED_BUILD_NUMBER" ]]; then
-  echo "构建产物版本与 Resources/Info.plist 不一致" >&2
+      || "$BUILT_BUILD_NUMBER" != "$EXPECTED_BUILD_NUMBER" \
+      || -z "$EXPECTED_AUTOMATION_USAGE" \
+      || "$BUILT_AUTOMATION_USAGE" != "$EXPECTED_AUTOMATION_USAGE" ]]; then
+  echo "构建产物 Info.plist 与 Resources/Info.plist 不一致" >&2
   exit 1
 fi
 if /usr/bin/grep -Eq '[[:digit:]]+[.][[:digit:]]+[.][[:digit:]]+' \

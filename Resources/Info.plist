@@ -28,6 +28,8 @@
   <true/>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>用于在点击任务时切换到其所在的终端窗口或标签页。</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
 </dict>

@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let stockMarketClient = EastMoneyMarketClient()
     private let stockQuoteCache = StockQuoteCache()
     private let locator = PetWindowLocator()
+    private let taskWindowNavigator = TaskWindowNavigator()
     private let healthWriter = RuntimeHealthWriter()
     private let quotaView = QuotaPanelView(frame: NSRect(origin: .zero, size: expandedPanelSize))
     private var currentExpandedPanelSize = expandedPanelSize
@@ -443,6 +444,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         quotaView.onCycleRateLimit = { [weak self] in
             self?.cycleQuotaRateLimit()
+        }
+        quotaView.onOpenTask = { [weak self] item in
+            guard let target = item.target else { return }
+            self?.taskWindowNavigator.open(target)
         }
         quotaView.onWindowDragCompleted = { [weak self] in
             self?.saveStandalonePanelOrigin()

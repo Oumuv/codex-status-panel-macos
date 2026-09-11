@@ -783,6 +783,8 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
     defer { try? fileManager.removeItem(at: fixtureDirectory) }
 
     let sessionMetadata = #"{"type":"session_meta","payload":{"thread_source":"user"}}"#
+    let navigationThreadID = "12345678-1234-4abc-8def-1234567890ab"
+    let navigationMetadata = #"{"type":"session_meta","payload":{"id":"\#(navigationThreadID)","cwd":"/tmp/navigation-project","originator":"codex-tui","source":"cli","thread_source":"user"}}"#
     let userMessage = #"{"type":"event_msg","payload":{"type":"user_message","message":"阶段二增量任务"}}"#
     let started = #"{"type":"event_msg","payload":{"type":"task_started"}}"#
     let completed = #"{"type":"event_msg","payload":{"type":"task_complete"}}"#
@@ -996,7 +998,8 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
     let middleURL = fixtureDirectory.appendingPathComponent("middle.jsonl")
     let middleTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"中段读取任务"}}"#
     let middleData = Data(
-        (String(repeating: "x", count: 1_048_576 + 4_096)
+        (navigationMetadata + "\n"
+            + String(repeating: "x", count: 1_048_576 + 4_096)
             + "\n\(middleTitle)\n\(started)\n").utf8
     )
     try middleData.write(to: middleURL, options: .atomic)
@@ -1006,6 +1009,10 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
     record(
         "middle-first-line-discarded",
         middleSnapshot.items.first?.title == "中段读取任务"
+            && middleSnapshot.items.first?.target?.threadID == navigationThreadID
+            && middleSnapshot.items.first?.target?.client == .cli
+            && middleSnapshot.items.first?.target?.workingDirectory
+                == "/tmp/navigation-project"
             && middleReader.lastReadDiagnostics.bytesRead <= 1_048_576
     )
 
@@ -1046,7 +1053,11 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
         modificationDate: try semanticURL.resourceValues(
             forKeys: [.contentModificationDateKey]
         ).contentModificationDate ?? now,
-        now: nextDate()
+        now: nextDate(),
+        target: CodexTaskProgressReader.taskTarget(
+            sessionMetadataLine: sessionMetadata,
+            rolloutURL: semanticURL
+        )
     )
     record("semantic-equivalence", semanticSnapshot == referenceSnapshot)
 
@@ -1152,6 +1163,74 @@ func runTaskProgressSelfTest() -> Never {
     ) == "正式任务名称"
     else {
         fputs("task index title mapping failed\n", stderr)
+        exit(1)
+    }
+
+    let cliMetadata = #"{"type":"session_meta","payload":{"id":"\#(threadID)","cwd":"/tmp/cli-project/../cli-project","originator":"codex-tui","source":"cli","thread_source":"user"}}"#
+    let appThreadID = "87654321-4321-4cba-8fed-ba0987654321"
+    let appMetadata = #"{"type":"session_meta","payload":{"id":"\#(appThreadID)","cwd":"/tmp/app-project","originator":"Codex Desktop","source":"vscode","thread_source":"user"}}"#
+    let cliTarget = CodexTaskProgressReader.taskTarget(
+        sessionMetadataLine: cliMetadata,
+        rolloutURL: rolloutURL
+    )
+    let appTarget = CodexTaskProgressReader.taskTarget(
+        sessionMetadataLine: appMetadata,
+        rolloutURL: URL(fileURLWithPath: "/tmp/app-rollout.jsonl")
+    )
+    let deepLink = TaskWindowNavigator.codexDeepLink(threadID: appThreadID)
+    let lsofOutput = """
+    p42
+    f7
+    n/tmp/other.jsonl
+    p73
+    f9
+    n\(rolloutURL.path)
+    """
+    let bodyRect = NSRect(x: 10, y: 20, width: 220, height: 180)
+    let secondTaskPoint = NSPoint(
+        x: bodyRect.midX,
+        y: taskProgressRowRect(index: 1, in: bodyRect).midY
+    )
+    let navigationChecks = [
+        cliTarget.client == .cli
+            && cliTarget.threadID == threadID
+            && cliTarget.workingDirectory == "/tmp/cli-project",
+        appTarget.client == .app && appTarget.threadID == appThreadID,
+        deepLink?.absoluteString == "codex://threads/\(appThreadID)",
+        TaskWindowNavigator.processIDs(
+            fromLsofOutput: lsofOutput,
+            rolloutPath: rolloutURL.path
+        ) == [73],
+        TaskWindowNavigator.tty(
+            fromLsofOutput: "p73\nf0\nn/dev/ttys007\n"
+        ) == "/dev/ttys007",
+        TaskWindowNavigator.terminalKind(
+            forBundleIdentifier: "com.apple.Terminal"
+        ) == .terminal
+            && TaskWindowNavigator.terminalKind(
+                forBundleIdentifier: "com.googlecode.iterm2"
+            ) == .iTerm2
+            && TaskWindowNavigator.terminalKind(
+                forBundleIdentifier: "com.mitchellh.ghostty"
+            ) == .ghostty
+            && TaskWindowNavigator.terminalKind(
+                forBundleIdentifier: "dev.warp.Warp-Stable"
+            ) == .other,
+        TaskWindowNavigator.appleScriptResult(from: "\"focused\"\n")
+            == "focused",
+        taskProgressItemIndex(
+            at: secondTaskPoint,
+            taskCount: 3,
+            in: bodyRect
+        ) == 1
+            && taskProgressItemIndex(
+                at: NSPoint(x: bodyRect.midX, y: bodyRect.minY + 10),
+                taskCount: 3,
+                in: bodyRect
+            ) == nil,
+    ]
+    guard navigationChecks.allSatisfy({ $0 }) else {
+        fputs("task window navigation mapping failed\n", stderr)
         exit(1)
     }
 
@@ -1297,7 +1376,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; animation=4/4; list=pass; layout=pass; icons=4/4")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; animation=4/4; list=pass; layout=pass; icons=4/4")
     exit(0)
 }
 

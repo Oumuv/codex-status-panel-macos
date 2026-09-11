@@ -46,22 +46,38 @@ enum TaskProgressKind: String, Equatable {
     case idle
 }
 
+enum CodexTaskClient: String, Equatable {
+    case cli
+    case app
+    case unknown
+}
+
+struct TaskProgressTarget: Equatable {
+    let threadID: String?
+    let client: CodexTaskClient
+    let workingDirectory: String?
+    let rolloutPath: String
+}
+
 struct TaskProgressItem: Equatable {
     let title: String
     let kind: TaskProgressKind
     let startedAt: Date
     let statusOverride: String?
+    let target: TaskProgressTarget?
 
     init(
         title: String,
         kind: TaskProgressKind,
         startedAt: Date = .distantPast,
-        statusOverride: String? = nil
+        statusOverride: String? = nil,
+        target: TaskProgressTarget? = nil
     ) {
         self.title = title
         self.kind = kind
         self.startedAt = startedAt
         self.statusOverride = statusOverride
+        self.target = target
     }
 
     var statusText: String {
@@ -181,7 +197,18 @@ final class CodexTaskProgressReader {
         var pendingLineData: Data
         var isDiscardingLeadingFragment: Bool
         var lifecycleState: LifecycleState
+        let target: TaskProgressTarget
         var snapshot: TaskProgressSnapshot
+    }
+
+    private struct RolloutSessionInfo {
+        let isUserVisible: Bool
+        let target: TaskProgressTarget
+    }
+
+    private struct SessionInfoCacheEntry {
+        let identity: FileIdentity
+        let info: RolloutSessionInfo
     }
 
     private let fileManager: FileManager
@@ -193,7 +220,7 @@ final class CodexTaskProgressReader {
     private let activeTaskFreshness: TimeInterval = 30 * 60
     private let completedTaskVisibility: TimeInterval = 2 * 60
     private var cachedRollouts: [RolloutCandidate] = []
-    private var cachedRolloutVisibility: [String: Bool] = [:]
+    private var sessionInfoCache: [String: SessionInfoCacheEntry] = [:]
     private var parsedCache: [String: ParsedCacheEntry] = [:]
     private var cachedThreadTitles: [String: String] = [:]
     private var cachedThreadIndexModificationDate: Date?
@@ -240,14 +267,13 @@ final class CodexTaskProgressReader {
                 indexedTitles: threadTitles,
                 fallback: item.title
             )
-            if resolvedTitle != item.title {
-                item = TaskProgressItem(
-                    title: resolvedTitle,
-                    kind: item.kind,
-                    startedAt: item.startedAt,
-                    statusOverride: item.statusOverride
-                )
-            }
+            item = TaskProgressItem(
+                title: resolvedTitle,
+                kind: item.kind,
+                startedAt: item.startedAt,
+                statusOverride: item.statusOverride,
+                target: item.target
+            )
 
             let threadID = Self.threadID(from: candidate.url)
             guard Self.shouldDisplay(
@@ -292,7 +318,8 @@ final class CodexTaskProgressReader {
                 cached.snapshot = Self.snapshot(
                     from: cached.lifecycleState,
                     modificationDate: metadata.modificationDate,
-                    now: now
+                    now: now,
+                    target: cached.target
                 )
                 parsedCache[cacheKey] = cached
                 return cached.snapshot
@@ -320,7 +347,8 @@ final class CodexTaskProgressReader {
                     cached.snapshot = Self.snapshot(
                         from: cached.lifecycleState,
                         modificationDate: metadata.modificationDate,
-                        now: now
+                        now: now,
+                        target: cached.target
                     )
                     parsedCache[cacheKey] = cached
                     return cached.snapshot
@@ -356,6 +384,10 @@ final class CodexTaskProgressReader {
 
         lastReadDiagnostics.bytesRead += data.count
         lastReadDiagnostics.fullRebuildCount += 1
+        let target = sessionInfo(
+            for: url,
+            metadata: metadata
+        ).target
         var entry = ParsedCacheEntry(
             identity: metadata.identity,
             fileSize: metadata.size,
@@ -364,6 +396,7 @@ final class CodexTaskProgressReader {
             pendingLineData: Data(),
             isDiscardingLeadingFragment: startOffset > 0,
             lifecycleState: LifecycleState(),
+            target: target,
             snapshot: .idle
         )
         consume(
@@ -374,7 +407,8 @@ final class CodexTaskProgressReader {
         entry.snapshot = Self.snapshot(
             from: entry.lifecycleState,
             modificationDate: metadata.modificationDate,
-            now: now
+            now: now,
+            target: target
         )
         return entry
     }
@@ -452,6 +486,34 @@ final class CodexTaskProgressReader {
         }
     }
 
+    private func sessionInfo(
+        for url: URL,
+        metadata: FileMetadata
+    ) -> RolloutSessionInfo {
+        if let cached = sessionInfoCache[url.path],
+           cached.identity == metadata.identity
+        {
+            return cached.info
+        }
+
+        let maximumMetadataBytes = 262_144
+        let data = readData(
+            from: url,
+            offset: 0,
+            byteCount: Int(min(UInt64(maximumMetadataBytes), metadata.size))
+        ) ?? Data()
+        let payload = Self.sessionMetadataPayload(data: data)
+        let info = RolloutSessionInfo(
+            isUserVisible: payload.map(Self.isUserVisibleSessionMetadata) ?? true,
+            target: Self.taskTarget(payload: payload, rolloutURL: url)
+        )
+        sessionInfoCache[url.path] = SessionInfoCacheEntry(
+            identity: metadata.identity,
+            info: info
+        )
+        return info
+    }
+
     private func fileMetadata(for url: URL) -> FileMetadata? {
         guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
               attributes[.type] as? FileAttributeType == .typeRegular,
@@ -473,7 +535,8 @@ final class CodexTaskProgressReader {
     static func parse(
         lines: [String],
         modificationDate: Date,
-        now: Date
+        now: Date,
+        target: TaskProgressTarget? = nil
     ) -> TaskProgressSnapshot {
         var state = LifecycleState()
 
@@ -496,7 +559,8 @@ final class CodexTaskProgressReader {
         return snapshot(
             from: state,
             modificationDate: modificationDate,
-            now: now
+            now: now,
+            target: target
         )
     }
 
@@ -594,7 +658,8 @@ final class CodexTaskProgressReader {
     private static func snapshot(
         from state: LifecycleState,
         modificationDate: Date,
-        now: Date
+        now: Date,
+        target: TaskProgressTarget?
     ) -> TaskProgressSnapshot {
         let title = state.activeTaskTitle ?? state.latestUserTitle ?? "Codex 任务"
         let taskStartedAt = state.taskStartedAt ?? modificationDate
@@ -602,28 +667,32 @@ final class CodexTaskProgressReader {
             return TaskProgressSnapshot(items: [TaskProgressItem(
                 title: title,
                 kind: .waitingForInput,
-                startedAt: taskStartedAt
+                startedAt: taskStartedAt,
+                target: target
             )])
         }
         if let lifecycle = state.lifecycle {
             return TaskProgressSnapshot(items: [TaskProgressItem(
                 title: title,
                 kind: lifecycle,
-                startedAt: taskStartedAt
+                startedAt: taskStartedAt,
+                target: target
             )])
         }
         if !state.pendingInteractionCalls.isEmpty {
             return TaskProgressSnapshot(items: [TaskProgressItem(
                 title: title,
                 kind: .waitingForInput,
-                startedAt: taskStartedAt
+                startedAt: taskStartedAt,
+                target: target
             )])
         }
         if now.timeIntervalSince(modificationDate) <= 30 * 60 {
             return TaskProgressSnapshot(items: [TaskProgressItem(
                 title: title,
                 kind: .running,
-                startedAt: taskStartedAt
+                startedAt: taskStartedAt,
+                target: target
             )])
         }
         return .idle
@@ -718,17 +787,23 @@ final class CodexTaskProgressReader {
     }
 
     static func isUserVisibleSessionMetadata(data: Data) -> Bool {
-        let lineEnd = data.firstIndex(of: 0x0A) ?? data.endIndex
-        let firstLineData = data.subdata(in: data.startIndex..<lineEnd)
-        guard let record = try? JSONSerialization.jsonObject(
-            with: firstLineData
-        ) as? [String: Any],
-              record["type"] as? String == "session_meta",
-              let payload = record["payload"] as? [String: Any]
-        else {
-            return true
-        }
+        guard let payload = sessionMetadataPayload(data: data) else { return true }
+        return isUserVisibleSessionMetadata(payload: payload)
+    }
 
+    static func taskTarget(
+        sessionMetadataLine: String,
+        rolloutURL: URL
+    ) -> TaskProgressTarget {
+        taskTarget(
+            payload: sessionMetadataPayload(data: Data(sessionMetadataLine.utf8)),
+            rolloutURL: rolloutURL
+        )
+    }
+
+    private static func isUserVisibleSessionMetadata(
+        payload: [String: Any]
+    ) -> Bool {
         let threadSource = (payload["thread_source"] as? String)?.lowercased()
         if threadSource == "subagent" || threadSource == "automation" {
             return false
@@ -737,6 +812,73 @@ final class CodexTaskProgressReader {
             return false
         }
         return true
+    }
+
+    private static func sessionMetadataPayload(data: Data) -> [String: Any]? {
+        let lineEnd = data.firstIndex(of: 0x0A) ?? data.endIndex
+        let firstLineData = data.subdata(in: data.startIndex..<lineEnd)
+        guard let record = try? JSONSerialization.jsonObject(
+            with: firstLineData
+        ) as? [String: Any],
+        record["type"] as? String == "session_meta"
+        else { return nil }
+        return record["payload"] as? [String: Any]
+    }
+
+    private static func taskTarget(
+        payload: [String: Any]?,
+        rolloutURL: URL
+    ) -> TaskProgressTarget {
+        let payloadThreadID = (payload?["id"] as? String)
+            ?? (payload?["thread_id"] as? String)
+        let normalizedPayloadThreadID = payloadThreadID.flatMap(normalizedThreadID)
+        let workingDirectory: String? = (payload?["cwd"] as? String).flatMap {
+            rawValue -> String? in
+            let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            return URL(fileURLWithPath: trimmed).standardizedFileURL.path
+        }
+
+        return TaskProgressTarget(
+            threadID: normalizedPayloadThreadID ?? threadID(from: rolloutURL),
+            client: taskClient(from: payload),
+            workingDirectory: workingDirectory,
+            rolloutPath: rolloutURL.path
+        )
+    }
+
+    private static func normalizedThreadID(_ value: String) -> String? {
+        let pattern = #"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"#
+        guard value.range(of: pattern, options: .regularExpression) != nil else {
+            return nil
+        }
+        return value.lowercased()
+    }
+
+    private static func taskClient(from payload: [String: Any]?) -> CodexTaskClient {
+        let originator = (payload?["originator"] as? String)?.lowercased() ?? ""
+        let sourceName: String
+        if let source = payload?["source"] as? String {
+            sourceName = source.lowercased()
+        } else if let source = payload?["source"] as? [String: Any] {
+            sourceName = source.keys.map { $0.lowercased() }.joined(separator: " ")
+        } else {
+            sourceName = ""
+        }
+
+        if sourceName.contains("vscode")
+            || originator.contains("desktop")
+            || originator.contains("codex_work")
+        {
+            return .app
+        }
+        if sourceName.contains("cli")
+            || originator.contains("codex-tui")
+            || originator.contains("codex_cli")
+        {
+            return .cli
+        }
+        return .unknown
     }
 
     static func shouldDisplay(
@@ -950,18 +1092,8 @@ final class CodexTaskProgressReader {
     }
 
     private func isUserVisibleRollout(_ url: URL) -> Bool {
-        if let cached = cachedRolloutVisibility[url.path] { return cached }
-
-        var isVisible = true
-        if let handle = try? FileHandle(forReadingFrom: url) {
-            // defer 会在当前作用域退出时执行，确保所有分支都能关闭文件句柄。
-            defer { try? handle.close() }
-            if let data = try? handle.read(upToCount: 262_144) {
-                isVisible = Self.isUserVisibleSessionMetadata(data: data)
-            }
-        }
-        cachedRolloutVisibility[url.path] = isVisible
-        return isVisible
+        guard let metadata = fileMetadata(for: url) else { return true }
+        return sessionInfo(for: url, metadata: metadata).isUserVisible
     }
 
     private static let iso8601WithFractional: ISO8601DateFormatter = {

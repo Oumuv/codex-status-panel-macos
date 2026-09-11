@@ -4,6 +4,26 @@
 import AppKit
 import Foundation
 
+func taskProgressRowRect(index: Int, in bodyRect: NSRect) -> NSRect {
+    NSRect(
+        x: bodyRect.minX + 14,
+        y: bodyRect.minY + 93 + CGFloat(index) * taskProgressRowHeight,
+        width: bodyRect.width - 28,
+        height: taskProgressRowHeight
+    )
+}
+
+func taskProgressItemIndex(
+    at point: NSPoint,
+    taskCount: Int,
+    in bodyRect: NSRect
+) -> Int? {
+    guard taskCount > 0 else { return nil }
+    return (0..<taskCount).first {
+        taskProgressRowRect(index: $0, in: bodyRect).contains(point)
+    }
+}
+
 final class QuotaPanelView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -43,6 +63,7 @@ final class QuotaPanelView: NSView {
             if taskProgress != oldValue {
                 needsDisplay = true
                 syncRunningTaskBadges()
+                window?.invalidateCursorRects(for: self)
             }
         }
     }
@@ -102,6 +123,7 @@ final class QuotaPanelView: NSView {
     }
     var onToggleCollapsed: (() -> Void)?
     var onCycleRateLimit: (() -> Void)?
+    var onOpenTask: ((TaskProgressItem) -> Void)?
     var onWindowDragCompleted: (() -> Void)?
     private var hideButtonTrackingArea: NSTrackingArea?
     private var isHideButtonHovered = false
@@ -209,10 +231,10 @@ final class QuotaPanelView: NSView {
         for (index, item) in taskItems.enumerated()
             where item.kind == .running
         {
+            let rowRect = taskProgressRowRect(index: index, in: bodyRect)
             let iconRect = NSRect(
                 x: contentX - 2,
-                y: bodyRect.minY + 100
-                    + CGFloat(index) * taskProgressRowHeight,
+                y: rowRect.minY + 7,
                 width: 20,
                 height: 15
             )
@@ -391,13 +413,12 @@ final class QuotaPanelView: NSView {
             ? TaskProgressSnapshot.idle.items
             : taskProgress.items
         for (index, item) in taskItems.enumerated() {
+            let rowRect = taskProgressRowRect(index: index, in: bodyRect)
             drawTaskProgressItem(
                 item,
                 index: index,
-                y: bodyRect.minY + 100
-                    + CGFloat(index) * taskProgressRowHeight,
-                separatorY: bodyRect.minY + 93
-                    + CGFloat(index) * taskProgressRowHeight,
+                y: rowRect.minY + 7,
+                separatorY: rowRect.minY,
                 contentX: contentX,
                 contentWidth: contentWidth
             )
@@ -514,6 +535,17 @@ final class QuotaPanelView: NSView {
             onToggleCollapsed?()
             return
         }
+        if !isCollapsed,
+           let index = taskProgressItemIndex(
+               at: point,
+               taskCount: taskProgress.items.count,
+               in: bodyRect
+           ),
+           taskProgress.items[index].target != nil
+        {
+            onOpenTask?(taskProgress.items[index])
+            return
+        }
 
         guard allowsWindowDragging, let window else {
             if isCollapsed {
@@ -559,6 +591,14 @@ final class QuotaPanelView: NSView {
         {
             addCursorRect(
                 quotaValueRect(in: bodyRect),
+                cursor: .pointingHand
+            )
+        }
+        for (index, item) in taskProgress.items.enumerated()
+            where item.target != nil
+        {
+            addCursorRect(
+                taskProgressRowRect(index: index, in: bodyRect),
                 cursor: .pointingHand
             )
         }
