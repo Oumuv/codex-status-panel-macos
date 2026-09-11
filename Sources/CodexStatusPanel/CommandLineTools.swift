@@ -790,6 +790,7 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
     let aborted = #"{"type":"event_msg","payload":{"type":"turn_aborted"}}"#
     let request = #"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call-stage-2"}}"#
     let response = #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-stage-2"}}"#
+    let cliApproval = #"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"date\",\"sandbox_permissions\":\"require_escalated\"}","call_id":"call-cli-incremental"}}"#
     let noUnreadState = CodexTaskProgressReader.UnreadThreadState(
         ids: [],
         isAvailable: false
@@ -907,7 +908,7 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
     try writeLines([sessionMetadata, started], to: partialURL)
     let partialReader = makeReader { [partialURL] }
     _ = partialReader.read(at: nextDate())
-    let requestBytes = Data(request.utf8)
+    let requestBytes = Data(cliApproval.utf8)
     let splitIndex = requestBytes.count / 2
     let firstHalf = requestBytes.subdata(in: 0..<splitIndex)
     let secondHalf = requestBytes.subdata(in: splitIndex..<requestBytes.count)
@@ -919,7 +920,7 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
     try append(secondHalf, to: partialURL)
     let completedPartialSnapshot = partialReader.read(at: nextDate())
     record(
-        "partial-line-once",
+        "partial-cli-approval-line-once",
         firstHalfWasBuffered
             && completedPartialSnapshot.kind == .waitingForInput
             && partialReader.lastReadDiagnostics.completeLineCount == 1
@@ -1087,10 +1088,32 @@ func runTaskProgressSelfTest() -> Never {
     let failed = #"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
     let request = #"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call-1"}}"#
     let response = #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1"}}"#
+    let cliApproval = #"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"date\",\"sandbox_permissions\":\"require_escalated\"}","call_id":"call-cli-approval"}}"#
+    let cliApprovalResponse = #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-cli-approval"}}"#
+    let bridgedApproval = #"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const result = await tools.exec_command({ cmd: \"date\", sandbox_permissions: \"require_escalated\" });","call_id":"call-bridged-approval"}}"#
+    let bridgedApprovalResponse = #"{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-bridged-approval"}}"#
+    let regularExec = #"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const result = await tools.exec_command({ cmd: \"date\" });","call_id":"call-regular-exec"}}"#
+    let escalationMention = #"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const value = \"sandbox_permissions: require_escalated\";","call_id":"call-escalation-mention"}}"#
     let lifecycleCases: [(String, [String], Date, TaskProgressKind)] = [
         ("running", [started], now, .running),
         ("waiting", [started, request], now, .waitingForInput),
         ("resumed", [started, request, response], now, .running),
+        ("cli-approval", [started, cliApproval], now, .waitingForInput),
+        (
+            "cli-approval-resumed",
+            [started, cliApproval, cliApprovalResponse],
+            now,
+            .running
+        ),
+        ("bridged-approval", [started, bridgedApproval], now, .waitingForInput),
+        (
+            "bridged-approval-resumed",
+            [started, bridgedApproval, bridgedApprovalResponse],
+            now,
+            .running
+        ),
+        ("regular-exec", [started, regularExec], now, .running),
+        ("escalation-mention", [started, escalationMention], now, .running),
         ("completed", [started, completed], now, .completed),
         ("failed", [started, failed], now, .failed),
         ("fresh-tail-fallback", [], now, .running),
@@ -1274,7 +1297,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=7/7; title=pass; visibility=pass; filtering=pass; incremental=16/16; animation=4/4; list=pass; layout=pass; icons=4/4")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; animation=4/4; list=pass; layout=pass; icons=4/4")
     exit(0)
 }
 

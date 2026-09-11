@@ -167,7 +167,7 @@ final class CodexTaskProgressReader {
 
     private struct LifecycleState {
         var lifecycle: TaskProgressKind?
-        var pendingUserInputCalls = Set<String>()
+        var pendingInteractionCalls = Set<String>()
         var latestUserTitle: String?
         var activeTaskTitle: String?
         var taskStartedAt: Date?
@@ -540,33 +540,55 @@ final class CodexTaskProgressReader {
                 state.latestUserTitle = title
             } else if payloadType == "task_started" {
                 state.lifecycle = .running
-                state.pendingUserInputCalls.removeAll()
+                state.pendingInteractionCalls.removeAll()
                 state.activeTaskTitle = state.latestUserTitle ?? state.activeTaskTitle
                 state.taskStartedAt = timestamp(from: record) ?? modificationDate
             } else if payloadType == "task_complete" {
                 state.lifecycle = .completed
-                state.pendingUserInputCalls.removeAll()
+                state.pendingInteractionCalls.removeAll()
             } else if ["task_failed", "turn_aborted", "error"].contains(payloadType) {
                 state.lifecycle = .failed
-                state.pendingUserInputCalls.removeAll()
+                state.pendingInteractionCalls.removeAll()
             }
             return
         }
 
-        // request_user_input 发出后记录 call_id；收到对应输出才视为用户已响应。
+        // 用户输入或命令审批发出后记录 call_id；收到对应输出才视为用户已响应。
         if ["function_call", "custom_tool_call"].contains(payloadType),
-           payload["name"] as? String == "request_user_input",
+           isPendingInteractionCall(payload),
            let callID = payload["call_id"] as? String
         {
-            state.pendingUserInputCalls.insert(callID)
+            state.pendingInteractionCalls.insert(callID)
             return
         }
 
         if ["function_call_output", "custom_tool_call_output"].contains(payloadType),
            let callID = payload["call_id"] as? String
         {
-            state.pendingUserInputCalls.remove(callID)
+            state.pendingInteractionCalls.remove(callID)
         }
+    }
+
+    private static func isPendingInteractionCall(_ payload: [String: Any]) -> Bool {
+        guard let name = payload["name"] as? String else { return false }
+        if name == "request_user_input" { return true }
+
+        if name == "exec_command",
+           let rawArguments = payload["arguments"] as? String,
+           let data = rawArguments.data(using: .utf8),
+           let arguments = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            return arguments["sandbox_permissions"] as? String == "require_escalated"
+        }
+
+        guard name == "exec",
+              let input = payload["input"] as? String,
+              input.contains("tools.exec_command")
+        else { return false }
+        return input.range(
+            of: #"[\"']?sandbox_permissions[\"']?\s*:\s*[\"']require_escalated[\"']"#,
+            options: .regularExpression
+        ) != nil
     }
 
     private static func snapshot(
@@ -576,7 +598,7 @@ final class CodexTaskProgressReader {
     ) -> TaskProgressSnapshot {
         let title = state.activeTaskTitle ?? state.latestUserTitle ?? "Codex 任务"
         let taskStartedAt = state.taskStartedAt ?? modificationDate
-        if state.lifecycle == .running, !state.pendingUserInputCalls.isEmpty {
+        if state.lifecycle == .running, !state.pendingInteractionCalls.isEmpty {
             return TaskProgressSnapshot(items: [TaskProgressItem(
                 title: title,
                 kind: .waitingForInput,
@@ -590,7 +612,7 @@ final class CodexTaskProgressReader {
                 startedAt: taskStartedAt
             )])
         }
-        if !state.pendingUserInputCalls.isEmpty {
+        if !state.pendingInteractionCalls.isEmpty {
             return TaskProgressSnapshot(items: [TaskProgressItem(
                 title: title,
                 kind: .waitingForInput,
@@ -615,6 +637,7 @@ final class CodexTaskProgressReader {
             || line.contains(#""error""#)
             || line.contains("user_message")
             || line.contains("request_user_input")
+            || line.contains("require_escalated")
             || line.contains("function_call_output")
             || line.contains("custom_tool_call_output")
     }
@@ -628,6 +651,7 @@ final class CodexTaskProgressReader {
         Data(#""error""#.utf8),
         Data("user_message".utf8),
         Data("request_user_input".utf8),
+        Data("require_escalated".utf8),
         Data("function_call_output".utf8),
         Data("custom_tool_call_output".utf8),
     ]
