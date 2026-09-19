@@ -37,7 +37,7 @@ struct RPCResponse: Decodable {
     let error: RPCError?
 }
 
-enum TaskProgressKind: String, Equatable {
+enum TaskProgressKind: String, Hashable {
     case reading
     case running
     case waitingForInput
@@ -138,12 +138,9 @@ struct TaskProgressSnapshot: Equatable {
     }
 }
 
-func shouldAnimateRunningArrow(
-    isWindowVisible: Bool,
-    isCollapsed: Bool,
-    hasRunningTask: Bool
-) -> Bool {
-    isWindowVisible && !isCollapsed && hasRunningTask
+struct TaskProgressReadResult: Equatable {
+    let allItems: [TaskProgressItem]
+    let snapshot: TaskProgressSnapshot
 }
 
 /// 从本机 Codex rollout JSONL 日志中恢复用户可见任务的当前状态。
@@ -244,6 +241,10 @@ final class CodexTaskProgressReader {
     }
 
     func read(at now: Date = Date()) -> TaskProgressSnapshot {
+        readResult(at: now).snapshot
+    }
+
+    func readResult(at now: Date = Date()) -> TaskProgressReadResult {
         lastReadDiagnostics = ReadDiagnostics()
         let threadTitles = threadTitlesOverride ?? readThreadTitleIndex()
         let unreadState = unreadStateOverride ?? readUnreadThreadState()
@@ -300,7 +301,10 @@ final class CodexTaskProgressReader {
             if leftTerminal { return $0.startedAt > $1.startedAt }
             return $0.startedAt < $1.startedAt
         }
-        return .displaying(items)
+        return TaskProgressReadResult(
+            allItems: items,
+            snapshot: .displaying(items)
+        )
     }
 
     private func readSnapshot(

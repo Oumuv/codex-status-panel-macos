@@ -1323,6 +1323,85 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
+    func attentionItem(
+        id: String,
+        title: String,
+        kind: TaskProgressKind
+    ) -> TaskProgressItem {
+        TaskProgressItem(
+            title: title,
+            kind: kind,
+            startedAt: now,
+            target: TaskProgressTarget(
+                threadID: id,
+                client: .app,
+                workingDirectory: nil,
+                rolloutPath: "/tmp/\(id).jsonl"
+            )
+        )
+    }
+
+    let tracker = TaskAttentionTracker()
+    let attentionRunning = attentionItem(
+        id: "attention-running",
+        title: "动效任务",
+        kind: .running
+    )
+    let attentionWaiting = attentionItem(
+        id: "attention-running",
+        title: "动效任务",
+        kind: .waitingForInput
+    )
+    let attentionCompleted = attentionItem(
+        id: "attention-running",
+        title: "动效任务",
+        kind: .completed
+    )
+    let attentionFailed = attentionItem(
+        id: "attention-failed",
+        title: "失败任务",
+        kind: .failed
+    )
+    let baselineEvents = tracker.update(with: [attentionRunning])
+    let unchangedEvents = tracker.update(with: [attentionRunning])
+    let waitingEvents = tracker.update(with: [attentionWaiting])
+    let repeatedWaitingEvents = tracker.update(with: [attentionWaiting])
+    let completedEvents = tracker.update(with: [attentionCompleted])
+    let newFailedEvents = tracker.update(with: [
+        attentionCompleted,
+        attentionFailed,
+    ])
+    let attentionChecks = [
+        baselineEvents.isEmpty,
+        unchangedEvents.isEmpty,
+        waitingEvents.count == 1
+            && waitingEvents[0].previousKind == .running
+            && waitingEvents[0].kind == .waitingForInput,
+        repeatedWaitingEvents.isEmpty,
+        completedEvents.count == 1
+            && completedEvents[0].previousKind == .waitingForInput
+            && completedEvents[0].kind == .completed,
+        newFailedEvents.count == 1
+            && newFailedEvents[0].previousKind == nil
+            && newFailedEvents[0].kind == .failed,
+        dominantTaskProgressKind(in: [
+            attentionRunning,
+            attentionWaiting,
+            attentionCompleted,
+            attentionFailed,
+        ]) == .failed,
+        dominantTaskProgressKind(in: [
+            attentionRunning,
+            attentionCompleted,
+        ]) == .running,
+        taskAttentionIdentifier(for: attentionRunning)
+            == "thread:attention-running",
+    ]
+    guard attentionChecks.allSatisfy({ $0 }) else {
+        fputs("task attention transition tracking failed\n", stderr)
+        exit(1)
+    }
+
     let oneTaskWithoutMarket = panelSizeForTaskRows(1, showsMarketPrices: false)
     let threeTasksWithMarket = panelSizeForTaskRows(3, showsMarketPrices: true)
     guard abs(
@@ -1335,25 +1414,25 @@ func runTaskProgressSelfTest() -> Never {
     }
 
     let animationChecks = [
-        shouldAnimateRunningArrow(
+        shouldAnimateTaskEffects(
             isWindowVisible: true,
-            isCollapsed: false,
-            hasRunningTask: true
+            isWindowOccluded: false,
+            reduceMotion: false
         ),
-        !shouldAnimateRunningArrow(
+        !shouldAnimateTaskEffects(
             isWindowVisible: false,
-            isCollapsed: false,
-            hasRunningTask: true
+            isWindowOccluded: false,
+            reduceMotion: false
         ),
-        !shouldAnimateRunningArrow(
+        !shouldAnimateTaskEffects(
             isWindowVisible: true,
-            isCollapsed: true,
-            hasRunningTask: true
+            isWindowOccluded: true,
+            reduceMotion: false
         ),
-        !shouldAnimateRunningArrow(
+        !shouldAnimateTaskEffects(
             isWindowVisible: true,
-            isCollapsed: false,
-            hasRunningTask: false
+            isWindowOccluded: false,
+            reduceMotion: true
         ),
     ]
     guard animationChecks.allSatisfy({ $0 }) else {
@@ -1367,8 +1446,18 @@ func runTaskProgressSelfTest() -> Never {
         "task-completed-icon.png",
         "task-failed-icon.png",
     ]
+    let taskBallNames = [
+        "01-red.png",
+        "02-blue.png",
+        "03-pink.png",
+        "04-orange.png",
+        "05-green.png",
+    ]
     guard let resourceURL = Bundle.main.resourceURL,
           taskIconNames.allSatisfy({
+              NSImage(contentsOf: resourceURL.appendingPathComponent($0)) != nil
+          }),
+          taskBallNames.allSatisfy({
               NSImage(contentsOf: resourceURL.appendingPathComponent($0)) != nil
           })
     else {
@@ -1376,7 +1465,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; animation=4/4; list=pass; layout=pass; icons=4/4")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; list=pass; layout=pass; icons=4/4; balls=5/5")
     exit(0)
 }
 
@@ -2148,6 +2237,16 @@ enum PreviewUsageMode: String {
     case sub2apiDanger = "sub2api-danger"
 }
 
+enum PreviewTaskMode: String {
+    case showcase
+    case reading
+    case running
+    case waiting
+    case completed
+    case failed
+    case idle
+}
+
 private func previewSub2APIRateLimitPresentation(
     selectedIndex: Int
 ) -> QuotaPresentation {
@@ -2248,21 +2347,65 @@ private func previewQuotaPresentation(
 func renderPreviewOnce(
     to outputPath: String,
     collapsed: Bool,
-    usageMode: PreviewUsageMode
+    usageMode: PreviewUsageMode,
+    taskMode: PreviewTaskMode
 ) -> Never {
     // 离屏创建 NSView 并缓存到位图，不需要真正显示窗口即可生成 UI 预览 PNG。
-    let previewTaskProgress = TaskProgressSnapshot(items: [
-        TaskProgressItem(
-            title: "web3+ai科普视频",
+    let previewTaskItems: [TaskProgressItem]
+    switch taskMode {
+    case .showcase:
+        previewTaskItems = [
+            TaskProgressItem(
+                title: "web3+ai科普视频",
+                kind: .running,
+                startedAt: Date()
+            ),
+            TaskProgressItem(
+                title: "等待发布确认",
+                kind: .waitingForInput,
+                startedAt: Date()
+            ),
+            TaskProgressItem(
+                title: "蓝色卜卜宠物",
+                kind: .completed,
+                startedAt: Date()
+            ),
+            TaskProgressItem(
+                title: "回归测试失败",
+                kind: .failed,
+                startedAt: Date()
+            ),
+        ]
+    case .reading:
+        previewTaskItems = TaskProgressSnapshot.reading.items
+    case .running:
+        previewTaskItems = [TaskProgressItem(
+            title: "正在实现任务动效",
             kind: .running,
             startedAt: Date()
-        ),
-        TaskProgressItem(
-            title: "蓝色卜卜宠物",
+        )]
+    case .waiting:
+        previewTaskItems = [TaskProgressItem(
+            title: "等待发布确认",
+            kind: .waitingForInput,
+            startedAt: Date()
+        )]
+    case .completed:
+        previewTaskItems = [TaskProgressItem(
+            title: "任务动效实现",
             kind: .completed,
             startedAt: Date()
-        ),
-    ])
+        )]
+    case .failed:
+        previewTaskItems = [TaskProgressItem(
+            title: "回归测试失败",
+            kind: .failed,
+            startedAt: Date()
+        )]
+    case .idle:
+        previewTaskItems = TaskProgressSnapshot.idle.items
+    }
+    let previewTaskProgress = TaskProgressSnapshot(items: previewTaskItems)
     let previewStockConfigurations = Array(
         PanelMarkets.defaults.stockQuotes.prefix(2)
     )
@@ -2303,7 +2446,10 @@ func renderPreviewOnce(
     view.isCollapsed = collapsed
     view.showsMarketPrices = true
     view.showsStockPrices = true
-    view.taskProgress = previewTaskProgress
+    view.applyTaskProgress(TaskProgressReadResult(
+        allItems: previewTaskProgress.items,
+        snapshot: previewTaskProgress
+    ))
     let presentation = previewQuotaPresentation(for: usageMode)
     if let presentation {
         view.quotaSourceName = presentation.sourceName

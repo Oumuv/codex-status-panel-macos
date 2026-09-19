@@ -3,6 +3,7 @@
 
 import AppKit
 import Foundation
+import QuartzCore
 
 func taskProgressRowRect(index: Int, in bodyRect: NSRect) -> NSRect {
     NSRect(
@@ -24,6 +25,245 @@ func taskProgressItemIndex(
     }
 }
 
+private func taskAttentionColor(for kind: TaskProgressKind) -> NSColor {
+    switch kind {
+    case .reading, .running:
+        return NSColor(
+            calibratedRed: 0.10,
+            green: 0.78,
+            blue: 1.0,
+            alpha: 1
+        )
+    case .waitingForInput:
+        return NSColor(
+            calibratedRed: 1.0,
+            green: 0.79,
+            blue: 0.18,
+            alpha: 1
+        )
+    case .completed:
+        return NSColor(
+            calibratedRed: 0.24,
+            green: 0.86,
+            blue: 0.58,
+            alpha: 1
+        )
+    case .failed:
+        return NSColor(
+            calibratedRed: 1.0,
+            green: 0.39,
+            blue: 0.43,
+            alpha: 1
+        )
+    case .idle:
+        return NSColor.white.withAlphaComponent(0.54)
+    }
+}
+
+private final class TaskAttentionRowView: NSView {
+    private let accentLayer = CALayer()
+    private var displayedKind: TaskProgressKind?
+    private var animationsEnabled = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureLayers()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureLayers()
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override func layout() {
+        super.layout()
+        accentLayer.frame = CGRect(
+            x: 0,
+            y: 3,
+            width: 2.5,
+            height: max(0, bounds.height - 6)
+        )
+    }
+
+    func update(kind: TaskProgressKind, animationsEnabled: Bool) {
+        guard displayedKind != kind || self.animationsEnabled != animationsEnabled else {
+            return
+        }
+        displayedKind = kind
+        self.animationsEnabled = animationsEnabled
+
+        let color = taskAttentionColor(for: kind)
+        accentLayer.backgroundColor = color.cgColor
+        accentLayer.removeAnimation(forKey: "ambient")
+        layer?.removeAnimation(forKey: "ambientBorder")
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.borderColor = color.withAlphaComponent(0.18).cgColor
+        layer?.borderWidth = 0
+        isHidden = false
+
+        switch kind {
+        case .reading, .idle:
+            isHidden = true
+        case .running:
+            accentLayer.opacity = 0.62
+            if animationsEnabled {
+                accentLayer.add(Self.opacityAnimation(
+                    values: [0.42, 0.95, 0.42],
+                    keyTimes: [0, 0.5, 1],
+                    duration: 2.2
+                ), forKey: "ambient")
+            }
+        case .waitingForInput:
+            accentLayer.opacity = 0.88
+            layer?.borderWidth = 0.75
+            if animationsEnabled {
+                accentLayer.add(Self.opacityAnimation(
+                    values: [0.58, 1, 0.58, 0.58],
+                    keyTimes: [0, 0.06, 0.14, 1],
+                    duration: 8
+                ), forKey: "ambient")
+            }
+        case .completed:
+            accentLayer.opacity = 0.92
+            layer?.borderWidth = 0.5
+        case .failed:
+            accentLayer.opacity = 0.92
+            layer?.borderWidth = 0.75
+            if animationsEnabled {
+                accentLayer.add(Self.opacityAnimation(
+                    values: [0.58, 1, 0.58, 0.58],
+                    keyTimes: [0, 0.08, 0.18, 1],
+                    duration: 5
+                ), forKey: "ambient")
+            }
+        }
+    }
+
+    func playEntrance(for kind: TaskProgressKind) {
+        guard animationsEnabled,
+              kind == .waitingForInput || kind == .completed || kind == .failed
+        else { return }
+
+        let color = taskAttentionColor(for: kind)
+        let clear = color.withAlphaComponent(0).cgColor
+        let highlighted = color.withAlphaComponent(
+            kind == .completed ? 0.16 : 0.22
+        ).cgColor
+        let animation = CAKeyframeAnimation(keyPath: "backgroundColor")
+        if kind == .completed {
+            animation.values = [clear, highlighted, clear]
+            animation.keyTimes = [0, 0.45, 1]
+            animation.duration = 0.85
+        } else {
+            animation.values = [
+                clear, highlighted, clear,
+                highlighted, clear,
+                highlighted, clear,
+            ]
+            animation.keyTimes = [0, 0.12, 0.25, 0.38, 0.52, 0.68, 1]
+            animation.duration = 1.8
+        }
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer?.add(animation, forKey: "entrance")
+    }
+
+    func stopAnimations() {
+        accentLayer.removeAllAnimations()
+        layer?.removeAllAnimations()
+    }
+
+    private func configureLayers() {
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        layer?.masksToBounds = false
+        accentLayer.cornerRadius = 1.25
+        layer?.addSublayer(accentLayer)
+    }
+
+    private static func opacityAnimation(
+        values: [Float],
+        keyTimes: [NSNumber],
+        duration: CFTimeInterval
+    ) -> CAKeyframeAnimation {
+        let animation = CAKeyframeAnimation(keyPath: "opacity")
+        animation.values = values.map(NSNumber.init(value:))
+        animation.keyTimes = keyTimes
+        animation.duration = duration
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        return animation
+    }
+}
+
+private final class CollapsedTaskAttentionView: NSView {
+    private var displayedKind: TaskProgressKind?
+    private var animationsEnabled = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = false
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+        layer?.masksToBounds = false
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    func update(kind: TaskProgressKind, animationsEnabled: Bool) {
+        guard displayedKind != kind || self.animationsEnabled != animationsEnabled else {
+            return
+        }
+        displayedKind = kind
+        self.animationsEnabled = animationsEnabled
+        layer?.removeAllAnimations()
+
+        guard kind != .idle else {
+            isHidden = true
+            return
+        }
+        isHidden = false
+        let color = taskAttentionColor(for: kind)
+        layer?.borderColor = color.withAlphaComponent(0.82).cgColor
+        layer?.borderWidth = kind == .running || kind == .reading ? 0.75 : 1.25
+        layer?.cornerRadius = 15
+        layer?.opacity = 1
+
+        guard animationsEnabled,
+              kind == .waitingForInput || kind == .failed
+        else { return }
+
+        let animation = CAKeyframeAnimation(keyPath: "opacity")
+        animation.values = [0.42, 1, 0.42, 0.42]
+        animation.keyTimes = [0, 0.08, 0.18, 1]
+        animation.duration = kind == .failed ? 5 : 8
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer?.add(animation, forKey: "ambient")
+    }
+
+    func stopAnimations() {
+        layer?.removeAllAnimations()
+    }
+}
+
+private final class TaskBallImageView: NSImageView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+}
+
 final class QuotaPanelView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -36,10 +276,11 @@ final class QuotaPanelView: NSView {
     }
 
     private func configureLayerBacking() {
-        // GIF 角标必须拥有独立绘制层，否则每一帧都会向上触发整个面板重绘。
+        // 动效使用独立图层，避免每一帧向上触发整个面板重绘。
         wantsLayer = true
         canDrawSubviewsIntoLayer = false
         layerContentsRedrawPolicy = .onSetNeedsDisplay
+        configureTaskAttentionViews()
     }
 
     // didSet 是属性观察器：属性被赋新值后自动执行，用于通知 AppKit 重新绘制。
@@ -58,11 +299,11 @@ final class QuotaPanelView: NSView {
         didSet { needsDisplay = true }
     }
     var errorText: String? { didSet { needsDisplay = true } }
-    var taskProgress = TaskProgressSnapshot.reading {
+    private(set) var taskProgress = TaskProgressSnapshot.reading {
         didSet {
             if taskProgress != oldValue {
                 needsDisplay = true
-                syncRunningTaskBadges()
+                needsLayout = true
                 window?.invalidateCursorRects(for: self)
             }
         }
@@ -95,7 +336,7 @@ final class QuotaPanelView: NSView {
         didSet {
             guard pointerSide != oldValue else { return }
             needsDisplay = true
-            syncRunningTaskBadges()
+            needsLayout = true
             window?.invalidateCursorRects(for: self)
             window?.invalidateShadow()
         }
@@ -110,7 +351,8 @@ final class QuotaPanelView: NSView {
     var isCollapsed = false {
         didSet {
             needsDisplay = true
-            syncRunningTaskBadges()
+            needsLayout = true
+            updateTaskAnimationState()
             window?.invalidateCursorRects(for: self)
             window?.invalidateShadow()
         }
@@ -129,11 +371,27 @@ final class QuotaPanelView: NSView {
     var onWindowDragCompleted: (() -> Void)?
     private var hideButtonTrackingArea: NSTrackingArea?
     private var isHideButtonHovered = false
-    private var runningTaskBadgeViews: [NSImageView] = []
-    private var runningTaskBadgeAnimationsEnabled = false
-    // 临时关闭运行任务 GIF 角标，用于排查动画对 CPU 占用的影响。
-    private let showsRunningTaskBadgeAnimation = false
+    private var taskBallViews: [TaskProgressKind: NSImageView] = [:]
+    private var taskRowAttentionViews: [String: TaskAttentionRowView] = [:]
+    private let collapsedTaskAttentionView = CollapsedTaskAttentionView(frame: .zero)
+    private var attentionItems = TaskProgressSnapshot.reading.items
+    private var pendingAttentionEvents: [TaskAttentionEvent] = []
+    private var taskAnimationsEnabled = false
+    private var lastBallAnimationKind: TaskProgressKind?
+    private var lastBallAnimationsEnabled = false
     private var windowVisibilityObservers: [NSObjectProtocol] = []
+
+    private static let taskBallSpecifications: [(
+        kind: TaskProgressKind,
+        assetName: String,
+        horizontalFraction: CGFloat
+    )] = [
+        (.failed, "01-red.png", 0.15),
+        (.running, "02-blue.png", 0.33),
+        (.reading, "03-pink.png", 0.51),
+        (.waitingForInput, "04-orange.png", 0.69),
+        (.completed, "05-green.png", 0.86),
+    ]
 
     // lazy 属性第一次使用时才加载资源；重新加载配置时会主动替换该缓存。
     private lazy var backgroundImage: NSImage? = loadBackgroundImage()
@@ -149,6 +407,8 @@ final class QuotaPanelView: NSView {
         hasUsageProviderConfiguration = panelConfig.usageProvider != nil
         backgroundImage = loadBackgroundImage()
         needsDisplay = true
+        needsLayout = true
+        updateTaskAnimationState()
         window?.invalidateCursorRects(for: self)
     }
 
@@ -157,9 +417,6 @@ final class QuotaPanelView: NSView {
     )
     private lazy var runningTaskIcon: NSImage? = taskIcon(
         named: "task-running-icon.png"
-    )
-    private lazy var runningTaskBadgeAnimation: NSImage? = taskIcon(
-        named: "task-running-badge.gif"
     )
     private lazy var waitingTaskIcon: NSImage? = taskIcon(
         named: "task-waiting-icon.png"
@@ -179,7 +436,7 @@ final class QuotaPanelView: NSView {
     override var isFlipped: Bool { true }
 
     deinit {
-        runningTaskBadgeViews.forEach { $0.animates = false }
+        stopAllTaskAnimations()
         windowVisibilityObservers.forEach {
             NotificationCenter.default.removeObserver($0)
         }
@@ -200,81 +457,366 @@ final class QuotaPanelView: NSView {
                 queue: .main
             ) { [weak self] _ in
                 // weak 防止 NotificationCenter 的闭包与视图互相强引用。
-                self?.updateRunningTaskBadgeAnimationState()
+                self?.updateTaskAnimationState()
             })
         }
-        syncRunningTaskBadges()
+        needsLayout = true
+        syncTaskAttentionRowViews()
+        updateTaskAnimationState()
     }
 
-    func setRunningTaskBadgeAnimationsEnabled(_ enabled: Bool) {
-        guard runningTaskBadgeAnimationsEnabled != enabled else { return }
-        runningTaskBadgeAnimationsEnabled = enabled
-        updateRunningTaskBadgeAnimationState()
+    func setTaskAnimationsEnabled(_ enabled: Bool) {
+        guard taskAnimationsEnabled != enabled else { return }
+        taskAnimationsEnabled = enabled
+        updateTaskAnimationState()
     }
 
-    private func syncRunningTaskBadges() {
-        for imageView in runningTaskBadgeViews {
-            imageView.animates = false
-            imageView.removeFromSuperview()
-        }
-        runningTaskBadgeViews.removeAll(keepingCapacity: true)
+    func applyTaskProgress(
+        _ result: TaskProgressReadResult,
+        events: [TaskAttentionEvent] = []
+    ) {
+        attentionItems = result.allItems
+        taskProgress = result.snapshot
+        enqueueAttentionEvents(events)
+        updateTaskAnimationState()
+    }
 
-        guard showsRunningTaskBadgeAnimation,
-              !isCollapsed,
-              window != nil,
-              let animation = runningTaskBadgeAnimation
-        else { return }
+    override func layout() {
+        super.layout()
+        layoutTaskAttentionViews()
+    }
 
-        let bodyRect = panelBodyRect()
-        let contentX = bodyRect.minX + 14
-        let taskItems = taskProgress.items.isEmpty
-            ? TaskProgressSnapshot.idle.items
-            : taskProgress.items
-        for (index, item) in taskItems.enumerated()
-            where item.kind == .running
-        {
-            let rowRect = taskProgressRowRect(index: index, in: bodyRect)
-            let iconRect = NSRect(
-                x: contentX - 2,
-                y: rowRect.minY + 7,
-                width: 20,
-                height: 15
-            )
-            let badgeRect = NSRect(
-                x: iconRect.minX + 10.6,
-                y: iconRect.minY + 0.4,
-                width: 8.4,
-                height: 8.4
-            )
-            let imageView = NSImageView(frame: badgeRect)
-            imageView.image = animation
+    private var usesLayeredTaskBalls: Bool {
+        panelConfig.theme.backgroundImage == "quota-panel-background.png"
+            && taskBallViews.count == Self.taskBallSpecifications.count
+    }
+
+    private var canAnimateTaskEffects: Bool {
+        let isVisible = taskAnimationsEnabled && window?.isVisible == true
+        let isOccluded = window.map {
+            !$0.occlusionState.contains(.visible)
+        } ?? true
+        return shouldAnimateTaskEffects(
+            isWindowVisible: isVisible,
+            isWindowOccluded: isOccluded,
+            reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        )
+    }
+
+    private func configureTaskAttentionViews() {
+        for specification in Self.taskBallSpecifications {
+            guard let image = taskIcon(named: specification.assetName) else { continue }
+            let imageView = TaskBallImageView(frame: .zero)
+            imageView.image = image
             imageView.imageAlignment = .alignCenter
-            imageView.imageScaling = .scaleAxesIndependently
+            imageView.imageScaling = .scaleProportionallyUpOrDown
             imageView.imageFrameStyle = .none
             imageView.isEditable = false
             imageView.wantsLayer = true
             imageView.canDrawSubviewsIntoLayer = false
             imageView.layerContentsRedrawPolicy = .onSetNeedsDisplay
-            imageView.animates = false
+            imageView.layer?.masksToBounds = false
+            imageView.isHidden = true
             addSubview(imageView)
-            runningTaskBadgeViews.append(imageView)
+            taskBallViews[specification.kind] = imageView
         }
-
-        updateRunningTaskBadgeAnimationState()
+        collapsedTaskAttentionView.isHidden = true
+        addSubview(collapsedTaskAttentionView)
     }
 
-    private func updateRunningTaskBadgeAnimationState() {
-        let shouldAnimate = shouldAnimateRunningArrow(
-            isWindowVisible: runningTaskBadgeAnimationsEnabled
-                && window?.isVisible == true,
-            isCollapsed: isCollapsed,
-            hasRunningTask: !runningTaskBadgeViews.isEmpty
-        )
-        for imageView in runningTaskBadgeViews
-            where imageView.animates != shouldAnimate
-        {
-            imageView.animates = shouldAnimate
+    private func layoutTaskAttentionViews() {
+        let bodyRect = panelBodyRect()
+        let showsBalls = usesLayeredTaskBalls && !isCollapsed
+        let ballSize: CGFloat = 36
+        let ballY = bodyRect.minY + 28
+        for specification in Self.taskBallSpecifications {
+            guard let imageView = taskBallViews[specification.kind] else { continue }
+            let centerX = bodyRect.minX
+                + bodyRect.width * specification.horizontalFraction
+            imageView.frame = NSRect(
+                x: floor(centerX - ballSize / 2),
+                y: ballY,
+                width: ballSize,
+                height: ballSize
+            )
+            imageView.isHidden = !showsBalls
         }
+
+        for (index, item) in taskProgress.items.enumerated() {
+            guard let taskID = rowAttentionIdentifier(for: item, index: index),
+                  let rowView = taskRowAttentionViews[taskID]
+            else { continue }
+            rowView.frame = taskProgressRowRect(index: index, in: bodyRect)
+            rowView.alphaValue = isCollapsed ? 0 : 1
+        }
+
+        collapsedTaskAttentionView.frame = bodyRect.insetBy(dx: 1, dy: 1)
+    }
+
+    private func syncTaskAttentionRowViews() {
+        let animationsEnabled = canAnimateTaskEffects && !isCollapsed
+        var activeIDs = Set<String>()
+        for (index, item) in taskProgress.items.enumerated() {
+            guard let taskID = rowAttentionIdentifier(for: item, index: index) else {
+                continue
+            }
+            activeIDs.insert(taskID)
+            let rowView: TaskAttentionRowView
+            if let existing = taskRowAttentionViews[taskID] {
+                rowView = existing
+            } else {
+                rowView = TaskAttentionRowView(frame: .zero)
+                taskRowAttentionViews[taskID] = rowView
+                addSubview(rowView)
+            }
+            rowView.update(kind: item.kind, animationsEnabled: animationsEnabled)
+        }
+
+        let removedIDs = taskRowAttentionViews.keys.filter {
+            !activeIDs.contains($0)
+        }
+        for taskID in removedIDs {
+            guard let rowView = taskRowAttentionViews.removeValue(forKey: taskID) else {
+                continue
+            }
+            rowView.stopAnimations()
+            rowView.removeFromSuperview()
+        }
+    }
+
+    private func rowAttentionIdentifier(
+        for item: TaskProgressItem,
+        index: Int
+    ) -> String? {
+        taskAttentionIdentifier(for: item)
+            ?? "display:\(index):\(item.title):\(item.startedAt.timeIntervalSinceReferenceDate.bitPattern)"
+    }
+
+    private func enqueueAttentionEvents(_ events: [TaskAttentionEvent]) {
+        for event in events {
+            pendingAttentionEvents.removeAll { $0.taskID == event.taskID }
+            switch event.kind {
+            case .waitingForInput, .completed, .failed:
+                pendingAttentionEvents.append(event)
+            case .reading, .running, .idle:
+                break
+            }
+        }
+    }
+
+    private func updateTaskAnimationState() {
+        let animationsEnabled = canAnimateTaskEffects
+        let dominantKind = dominantTaskProgressKind(in: attentionItems)
+
+        syncTaskAttentionRowViews()
+        collapsedTaskAttentionView.update(
+            kind: dominantKind,
+            animationsEnabled: animationsEnabled && isCollapsed
+        )
+        collapsedTaskAttentionView.isHidden = !isCollapsed || dominantKind == .idle
+        updateTaskBallPresentation(
+            dominantKind: dominantKind,
+            animationsEnabled: animationsEnabled && !isCollapsed
+        )
+
+        guard animationsEnabled else {
+            for imageView in taskBallViews.values {
+                imageView.layer?.removeAllAnimations()
+            }
+            for rowView in taskRowAttentionViews.values {
+                rowView.stopAnimations()
+            }
+            collapsedTaskAttentionView.stopAnimations()
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                pendingAttentionEvents.removeAll(keepingCapacity: true)
+            }
+            return
+        }
+        playPendingAttentionEvents(dominantKind: dominantKind)
+    }
+
+    private func updateTaskBallPresentation(
+        dominantKind: TaskProgressKind,
+        animationsEnabled: Bool
+    ) {
+        let shouldAnimate = animationsEnabled && usesLayeredTaskBalls
+        guard lastBallAnimationKind != dominantKind
+                || lastBallAnimationsEnabled != shouldAnimate
+        else { return }
+
+        lastBallAnimationKind = dominantKind
+        lastBallAnimationsEnabled = shouldAnimate
+        let emphasizesUrgency = dominantKind == .waitingForInput
+            || dominantKind == .failed
+
+        for specification in Self.taskBallSpecifications {
+            guard let imageView = taskBallViews[specification.kind],
+                  let imageLayer = imageView.layer
+            else { continue }
+            if shouldAnimate {
+                imageLayer.removeAnimation(forKey: "ambient")
+            } else {
+                imageLayer.removeAllAnimations()
+            }
+            imageLayer.shadowColor = taskAttentionColor(for: dominantKind).cgColor
+            imageLayer.shadowOffset = .zero
+            imageLayer.shadowRadius = specification.kind == dominantKind ? 5 : 0
+            imageLayer.shadowOpacity = specification.kind == dominantKind
+                && dominantKind != .idle ? 0.38 : 0
+            imageView.alphaValue = emphasizesUrgency
+                && specification.kind != dominantKind ? 0.66 : 1
+        }
+
+        guard shouldAnimate,
+              let activeLayer = taskBallViews[dominantKind]?.layer
+        else { return }
+
+        let animation: CAKeyframeAnimation
+        switch dominantKind {
+        case .reading:
+            animation = Self.repeatingAnimation(
+                keyPath: "opacity",
+                values: [0.72, 1, 0.72],
+                keyTimes: [0, 0.5, 1],
+                duration: 2.4
+            )
+        case .running:
+            animation = Self.repeatingAnimation(
+                keyPath: "transform.translation.y",
+                values: [0, -1.6, 0],
+                keyTimes: [0, 0.5, 1],
+                duration: 2.2
+            )
+        case .waitingForInput:
+            animation = Self.repeatingAnimation(
+                keyPath: "transform.scale",
+                values: [1, 1.08, 1, 1],
+                keyTimes: [0, 0.06, 0.14, 1],
+                duration: 8
+            )
+        case .failed:
+            animation = Self.repeatingAnimation(
+                keyPath: "transform.translation.x",
+                values: [0, -1.4, 1.4, 0, 0],
+                keyTimes: [0, 0.04, 0.08, 0.14, 1],
+                duration: 5
+            )
+        case .completed, .idle:
+            return
+        }
+        activeLayer.add(animation, forKey: "ambient")
+    }
+
+    private func playPendingAttentionEvents(dominantKind: TaskProgressKind) {
+        guard !pendingAttentionEvents.isEmpty else { return }
+        let events = pendingAttentionEvents
+        pendingAttentionEvents.removeAll(keepingCapacity: true)
+
+        for event in events {
+            taskRowAttentionViews[event.taskID]?.playEntrance(for: event.kind)
+        }
+
+        guard !isCollapsed,
+              let dominantEvent = events.max(by: {
+                  taskAttentionPriority($0.kind) < taskAttentionPriority($1.kind)
+              })
+        else { return }
+
+        if (dominantKind == .failed || dominantKind == .waitingForInput),
+           taskAttentionPriority(dominantKind)
+            > taskAttentionPriority(dominantEvent.kind)
+        {
+            return
+        }
+        playTaskBallEntrance(for: dominantEvent.kind)
+    }
+
+    private func playTaskBallEntrance(for kind: TaskProgressKind) {
+        guard usesLayeredTaskBalls,
+              let activeLayer = taskBallViews[kind]?.layer
+        else { return }
+
+        switch kind {
+        case .waitingForInput:
+            activeLayer.add(Self.oneShotAnimation(
+                keyPath: "transform.scale",
+                values: [1, 1.14, 1, 1.14, 1, 1.14, 1],
+                keyTimes: [0, 0.12, 0.25, 0.38, 0.52, 0.68, 1],
+                duration: 1.8
+            ), forKey: "entrance")
+        case .completed:
+            activeLayer.add(Self.oneShotAnimation(
+                keyPath: "transform.scale",
+                values: [0.84, 1.16, 0.96, 1],
+                keyTimes: [0, 0.45, 0.72, 1],
+                duration: 0.8
+            ), forKey: "entrance")
+            let startTime = CACurrentMediaTime()
+            for (index, specification) in Self.taskBallSpecifications.enumerated() {
+                guard let imageLayer = taskBallViews[specification.kind]?.layer else {
+                    continue
+                }
+                let wave = Self.oneShotAnimation(
+                    keyPath: "transform.translation.y",
+                    values: [0, -2.8, 0],
+                    keyTimes: [0, 0.48, 1],
+                    duration: 0.48
+                )
+                wave.beginTime = startTime + Double(index) * 0.07
+                imageLayer.add(wave, forKey: "completionWave")
+            }
+        case .failed:
+            activeLayer.add(Self.oneShotAnimation(
+                keyPath: "transform.translation.x",
+                values: [0, -2.2, 2.2, -1.8, 1.8, -1, 1, 0],
+                keyTimes: [0, 0.12, 0.24, 0.36, 0.48, 0.62, 0.76, 1],
+                duration: 0.8
+            ), forKey: "entrance")
+        case .reading, .running, .idle:
+            break
+        }
+    }
+
+    private func stopAllTaskAnimations() {
+        for imageView in taskBallViews.values {
+            imageView.layer?.removeAllAnimations()
+        }
+        for rowView in taskRowAttentionViews.values {
+            rowView.stopAnimations()
+        }
+        collapsedTaskAttentionView.stopAnimations()
+        lastBallAnimationKind = nil
+        lastBallAnimationsEnabled = false
+    }
+
+    private static func repeatingAnimation(
+        keyPath: String,
+        values: [CGFloat],
+        keyTimes: [NSNumber],
+        duration: CFTimeInterval
+    ) -> CAKeyframeAnimation {
+        let animation = oneShotAnimation(
+            keyPath: keyPath,
+            values: values,
+            keyTimes: keyTimes,
+            duration: duration
+        )
+        animation.repeatCount = .infinity
+        return animation
+    }
+
+    private static func oneShotAnimation(
+        keyPath: String,
+        values: [CGFloat],
+        keyTimes: [NSNumber],
+        duration: CFTimeInterval
+    ) -> CAKeyframeAnimation {
+        let animation = CAKeyframeAnimation(keyPath: keyPath)
+        animation.values = values.map { NSNumber(value: Double($0)) }
+        animation.keyTimes = keyTimes
+        animation.duration = duration
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        return animation
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -290,10 +832,20 @@ final class QuotaPanelView: NSView {
         background.setFill()
         bodyPath.fill()
 
-        if !isCollapsed, let backgroundImage {
+        if !isCollapsed, usesLayeredTaskBalls || backgroundImage != nil {
             NSGraphicsContext.saveGraphicsState()
             bodyPath.addClip()
-            drawFiveBallBand(backgroundImage, in: bodyRect)
+            if usesLayeredTaskBalls {
+                NSColor.black.setFill()
+                NSBezierPath(rect: NSRect(
+                    x: bodyRect.minX,
+                    y: bodyRect.minY,
+                    width: bodyRect.width,
+                    height: min(93, bodyRect.height)
+                )).fill()
+            } else if let backgroundImage {
+                drawFiveBallBand(backgroundImage, in: bodyRect)
+            }
             NSColor.black.withAlphaComponent(0.08).setFill()
             bodyPath.fill()
             NSGraphicsContext.restoreGraphicsState()
@@ -349,6 +901,10 @@ final class QuotaPanelView: NSView {
                 font: labelFont,
                 color: NSColor.white.withAlphaComponent(0.92),
                 alignment: .center
+            )
+            drawCollapsedTaskIndicator(
+                kind: dominantTaskProgressKind(in: attentionItems),
+                in: bodyRect
             )
             return
         }
@@ -961,6 +1517,24 @@ final class QuotaPanelView: NSView {
         )
     }
 
+    private func drawCollapsedTaskIndicator(
+        kind: TaskProgressKind,
+        in bodyRect: NSRect
+    ) {
+        guard kind != .idle else { return }
+        let color = taskAttentionColor(for: kind)
+        let dotRect = NSRect(
+            x: bodyRect.maxX - 13,
+            y: bodyRect.minY + 8,
+            width: 6,
+            height: 6
+        )
+        color.withAlphaComponent(0.24).setFill()
+        NSBezierPath(ovalIn: dotRect.insetBy(dx: -2, dy: -2)).fill()
+        color.setFill()
+        NSBezierPath(ovalIn: dotRect).fill()
+    }
+
     private func drawTaskProgressItem(
         _ item: TaskProgressItem,
         index: Int,
@@ -1417,38 +1991,7 @@ final class QuotaPanelView: NSView {
     }
 
     private func taskProgressColor(for kind: TaskProgressKind) -> NSColor {
-        switch kind {
-        case .reading, .running:
-            return NSColor(
-                calibratedRed: 0.10,
-                green: 0.78,
-                blue: 1.0,
-                alpha: 1
-            )
-        case .waitingForInput:
-            return NSColor(
-                calibratedRed: 1.0,
-                green: 0.79,
-                blue: 0.18,
-                alpha: 1
-            )
-        case .completed:
-            return NSColor(
-                calibratedRed: 0.24,
-                green: 0.86,
-                blue: 0.58,
-                alpha: 1
-            )
-        case .failed:
-            return NSColor(
-                calibratedRed: 1.0,
-                green: 0.39,
-                blue: 0.43,
-                alpha: 1
-            )
-        case .idle:
-            return NSColor.white.withAlphaComponent(0.54)
-        }
+        taskAttentionColor(for: kind)
     }
 
     private func marketPriceColor(direction: Int) -> NSColor {

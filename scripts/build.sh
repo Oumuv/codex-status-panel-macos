@@ -29,6 +29,7 @@ for ARCH in arm64 x86_64; do
     -sdk "$SDK" \
     -framework AppKit \
     -framework CoreGraphics \
+    -framework QuartzCore \
     "${SWIFT_SOURCES[@]}" \
     -o "$TMP_DIR/CodexStatusPanel-$ARCH"
 done

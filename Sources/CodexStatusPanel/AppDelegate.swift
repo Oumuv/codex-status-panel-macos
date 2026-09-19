@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configuration: panelConfig.usageProvider
     )
     private let taskProgressReader = CodexTaskProgressReader()
+    private let taskAttentionTracker = TaskAttentionTracker()
     private let btcPriceClient = MarketPriceClient(symbol: "BTCUSDT")
     private let ethPriceClient = MarketPriceClient(symbol: "ETHUSDT")
     private let stockMarketClient = EastMoneyMarketClient()
@@ -154,7 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        quotaView.setRunningTaskBadgeAnimationsEnabled(false)
+        quotaView.setTaskAnimationsEnabled(false)
         refreshTimer?.invalidate()
         taskProgressTimer?.invalidate()
         btcRefreshTimer?.invalidate()
@@ -494,7 +495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isPanelHiddenByUser = true
         isStandalonePanelActive = false
         quotaView.allowsWindowDragging = false
-        quotaView.setRunningTaskBadgeAnimationsEnabled(false)
+        quotaView.setTaskAnimationsEnabled(false)
         if panel.isVisible {
             panel.orderOut(nil)
         }
@@ -748,7 +749,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !isPanelHiddenByUser else {
             isStandalonePanelActive = false
             quotaView.allowsWindowDragging = false
-            quotaView.setRunningTaskBadgeAnimationsEnabled(false)
+            quotaView.setTaskAnimationsEnabled(false)
             if panel.isVisible {
                 panel.orderOut(nil)
             }
@@ -799,7 +800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !panel.isVisible {
             panel.orderFrontRegardless()
         }
-        quotaView.setRunningTaskBadgeAnimationsEnabled(true)
+        quotaView.setTaskAnimationsEnabled(true)
         writeHealth(
             status: "following-pet",
             panelVisible: true,
@@ -854,7 +855,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !panel.isVisible {
             panel.orderFrontRegardless()
         }
-        quotaView.setRunningTaskBadgeAnimationsEnabled(true)
+        quotaView.setTaskAnimationsEnabled(true)
     }
 
     private func preferredStandaloneScreen(from screens: [NSScreen]) -> NSScreen? {
@@ -962,13 +963,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 日志扫描可能访问较多文件，放到 utility 队列，避免阻塞菜单和面板绘制。
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            let snapshot = self.taskProgressReader.read()
+            let result = self.taskProgressReader.readResult()
             // 所有 NSView / NSPanel 状态都必须回到主线程更新。
             DispatchQueue.main.async {
                 self.isRefreshingTaskProgress = false
-                self.quotaView.taskProgress = snapshot
+                let events = self.taskAttentionTracker.update(
+                    with: result.allItems
+                )
+                self.quotaView.applyTaskProgress(result, events: events)
                 let nextSize = panelSizeForTaskRows(
-                    snapshot.rowCount,
+                    result.snapshot.rowCount,
                     showsMarketPrices: self.showsMarketPrices,
                     showsStockPrices: self.showsStockPrices,
                     stockRowCount: enabledStockQuoteConfigurations.count

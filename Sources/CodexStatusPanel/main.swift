@@ -93,7 +93,7 @@ if CommandLine.arguments.contains("--print-task-progress") {
 
 if let previewFlag = CommandLine.arguments.firstIndex(of: "--render-preview") {
     guard CommandLine.arguments.indices.contains(previewFlag + 1) else {
-        fputs("用法：CodexStatusPanel --render-preview <output.png> [--collapsed] [--preview-usage <mode>]\n", stderr)
+        fputs("用法：CodexStatusPanel --render-preview <output.png> [--collapsed] [--preview-usage <mode>] [--preview-task <mode>]\n", stderr)
         exit(1)
     }
     let usageMode: PreviewUsageMode
@@ -112,10 +112,27 @@ if let previewFlag = CommandLine.arguments.firstIndex(of: "--render-preview") {
     } else {
         usageMode = .codex
     }
+    let taskMode: PreviewTaskMode
+    if let modeFlag = CommandLine.arguments.firstIndex(
+        of: "--preview-task"
+    ) {
+        guard CommandLine.arguments.indices.contains(modeFlag + 1),
+              let parsed = PreviewTaskMode(
+                rawValue: CommandLine.arguments[modeFlag + 1]
+              )
+        else {
+            fputs("用法：--preview-task <showcase|reading|running|waiting|completed|failed|idle>\n", stderr)
+            exit(1)
+        }
+        taskMode = parsed
+    } else {
+        taskMode = .showcase
+    }
     renderPreviewOnce(
         to: CommandLine.arguments[previewFlag + 1],
         collapsed: CommandLine.arguments.contains("--collapsed"),
-        usageMode: usageMode
+        usageMode: usageMode,
+        taskMode: taskMode
     )
 }
 
