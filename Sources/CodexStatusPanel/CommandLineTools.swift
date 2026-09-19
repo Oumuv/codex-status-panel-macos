@@ -1440,6 +1440,30 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
+    let runningTextEffect = taskStatusTextEffectProfile(for: .running)
+    let waitingTextEffect = taskStatusTextEffectProfile(for: .waitingForInput)
+    let completedTextEffect = taskStatusTextEffectProfile(for: .completed)
+    let failedTextEffect = taskStatusTextEffectProfile(for: .failed)
+    let readingTextEffect = taskStatusTextEffectProfile(for: .reading)
+    let idleTextEffect = taskStatusTextEffectProfile(for: .idle)
+    let textEffectChecks = [
+        runningTextEffect.ambientScanDuration == 2.4,
+        runningTextEffect.ambientActiveFraction > 0.5,
+        waitingTextEffect.entranceScanCount == 3,
+        waitingTextEffect.ambientScanDuration != nil,
+        completedTextEffect.entranceScanCount == 1
+            && completedTextEffect.ambientScanDuration == nil,
+        failedTextEffect.usesGlitchEntrance
+            && failedTextEffect.ambientScanDuration != nil,
+        readingTextEffect.ambientScanDuration == nil,
+        idleTextEffect.ambientScanDuration == nil
+            && idleTextEffect.glowOpacity == 0,
+    ]
+    guard textEffectChecks.allSatisfy({ $0 }) else {
+        fputs("task status text effect profile failed\n", stderr)
+        exit(1)
+    }
+
     let taskIconNames = [
         "task-running-icon.png",
         "task-waiting-icon.png",
@@ -1465,7 +1489,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; list=pass; layout=pass; icons=4/4; balls=5/5")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; text-effects=8/8; list=pass; layout=pass; icons=4/4; balls=5/5")
     exit(0)
 }
 
@@ -2481,6 +2505,7 @@ func renderPreviewOnce(
     view.stockMarketState = .trading
     view.stockUpdatedText = "14:32"
     view.layoutSubtreeIfNeeded()
+    view.prepareTaskEffectPreviewFrame()
 
     let scale: CGFloat = 2
     guard let bitmap = NSBitmapImageRep(

@@ -60,10 +60,89 @@ private func taskAttentionColor(for kind: TaskProgressKind) -> NSColor {
     }
 }
 
+struct TaskStatusTextEffectProfile: Equatable {
+    let ambientScanDuration: CFTimeInterval?
+    let ambientActiveFraction: Double
+    let entranceScanCount: Float
+    let entranceScanDuration: CFTimeInterval
+    let usesGlitchEntrance: Bool
+    let glowOpacity: Float
+}
+
+func taskStatusTextEffectProfile(
+    for kind: TaskProgressKind
+) -> TaskStatusTextEffectProfile {
+    switch kind {
+    case .reading:
+        return TaskStatusTextEffectProfile(
+            ambientScanDuration: nil,
+            ambientActiveFraction: 0,
+            entranceScanCount: 0,
+            entranceScanDuration: 0,
+            usesGlitchEntrance: false,
+            glowOpacity: 0.18
+        )
+    case .running:
+        return TaskStatusTextEffectProfile(
+            ambientScanDuration: 2.4,
+            ambientActiveFraction: 0.66,
+            entranceScanCount: 0,
+            entranceScanDuration: 0,
+            usesGlitchEntrance: false,
+            glowOpacity: 0.34
+        )
+    case .waitingForInput:
+        return TaskStatusTextEffectProfile(
+            ambientScanDuration: 5.6,
+            ambientActiveFraction: 0.18,
+            entranceScanCount: 3,
+            entranceScanDuration: 0.52,
+            usesGlitchEntrance: false,
+            glowOpacity: 0.62
+        )
+    case .completed:
+        return TaskStatusTextEffectProfile(
+            ambientScanDuration: nil,
+            ambientActiveFraction: 0,
+            entranceScanCount: 1,
+            entranceScanDuration: 0.72,
+            usesGlitchEntrance: false,
+            glowOpacity: 0.42
+        )
+    case .failed:
+        return TaskStatusTextEffectProfile(
+            ambientScanDuration: 6.2,
+            ambientActiveFraction: 0.16,
+            entranceScanCount: 1,
+            entranceScanDuration: 0.46,
+            usesGlitchEntrance: true,
+            glowOpacity: 0.68
+        )
+    case .idle:
+        return TaskStatusTextEffectProfile(
+            ambientScanDuration: nil,
+            ambientActiveFraction: 0,
+            entranceScanCount: 0,
+            entranceScanDuration: 0,
+            usesGlitchEntrance: false,
+            glowOpacity: 0
+        )
+    }
+}
+
 private final class TaskAttentionRowView: NSView {
-    private let accentLayer = CALayer()
+    private let statusTextLayer = CATextLayer()
+    private let ambientScanLayer = CAGradientLayer()
+    private let eventScanLayer = CAGradientLayer()
+    private let ambientScanMaskLayer = CATextLayer()
+    private let eventScanMaskLayer = CATextLayer()
+    private let cyanGlitchLayer = CATextLayer()
+    private let magentaGlitchLayer = CATextLayer()
     private var displayedKind: TaskProgressKind?
+    private var displayedText: String?
     private var animationsEnabled = false
+
+    private static let statusFont = NSFont.systemFont(ofSize: 9.2, weight: .semibold)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -83,65 +162,82 @@ private final class TaskAttentionRowView: NSView {
 
     override func layout() {
         super.layout()
-        accentLayer.frame = CGRect(
-            x: 0,
-            y: 3,
-            width: 2.5,
-            height: max(0, bounds.height - 6)
+        let statusFrame = CGRect(
+            x: max(0, bounds.width - 66),
+            y: 7,
+            width: min(66, bounds.width),
+            height: 15
         )
+        let scale = window?.backingScaleFactor
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 2
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for textLayer in [
+            cyanGlitchLayer,
+            magentaGlitchLayer,
+            statusTextLayer,
+            ambientScanLayer,
+            eventScanLayer,
+        ] {
+            textLayer.frame = statusFrame
+            textLayer.contentsScale = scale
+        }
+        ambientScanMaskLayer.frame = ambientScanLayer.bounds
+        eventScanMaskLayer.frame = eventScanLayer.bounds
+        ambientScanMaskLayer.contentsScale = scale
+        eventScanMaskLayer.contentsScale = scale
+        CATransaction.commit()
     }
 
-    func update(kind: TaskProgressKind, animationsEnabled: Bool) {
-        guard displayedKind != kind || self.animationsEnabled != animationsEnabled else {
+    func update(
+        kind: TaskProgressKind,
+        text: String,
+        animationsEnabled: Bool
+    ) {
+        guard displayedKind != kind
+                || displayedText != text
+                || self.animationsEnabled != animationsEnabled
+        else {
             return
         }
         displayedKind = kind
+        displayedText = text
         self.animationsEnabled = animationsEnabled
 
         let color = taskAttentionColor(for: kind)
-        accentLayer.backgroundColor = color.cgColor
-        accentLayer.removeAnimation(forKey: "ambient")
-        layer?.removeAnimation(forKey: "ambientBorder")
-        layer?.backgroundColor = NSColor.clear.cgColor
-        layer?.borderColor = color.withAlphaComponent(0.18).cgColor
-        layer?.borderWidth = 0
-        isHidden = false
+        let profile = taskStatusTextEffectProfile(for: kind)
+        updateText(text, color: color)
+        updateScanColors(for: kind, color: color)
+        stopAnimations()
 
-        switch kind {
-        case .reading, .idle:
-            isHidden = true
-        case .running:
-            accentLayer.opacity = 0.62
-            if animationsEnabled {
-                accentLayer.add(Self.opacityAnimation(
-                    values: [0.42, 0.95, 0.42],
-                    keyTimes: [0, 0.5, 1],
-                    duration: 2.2
-                ), forKey: "ambient")
-            }
-        case .waitingForInput:
-            accentLayer.opacity = 0.88
-            layer?.borderWidth = 0.75
-            if animationsEnabled {
-                accentLayer.add(Self.opacityAnimation(
-                    values: [0.58, 1, 0.58, 0.58],
-                    keyTimes: [0, 0.06, 0.14, 1],
-                    duration: 8
-                ), forKey: "ambient")
-            }
-        case .completed:
-            accentLayer.opacity = 0.92
-            layer?.borderWidth = 0.5
-        case .failed:
-            accentLayer.opacity = 0.92
-            layer?.borderWidth = 0.75
-            if animationsEnabled {
-                accentLayer.add(Self.opacityAnimation(
-                    values: [0.58, 1, 0.58, 0.58],
-                    keyTimes: [0, 0.08, 0.18, 1],
-                    duration: 5
-                ), forKey: "ambient")
-            }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        statusTextLayer.shadowColor = color.cgColor
+        statusTextLayer.shadowOpacity = profile.glowOpacity
+        statusTextLayer.shadowRadius = kind == .waitingForInput || kind == .failed
+            ? 3.6 : 2.4
+        statusTextLayer.shadowOffset = .zero
+        Self.parkScan(ambientScanLayer)
+        Self.parkScan(eventScanLayer)
+        CATransaction.commit()
+
+        guard animationsEnabled,
+              let duration = profile.ambientScanDuration
+        else { return }
+
+        ambientScanLayer.add(Self.scanAnimation(
+            duration: duration,
+            activeFraction: profile.ambientActiveFraction,
+            repeatCount: .infinity
+        ), forKey: "ambientScan")
+
+        if kind == .waitingForInput || kind == .failed {
+            statusTextLayer.add(Self.glowAnimation(
+                baseOpacity: profile.glowOpacity,
+                duration: duration
+            ), forKey: "ambientGlow")
         }
     }
 
@@ -150,52 +246,262 @@ private final class TaskAttentionRowView: NSView {
               kind == .waitingForInput || kind == .completed || kind == .failed
         else { return }
 
-        let color = taskAttentionColor(for: kind)
-        let clear = color.withAlphaComponent(0).cgColor
-        let highlighted = color.withAlphaComponent(
-            kind == .completed ? 0.16 : 0.22
-        ).cgColor
-        let animation = CAKeyframeAnimation(keyPath: "backgroundColor")
-        if kind == .completed {
-            animation.values = [clear, highlighted, clear]
-            animation.keyTimes = [0, 0.45, 1]
-            animation.duration = 0.85
-        } else {
-            animation.values = [
-                clear, highlighted, clear,
-                highlighted, clear,
-                highlighted, clear,
-            ]
-            animation.keyTimes = [0, 0.12, 0.25, 0.38, 0.52, 0.68, 1]
-            animation.duration = 1.8
+        let profile = taskStatusTextEffectProfile(for: kind)
+        eventScanLayer.add(Self.scanAnimation(
+            duration: profile.entranceScanDuration,
+            activeFraction: 1,
+            repeatCount: profile.entranceScanCount
+        ), forKey: "entranceScan")
+        statusTextLayer.add(Self.entranceGlowAnimation(
+            baseOpacity: profile.glowOpacity,
+            duration: profile.entranceScanDuration
+                * Double(profile.entranceScanCount)
+        ), forKey: "entranceGlow")
+
+        if profile.usesGlitchEntrance {
+            playGlitchEntrance()
         }
-        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        layer?.add(animation, forKey: "entrance")
     }
 
     func stopAnimations() {
-        accentLayer.removeAllAnimations()
-        layer?.removeAllAnimations()
+        statusTextLayer.removeAllAnimations()
+        ambientScanLayer.removeAllAnimations()
+        eventScanLayer.removeAllAnimations()
+        cyanGlitchLayer.removeAllAnimations()
+        magentaGlitchLayer.removeAllAnimations()
+        cyanGlitchLayer.opacity = 0
+        magentaGlitchLayer.opacity = 0
+    }
+
+    func preparePreviewFrame() {
+        guard displayedKind != .idle,
+              displayedKind != .reading
+        else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        eventScanLayer.startPoint = CGPoint(x: 0.18, y: 0.5)
+        eventScanLayer.endPoint = CGPoint(x: 0.72, y: 0.5)
+        CATransaction.commit()
     }
 
     private func configureLayers() {
         wantsLayer = true
-        layer?.cornerRadius = 6
         layer?.masksToBounds = false
-        accentLayer.cornerRadius = 1.25
-        layer?.addSublayer(accentLayer)
+        configureTextLayer(cyanGlitchLayer)
+        configureTextLayer(magentaGlitchLayer)
+        configureTextLayer(statusTextLayer)
+        configureTextLayer(ambientScanMaskLayer)
+        configureTextLayer(eventScanMaskLayer)
+        configureScanLayer(ambientScanLayer, mask: ambientScanMaskLayer)
+        configureScanLayer(eventScanLayer, mask: eventScanMaskLayer)
+
+        layer?.addSublayer(cyanGlitchLayer)
+        layer?.addSublayer(magentaGlitchLayer)
+        layer?.addSublayer(statusTextLayer)
+        layer?.addSublayer(ambientScanLayer)
+        layer?.addSublayer(eventScanLayer)
     }
 
-    private static func opacityAnimation(
-        values: [Float],
-        keyTimes: [NSNumber],
+    private func configureTextLayer(_ textLayer: CATextLayer) {
+        textLayer.alignmentMode = .right
+        textLayer.truncationMode = .end
+        textLayer.isWrapped = false
+        textLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        textLayer.actions = [
+            "bounds": NSNull(),
+            "position": NSNull(),
+            "string": NSNull(),
+            "opacity": NSNull(),
+        ]
+    }
+
+    private func configureScanLayer(
+        _ scanLayer: CAGradientLayer,
+        mask: CATextLayer
+    ) {
+        scanLayer.locations = [0, 0.36, 0.5, 0.64, 1]
+        scanLayer.mask = mask
+        scanLayer.actions = [
+            "bounds": NSNull(),
+            "position": NSNull(),
+            "startPoint": NSNull(),
+            "endPoint": NSNull(),
+        ]
+        Self.parkScan(scanLayer)
+    }
+
+    private func updateText(_ text: String, color: NSColor) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .right
+        paragraph.lineBreakMode = .byTruncatingTail
+        let baseAttributes: [NSAttributedString.Key: Any] = [
+            .font: Self.statusFont,
+            .foregroundColor: color,
+            .paragraphStyle: paragraph,
+        ]
+        let maskAttributes: [NSAttributedString.Key: Any] = [
+            .font: Self.statusFont,
+            .foregroundColor: NSColor.white,
+            .paragraphStyle: paragraph,
+        ]
+        statusTextLayer.string = NSAttributedString(
+            string: text,
+            attributes: baseAttributes
+        )
+        ambientScanMaskLayer.string = NSAttributedString(
+            string: text,
+            attributes: maskAttributes
+        )
+        eventScanMaskLayer.string = NSAttributedString(
+            string: text,
+            attributes: maskAttributes
+        )
+
+        var cyanAttributes = baseAttributes
+        cyanAttributes[.foregroundColor] = NSColor(
+            calibratedRed: 0.1,
+            green: 0.9,
+            blue: 1,
+            alpha: 0.9
+        )
+        var magentaAttributes = baseAttributes
+        magentaAttributes[.foregroundColor] = NSColor(
+            calibratedRed: 1,
+            green: 0.14,
+            blue: 0.72,
+            alpha: 0.9
+        )
+        cyanGlitchLayer.string = NSAttributedString(
+            string: text,
+            attributes: cyanAttributes
+        )
+        magentaGlitchLayer.string = NSAttributedString(
+            string: text,
+            attributes: magentaAttributes
+        )
+    }
+
+    private func updateScanColors(for kind: TaskProgressKind, color: NSColor) {
+        let secondary = kind == .failed
+            ? NSColor(calibratedRed: 1, green: 0.14, blue: 0.72, alpha: 1)
+            : color
+        let colors = [
+            color.withAlphaComponent(0).cgColor,
+            secondary.withAlphaComponent(0.34).cgColor,
+            NSColor.white.withAlphaComponent(0.98).cgColor,
+            color.withAlphaComponent(0.58).cgColor,
+            color.withAlphaComponent(0).cgColor,
+        ]
+        ambientScanLayer.colors = colors
+        eventScanLayer.colors = colors
+    }
+
+    private func playGlitchEntrance() {
+        let opacity = CAKeyframeAnimation(keyPath: "opacity")
+        opacity.values = [0, 0.82, 0, 0.58, 0]
+        opacity.keyTimes = [0, 0.16, 0.34, 0.54, 1]
+
+        let cyanShift = CAKeyframeAnimation(keyPath: "transform.translation.x")
+        cyanShift.values = [0, -1.4, 0.8, -0.5, 0]
+        cyanShift.keyTimes = opacity.keyTimes
+        let magentaShift = CAKeyframeAnimation(keyPath: "transform.translation.x")
+        magentaShift.values = [0, 1.3, -0.9, 0.6, 0]
+        magentaShift.keyTimes = opacity.keyTimes
+
+        for (textLayer, shift) in [
+            (cyanGlitchLayer, cyanShift),
+            (magentaGlitchLayer, magentaShift),
+        ] {
+            let group = CAAnimationGroup()
+            group.animations = [opacity, shift]
+            group.duration = 0.42
+            group.timingFunction = CAMediaTimingFunction(name: .linear)
+            textLayer.add(group, forKey: "glitch")
+        }
+
+        let baseShift = CAKeyframeAnimation(keyPath: "transform.translation.x")
+        baseShift.values = [0, -0.7, 0.8, 0]
+        baseShift.keyTimes = [0, 0.26, 0.58, 1]
+        baseShift.duration = 0.36
+        baseShift.timingFunction = CAMediaTimingFunction(name: .linear)
+        statusTextLayer.add(baseShift, forKey: "glitch")
+    }
+
+    private static func parkScan(_ scanLayer: CAGradientLayer) {
+        scanLayer.startPoint = CGPoint(x: 1.12, y: 0.5)
+        scanLayer.endPoint = CGPoint(x: 1.48, y: 0.5)
+    }
+
+    private static func scanAnimation(
+        duration: CFTimeInterval,
+        activeFraction: Double,
+        repeatCount: Float
+    ) -> CAAnimationGroup {
+        let normalizedActiveFraction = min(1, max(0.01, activeFraction))
+        let keyTimes: [NSNumber]
+        let startValues: [NSValue]
+        let endValues: [NSValue]
+        if normalizedActiveFraction == 1 {
+            keyTimes = [0, 1]
+            startValues = [
+                NSValue(point: NSPoint(x: -0.48, y: 0.5)),
+                NSValue(point: NSPoint(x: 1.12, y: 0.5)),
+            ]
+            endValues = [
+                NSValue(point: NSPoint(x: -0.12, y: 0.5)),
+                NSValue(point: NSPoint(x: 1.48, y: 0.5)),
+            ]
+        } else {
+            keyTimes = [0, NSNumber(value: normalizedActiveFraction), 1]
+            startValues = [
+                NSValue(point: NSPoint(x: -0.48, y: 0.5)),
+                NSValue(point: NSPoint(x: 1.12, y: 0.5)),
+                NSValue(point: NSPoint(x: 1.12, y: 0.5)),
+            ]
+            endValues = [
+                NSValue(point: NSPoint(x: -0.12, y: 0.5)),
+                NSValue(point: NSPoint(x: 1.48, y: 0.5)),
+                NSValue(point: NSPoint(x: 1.48, y: 0.5)),
+            ]
+        }
+
+        let startPoint = CAKeyframeAnimation(keyPath: "startPoint")
+        startPoint.values = startValues
+        startPoint.keyTimes = keyTimes
+
+        let endPoint = CAKeyframeAnimation(keyPath: "endPoint")
+        endPoint.values = endValues
+        endPoint.keyTimes = keyTimes
+
+        let group = CAAnimationGroup()
+        group.animations = [startPoint, endPoint]
+        group.duration = duration
+        group.repeatCount = repeatCount
+        group.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        return group
+    }
+
+    private static func glowAnimation(
+        baseOpacity: Float,
         duration: CFTimeInterval
     ) -> CAKeyframeAnimation {
-        let animation = CAKeyframeAnimation(keyPath: "opacity")
-        animation.values = values.map(NSNumber.init(value:))
-        animation.keyTimes = keyTimes
+        let animation = CAKeyframeAnimation(keyPath: "shadowOpacity")
+        animation.values = [baseOpacity, min(1, baseOpacity + 0.22), baseOpacity, baseOpacity]
+        animation.keyTimes = [0, 0.08, 0.18, 1]
         animation.duration = duration
         animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        return animation
+    }
+
+    private static func entranceGlowAnimation(
+        baseOpacity: Float,
+        duration: CFTimeInterval
+    ) -> CAKeyframeAnimation {
+        let animation = CAKeyframeAnimation(keyPath: "shadowOpacity")
+        animation.values = [baseOpacity, 1, baseOpacity]
+        animation.keyTimes = [0, 0.46, 1]
+        animation.duration = duration
         animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         return animation
     }
@@ -259,8 +565,99 @@ private final class CollapsedTaskAttentionView: NSView {
 }
 
 private final class TaskBallImageView: NSImageView {
+    private let radarSweepLayer = CAGradientLayer()
+    private let radarRingMaskLayer = CAShapeLayer()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureRadarLayer()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureRadarLayer()
+    }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         nil
+    }
+
+    override func layout() {
+        super.layout()
+        let radarFrame = bounds.insetBy(dx: -1.5, dy: -1.5)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        radarSweepLayer.frame = radarFrame
+        radarRingMaskLayer.frame = radarSweepLayer.bounds
+        radarRingMaskLayer.path = CGPath(
+            ellipseIn: radarSweepLayer.bounds.insetBy(dx: 1.5, dy: 1.5),
+            transform: nil
+        )
+        CATransaction.commit()
+    }
+
+    func updateRadar(
+        color: NSColor,
+        visible: Bool,
+        animated: Bool
+    ) {
+        radarSweepLayer.removeAllAnimations()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        radarSweepLayer.colors = [
+            color.withAlphaComponent(0.04).cgColor,
+            color.withAlphaComponent(0.16).cgColor,
+            NSColor.white.withAlphaComponent(0.92).cgColor,
+            color.withAlphaComponent(0.08).cgColor,
+        ]
+        radarSweepLayer.locations = [0, 0.54, 0.82, 1]
+        radarSweepLayer.opacity = visible ? 0.78 : 0
+        CATransaction.commit()
+
+        guard visible, animated else { return }
+        let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
+        rotation.fromValue = 0
+        rotation.toValue = Double.pi * 2
+        rotation.duration = 3.4
+        rotation.repeatCount = .infinity
+        rotation.timingFunction = CAMediaTimingFunction(name: .linear)
+        radarSweepLayer.add(rotation, forKey: "radarRotation")
+    }
+
+    func playRadarPing() {
+        let ping = CAKeyframeAnimation(keyPath: "opacity")
+        ping.values = [0.34, 1, 0.46, 1, 0.52, 1, 0.78]
+        ping.keyTimes = [0, 0.12, 0.25, 0.38, 0.52, 0.68, 1]
+        ping.duration = 1.45
+        ping.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        radarSweepLayer.add(ping, forKey: "radarPing")
+    }
+
+    func stopAnimations() {
+        layer?.removeAllAnimations()
+        radarSweepLayer.removeAllAnimations()
+    }
+
+    private func configureRadarLayer() {
+        wantsLayer = true
+        layer?.masksToBounds = false
+        radarSweepLayer.type = .conic
+        radarSweepLayer.startPoint = CGPoint(x: 0.5, y: 0.5)
+        radarSweepLayer.endPoint = CGPoint(x: 0.5, y: 0)
+        radarSweepLayer.opacity = 0
+        radarSweepLayer.mask = radarRingMaskLayer
+        radarRingMaskLayer.fillColor = NSColor.clear.cgColor
+        radarRingMaskLayer.strokeColor = NSColor.white.cgColor
+        radarRingMaskLayer.lineWidth = 0.9
+        radarRingMaskLayer.lineCap = .round
+        radarRingMaskLayer.lineDashPattern = [2.2, 2.8]
+        radarSweepLayer.actions = [
+            "bounds": NSNull(),
+            "position": NSNull(),
+            "opacity": NSNull(),
+            "colors": NSNull(),
+        ]
+        layer?.addSublayer(radarSweepLayer)
     }
 }
 
@@ -371,7 +768,7 @@ final class QuotaPanelView: NSView {
     var onWindowDragCompleted: (() -> Void)?
     private var hideButtonTrackingArea: NSTrackingArea?
     private var isHideButtonHovered = false
-    private var taskBallViews: [TaskProgressKind: NSImageView] = [:]
+    private var taskBallViews: [TaskProgressKind: TaskBallImageView] = [:]
     private var taskRowAttentionViews: [String: TaskAttentionRowView] = [:]
     private let collapsedTaskAttentionView = CollapsedTaskAttentionView(frame: .zero)
     private var attentionItems = TaskProgressSnapshot.reading.items
@@ -481,6 +878,10 @@ final class QuotaPanelView: NSView {
         updateTaskAnimationState()
     }
 
+    func prepareTaskEffectPreviewFrame() {
+        taskRowAttentionViews.values.forEach { $0.preparePreviewFrame() }
+    }
+
     override func layout() {
         super.layout()
         layoutTaskAttentionViews()
@@ -569,7 +970,11 @@ final class QuotaPanelView: NSView {
                 taskRowAttentionViews[taskID] = rowView
                 addSubview(rowView)
             }
-            rowView.update(kind: item.kind, animationsEnabled: animationsEnabled)
+            rowView.update(
+                kind: item.kind,
+                text: item.statusText,
+                animationsEnabled: animationsEnabled
+            )
         }
 
         let removedIDs = taskRowAttentionViews.keys.filter {
@@ -621,7 +1026,7 @@ final class QuotaPanelView: NSView {
 
         guard animationsEnabled else {
             for imageView in taskBallViews.values {
-                imageView.layer?.removeAllAnimations()
+                imageView.stopAnimations()
             }
             for rowView in taskRowAttentionViews.values {
                 rowView.stopAnimations()
@@ -656,7 +1061,7 @@ final class QuotaPanelView: NSView {
             if shouldAnimate {
                 imageLayer.removeAnimation(forKey: "ambient")
             } else {
-                imageLayer.removeAllAnimations()
+                imageView.stopAnimations()
             }
             imageLayer.shadowColor = taskAttentionColor(for: dominantKind).cgColor
             imageLayer.shadowOffset = .zero
@@ -665,6 +1070,12 @@ final class QuotaPanelView: NSView {
                 && dominantKind != .idle ? 0.38 : 0
             imageView.alphaValue = emphasizesUrgency
                 && specification.kind != dominantKind ? 0.66 : 1
+            imageView.updateRadar(
+                color: taskAttentionColor(for: .waitingForInput),
+                visible: specification.kind == .waitingForInput
+                    && dominantKind == .waitingForInput,
+                animated: shouldAnimate
+            )
         }
 
         guard shouldAnimate,
@@ -688,18 +1099,13 @@ final class QuotaPanelView: NSView {
                 duration: 2.2
             )
         case .waitingForInput:
-            animation = Self.repeatingAnimation(
-                keyPath: "transform.scale",
-                values: [1, 1.08, 1, 1],
-                keyTimes: [0, 0.06, 0.14, 1],
-                duration: 8
-            )
+            return
         case .failed:
             animation = Self.repeatingAnimation(
                 keyPath: "transform.translation.x",
-                values: [0, -1.4, 1.4, 0, 0],
+                values: [0, -0.8, 0.8, 0, 0],
                 keyTimes: [0, 0.04, 0.08, 0.14, 1],
-                duration: 5
+                duration: 6.2
             )
         case .completed, .idle:
             return
@@ -733,17 +1139,13 @@ final class QuotaPanelView: NSView {
 
     private func playTaskBallEntrance(for kind: TaskProgressKind) {
         guard usesLayeredTaskBalls,
-              let activeLayer = taskBallViews[kind]?.layer
+              let activeView = taskBallViews[kind],
+              let activeLayer = activeView.layer
         else { return }
 
         switch kind {
         case .waitingForInput:
-            activeLayer.add(Self.oneShotAnimation(
-                keyPath: "transform.scale",
-                values: [1, 1.14, 1, 1.14, 1, 1.14, 1],
-                keyTimes: [0, 0.12, 0.25, 0.38, 0.52, 0.68, 1],
-                duration: 1.8
-            ), forKey: "entrance")
+            activeView.playRadarPing()
         case .completed:
             activeLayer.add(Self.oneShotAnimation(
                 keyPath: "transform.scale",
@@ -768,9 +1170,9 @@ final class QuotaPanelView: NSView {
         case .failed:
             activeLayer.add(Self.oneShotAnimation(
                 keyPath: "transform.translation.x",
-                values: [0, -2.2, 2.2, -1.8, 1.8, -1, 1, 0],
-                keyTimes: [0, 0.12, 0.24, 0.36, 0.48, 0.62, 0.76, 1],
-                duration: 0.8
+                values: [0, -1.6, 1.5, -0.8, 0.7, 0],
+                keyTimes: [0, 0.16, 0.34, 0.52, 0.7, 1],
+                duration: 0.42
             ), forKey: "entrance")
         case .reading, .running, .idle:
             break
@@ -779,7 +1181,7 @@ final class QuotaPanelView: NSView {
 
     private func stopAllTaskAnimations() {
         for imageView in taskBallViews.values {
-            imageView.layer?.removeAllAnimations()
+            imageView.stopAnimations()
         }
         for rowView in taskRowAttentionViews.values {
             rowView.stopAnimations()
@@ -1611,18 +2013,6 @@ final class QuotaPanelView: NSView {
                 weight: index == 0 ? .semibold : .medium
             ),
             color: NSColor.white.withAlphaComponent(0.84)
-        )
-        drawText(
-            item.statusText,
-            in: NSRect(
-                x: contentX + contentWidth - 66,
-                y: y,
-                width: 66,
-                height: 15
-            ),
-            font: .systemFont(ofSize: 9.2, weight: .semibold),
-            color: color,
-            alignment: .right
         )
     }
 
