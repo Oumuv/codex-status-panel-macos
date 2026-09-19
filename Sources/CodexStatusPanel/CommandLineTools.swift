@@ -1464,6 +1464,27 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
+    let celebration = taskCompletionCelebrationProfile
+    let celebrationChecks = [
+        celebration.ringCount == 2,
+        celebration.particleCount == 14,
+        celebration.totalDuration == 1.25,
+        celebration.waveStagger > 0 && celebration.waveStagger < 0.1,
+        celebration.waveTravelsFromCompletedBall,
+        !celebration.repeats,
+        taskCompletionWaveOrder == [
+            .completed,
+            .waitingForInput,
+            .reading,
+            .running,
+            .failed,
+        ],
+    ]
+    guard celebrationChecks.allSatisfy({ $0 }) else {
+        fputs("task completion celebration profile failed\n", stderr)
+        exit(1)
+    }
+
     let taskIconNames = [
         "task-running-icon.png",
         "task-waiting-icon.png",
@@ -1489,7 +1510,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; text-effects=8/8; list=pass; layout=pass; icons=4/4; balls=5/5")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; text-effects=8/8; celebration=7/7; list=pass; layout=pass; icons=4/4; balls=5/5")
     exit(0)
 }
 

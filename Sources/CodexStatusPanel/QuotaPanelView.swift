@@ -130,6 +130,32 @@ func taskStatusTextEffectProfile(
     }
 }
 
+struct TaskCompletionCelebrationProfile: Equatable {
+    let ringCount: Int
+    let particleCount: Int
+    let totalDuration: CFTimeInterval
+    let waveStagger: CFTimeInterval
+    let waveTravelsFromCompletedBall: Bool
+    let repeats: Bool
+}
+
+let taskCompletionCelebrationProfile = TaskCompletionCelebrationProfile(
+    ringCount: 2,
+    particleCount: 14,
+    totalDuration: 1.25,
+    waveStagger: 0.065,
+    waveTravelsFromCompletedBall: true,
+    repeats: false
+)
+
+let taskCompletionWaveOrder: [TaskProgressKind] = [
+    .completed,
+    .waitingForInput,
+    .reading,
+    .running,
+    .failed,
+]
+
 private final class TaskAttentionRowView: NSView {
     private let statusTextLayer = CATextLayer()
     private let ambientScanLayer = CAGradientLayer()
@@ -661,6 +687,331 @@ private final class TaskBallImageView: NSImageView {
     }
 }
 
+private final class TaskCompletionCelebrationView: NSView {
+    private let innerRingLayer = CAShapeLayer()
+    private let outerRingLayer = CAShapeLayer()
+    private var particleLayers: [CALayer] = []
+    private var celebrationCenter = CGPoint.zero
+    private var reducedMotionHaloVisible = false
+
+    private static let particleVectors: [CGPoint] = [
+        CGPoint(x: -30, y: -5),
+        CGPoint(x: -25, y: -17),
+        CGPoint(x: -17, y: -23),
+        CGPoint(x: -7, y: -18),
+        CGPoint(x: 1, y: -25),
+        CGPoint(x: 10, y: -19),
+        CGPoint(x: 19, y: -22),
+        CGPoint(x: 27, y: -13),
+        CGPoint(x: 30, y: 0),
+        CGPoint(x: 25, y: 12),
+        CGPoint(x: 17, y: 19),
+        CGPoint(x: 6, y: 22),
+        CGPoint(x: -10, y: 20),
+        CGPoint(x: -24, y: 12),
+    ]
+
+    private static let particleColors: [NSColor] = [
+        NSColor(calibratedRed: 0.22, green: 1, blue: 0.70, alpha: 1),
+        NSColor(calibratedRed: 0.13, green: 0.86, blue: 1, alpha: 1),
+        NSColor(calibratedRed: 1, green: 0.76, blue: 0.16, alpha: 1),
+        NSColor(calibratedRed: 1, green: 0.25, blue: 0.68, alpha: 1),
+        NSColor.white,
+    ]
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureLayers()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureLayers()
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    func updateCenter(_ center: CGPoint) {
+        celebrationCenter = center
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        configureRingGeometry(innerRingLayer, diameter: 39)
+        configureRingGeometry(outerRingLayer, diameter: 46)
+        for (index, particleLayer) in particleLayers.enumerated() {
+            let vector = Self.particleVectors[index]
+            particleLayer.position = CGPoint(
+                x: center.x + vector.x,
+                y: center.y + vector.y
+            )
+        }
+        CATransaction.commit()
+    }
+
+    func play() {
+        guard celebrationCenter != .zero else { return }
+        stopAnimations()
+        let startTime = CACurrentMediaTime()
+
+        animateRing(
+            innerRingLayer,
+            delay: 0.08,
+            duration: 0.68,
+            startScale: 0.58,
+            endScale: 1.72,
+            peakOpacity: 0.92,
+            startTime: startTime
+        )
+        animateRing(
+            outerRingLayer,
+            delay: 0.16,
+            duration: 0.78,
+            startScale: 0.62,
+            endScale: 1.58,
+            peakOpacity: 0.56,
+            startTime: startTime
+        )
+
+        for (index, particleLayer) in particleLayers.enumerated() {
+            animateParticle(
+                particleLayer,
+                vector: Self.particleVectors[index],
+                index: index,
+                startTime: startTime
+            )
+        }
+    }
+
+    func setReducedMotionHaloVisible(_ visible: Bool) {
+        guard reducedMotionHaloVisible != visible else { return }
+        stopAnimations()
+        reducedMotionHaloVisible = visible
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        innerRingLayer.opacity = visible ? 0.44 : 0
+        innerRingLayer.transform = CATransform3DMakeScale(1.08, 1.08, 1)
+        outerRingLayer.opacity = visible ? 0.22 : 0
+        outerRingLayer.transform = CATransform3DMakeScale(1.22, 1.22, 1)
+        CATransaction.commit()
+    }
+
+    func preparePreviewFrame(visible: Bool) {
+        stopAnimations()
+        guard visible else { return }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        innerRingLayer.opacity = 0.76
+        innerRingLayer.transform = CATransform3DMakeScale(1.28, 1.28, 1)
+        outerRingLayer.opacity = 0.42
+        outerRingLayer.transform = CATransform3DMakeScale(1.48, 1.48, 1)
+        for (index, particleLayer) in particleLayers.enumerated() {
+            let vector = Self.particleVectors[index]
+            particleLayer.position = CGPoint(
+                x: celebrationCenter.x + vector.x * 0.68,
+                y: celebrationCenter.y + vector.y * 0.68
+            )
+            particleLayer.opacity = index.isMultiple(of: 4) ? 0.58 : 0.92
+            particleLayer.transform = CATransform3DMakeRotation(
+                CGFloat(index) * 0.48,
+                0,
+                0,
+                1
+            )
+        }
+        CATransaction.commit()
+    }
+
+    func stopAnimations() {
+        reducedMotionHaloVisible = false
+        innerRingLayer.removeAllAnimations()
+        outerRingLayer.removeAllAnimations()
+        particleLayers.forEach { $0.removeAllAnimations() }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        innerRingLayer.opacity = 0
+        outerRingLayer.opacity = 0
+        innerRingLayer.transform = CATransform3DIdentity
+        outerRingLayer.transform = CATransform3DIdentity
+        for (index, particleLayer) in particleLayers.enumerated() {
+            let vector = Self.particleVectors[index]
+            particleLayer.opacity = 0
+            particleLayer.position = CGPoint(
+                x: celebrationCenter.x + vector.x,
+                y: celebrationCenter.y + vector.y
+            )
+            particleLayer.transform = CATransform3DIdentity
+        }
+        CATransaction.commit()
+    }
+
+    private func configureLayers() {
+        wantsLayer = true
+        layer?.masksToBounds = true
+        configureRingLayer(
+            innerRingLayer,
+            color: NSColor(
+                calibratedRed: 0.26,
+                green: 1,
+                blue: 0.72,
+                alpha: 1
+            ),
+            lineWidth: 1.35
+        )
+        configureRingLayer(
+            outerRingLayer,
+            color: NSColor(
+                calibratedRed: 0.18,
+                green: 0.82,
+                blue: 1,
+                alpha: 1
+            ),
+            lineWidth: 0.9
+        )
+        layer?.addSublayer(outerRingLayer)
+        layer?.addSublayer(innerRingLayer)
+
+        for index in 0..<taskCompletionCelebrationProfile.particleCount {
+            let particleLayer = CALayer()
+            let isDot = index.isMultiple(of: 4)
+            let size = isDot
+                ? CGSize(width: 3.2, height: 3.2)
+                : CGSize(width: 1.8, height: index.isMultiple(of: 3) ? 6 : 4.6)
+            particleLayer.bounds = CGRect(origin: .zero, size: size)
+            particleLayer.cornerRadius = isDot ? size.width / 2 : 0.9
+            particleLayer.backgroundColor = Self.particleColors[
+                index % Self.particleColors.count
+            ].cgColor
+            particleLayer.shadowColor = particleLayer.backgroundColor
+            particleLayer.shadowOpacity = 0.72
+            particleLayer.shadowRadius = 2.2
+            particleLayer.shadowOffset = .zero
+            particleLayer.opacity = 0
+            particleLayer.actions = [
+                "opacity": NSNull(),
+                "position": NSNull(),
+                "transform": NSNull(),
+            ]
+            layer?.addSublayer(particleLayer)
+            particleLayers.append(particleLayer)
+        }
+    }
+
+    private func configureRingLayer(
+        _ ringLayer: CAShapeLayer,
+        color: NSColor,
+        lineWidth: CGFloat
+    ) {
+        ringLayer.fillColor = NSColor.clear.cgColor
+        ringLayer.strokeColor = color.cgColor
+        ringLayer.lineWidth = lineWidth
+        ringLayer.shadowColor = color.cgColor
+        ringLayer.shadowOpacity = 0.68
+        ringLayer.shadowRadius = 3
+        ringLayer.shadowOffset = .zero
+        ringLayer.opacity = 0
+        ringLayer.actions = [
+            "bounds": NSNull(),
+            "position": NSNull(),
+            "opacity": NSNull(),
+            "path": NSNull(),
+            "transform": NSNull(),
+        ]
+    }
+
+    private func configureRingGeometry(
+        _ ringLayer: CAShapeLayer,
+        diameter: CGFloat
+    ) {
+        ringLayer.bounds = CGRect(x: 0, y: 0, width: diameter, height: diameter)
+        ringLayer.position = celebrationCenter
+        ringLayer.path = CGPath(
+            ellipseIn: ringLayer.bounds.insetBy(dx: 1.5, dy: 1.5),
+            transform: nil
+        )
+    }
+
+    private func animateRing(
+        _ ringLayer: CAShapeLayer,
+        delay: CFTimeInterval,
+        duration: CFTimeInterval,
+        startScale: CGFloat,
+        endScale: CGFloat,
+        peakOpacity: Float,
+        startTime: CFTimeInterval
+    ) {
+        let scale = CAKeyframeAnimation(keyPath: "transform.scale")
+        scale.values = [startScale, 1.08, endScale]
+        scale.keyTimes = [0, 0.38, 1]
+        scale.duration = duration
+
+        let opacity = CAKeyframeAnimation(keyPath: "opacity")
+        opacity.values = [0, peakOpacity, peakOpacity * 0.56, 0]
+        opacity.keyTimes = [0, 0.16, 0.58, 1]
+        opacity.duration = duration
+
+        let group = CAAnimationGroup()
+        group.animations = [scale, opacity]
+        group.beginTime = startTime + delay
+        group.duration = duration
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        ringLayer.add(group, forKey: "celebration")
+    }
+
+    private func animateParticle(
+        _ particleLayer: CALayer,
+        vector: CGPoint,
+        index: Int,
+        startTime: CFTimeInterval
+    ) {
+        let duration = 0.70 + Double(index % 3) * 0.06
+        let middle = CGPoint(
+            x: celebrationCenter.x + vector.x * 0.48,
+            y: celebrationCenter.y + vector.y * 0.42 - 2.5
+        )
+        let end = CGPoint(
+            x: celebrationCenter.x + vector.x,
+            y: celebrationCenter.y + vector.y + 2
+        )
+
+        let position = CAKeyframeAnimation(keyPath: "position")
+        position.values = [
+            NSValue(point: celebrationCenter),
+            NSValue(point: middle),
+            NSValue(point: end),
+        ]
+        position.keyTimes = [0, 0.48, 1]
+        position.duration = duration
+
+        let opacity = CAKeyframeAnimation(keyPath: "opacity")
+        opacity.values = [0, 1, 0.92, 0]
+        opacity.keyTimes = [0, 0.14, 0.68, 1]
+        opacity.duration = duration
+
+        let scale = CAKeyframeAnimation(keyPath: "transform.scale")
+        scale.values = [0.3, 1.12, 0.72]
+        scale.keyTimes = [0, 0.34, 1]
+        scale.duration = duration
+
+        let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
+        rotation.fromValue = 0
+        rotation.toValue = (index.isMultiple(of: 2) ? 1.0 : -1.0)
+            * Double.pi * 1.25
+        rotation.duration = duration
+
+        let group = CAAnimationGroup()
+        group.animations = [position, opacity, scale, rotation]
+        group.beginTime = startTime + 0.14 + Double(index) * 0.006
+        group.duration = duration
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        particleLayer.add(group, forKey: "celebration")
+    }
+}
+
 final class QuotaPanelView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -769,6 +1120,9 @@ final class QuotaPanelView: NSView {
     private var hideButtonTrackingArea: NSTrackingArea?
     private var isHideButtonHovered = false
     private var taskBallViews: [TaskProgressKind: TaskBallImageView] = [:]
+    private let taskCompletionCelebrationView = TaskCompletionCelebrationView(
+        frame: .zero
+    )
     private var taskRowAttentionViews: [String: TaskAttentionRowView] = [:]
     private let collapsedTaskAttentionView = CollapsedTaskAttentionView(frame: .zero)
     private var attentionItems = TaskProgressSnapshot.reading.items
@@ -880,6 +1234,29 @@ final class QuotaPanelView: NSView {
 
     func prepareTaskEffectPreviewFrame() {
         taskRowAttentionViews.values.forEach { $0.preparePreviewFrame() }
+        let showsCompletionCelebration = dominantTaskProgressKind(
+            in: attentionItems
+        ) == .completed && usesLayeredTaskBalls && !isCollapsed
+        taskCompletionCelebrationView.preparePreviewFrame(
+            visible: showsCompletionCelebration
+        )
+        guard showsCompletionCelebration else { return }
+
+        let waveOffsets: [TaskProgressKind: CGFloat] = [
+            .completed: -3.8,
+            .waitingForInput: -2.5,
+            .reading: -1.2,
+            .running: -0.4,
+            .failed: 0,
+        ]
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (kind, offset) in waveOffsets {
+            taskBallViews[kind]?.layer?.setAffineTransform(
+                CGAffineTransform(translationX: 0, y: offset)
+            )
+        }
+        CATransaction.commit()
     }
 
     override func layout() {
@@ -905,6 +1282,7 @@ final class QuotaPanelView: NSView {
     }
 
     private func configureTaskAttentionViews() {
+        addSubview(taskCompletionCelebrationView)
         for specification in Self.taskBallSpecifications {
             guard let image = taskIcon(named: specification.assetName) else { continue }
             let imageView = TaskBallImageView(frame: .zero)
@@ -930,6 +1308,14 @@ final class QuotaPanelView: NSView {
         let showsBalls = usesLayeredTaskBalls && !isCollapsed
         let ballSize: CGFloat = 36
         let ballY = bodyRect.minY + 28
+        let celebrationBand = NSRect(
+            x: bodyRect.minX + 1,
+            y: bodyRect.minY + 29,
+            width: bodyRect.width - 2,
+            height: 36
+        )
+        taskCompletionCelebrationView.frame = celebrationBand
+        taskCompletionCelebrationView.alphaValue = showsBalls ? 1 : 0
         for specification in Self.taskBallSpecifications {
             guard let imageView = taskBallViews[specification.kind] else { continue }
             let centerX = bodyRect.minX
@@ -941,6 +1327,12 @@ final class QuotaPanelView: NSView {
                 height: ballSize
             )
             imageView.isHidden = !showsBalls
+        }
+        if let completedBall = taskBallViews[.completed] {
+            taskCompletionCelebrationView.updateCenter(CGPoint(
+                x: completedBall.frame.midX - celebrationBand.minX,
+                y: completedBall.frame.midY - celebrationBand.minY
+            ))
         }
 
         for (index, item) in taskProgress.items.enumerated() {
@@ -1012,6 +1404,16 @@ final class QuotaPanelView: NSView {
     private func updateTaskAnimationState() {
         let animationsEnabled = canAnimateTaskEffects
         let dominantKind = dominantTaskProgressKind(in: attentionItems)
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let showsReducedMotionCompletionHalo = !animationsEnabled
+            && !isCollapsed
+            && usesLayeredTaskBalls
+            && dominantKind == .completed
+            && reduceMotion
+        let retainsAnimatedCompletionCelebration = animationsEnabled
+            && !isCollapsed
+            && usesLayeredTaskBalls
+            && dominantKind == .completed
 
         syncTaskAttentionRowViews()
         collapsedTaskAttentionView.update(
@@ -1024,6 +1426,16 @@ final class QuotaPanelView: NSView {
             animationsEnabled: animationsEnabled && !isCollapsed
         )
 
+        taskCompletionCelebrationView.setReducedMotionHaloVisible(
+            showsReducedMotionCompletionHalo
+        )
+
+        if !retainsAnimatedCompletionCelebration
+            && !showsReducedMotionCompletionHalo
+        {
+            taskCompletionCelebrationView.stopAnimations()
+        }
+
         guard animationsEnabled else {
             for imageView in taskBallViews.values {
                 imageView.stopAnimations()
@@ -1032,7 +1444,7 @@ final class QuotaPanelView: NSView {
                 rowView.stopAnimations()
             }
             collapsedTaskAttentionView.stopAnimations()
-            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            if reduceMotion {
                 pendingAttentionEvents.removeAll(keepingCapacity: true)
             }
             return
@@ -1149,22 +1561,24 @@ final class QuotaPanelView: NSView {
         case .completed:
             activeLayer.add(Self.oneShotAnimation(
                 keyPath: "transform.scale",
-                values: [0.84, 1.16, 0.96, 1],
-                keyTimes: [0, 0.45, 0.72, 1],
-                duration: 0.8
+                values: [0.88, 1.22, 0.94, 1.07, 1],
+                keyTimes: [0, 0.28, 0.50, 0.72, 1],
+                duration: 0.82
             ), forKey: "entrance")
+            taskCompletionCelebrationView.play()
             let startTime = CACurrentMediaTime()
-            for (index, specification) in Self.taskBallSpecifications.enumerated() {
-                guard let imageLayer = taskBallViews[specification.kind]?.layer else {
+            for (index, kind) in taskCompletionWaveOrder.enumerated() {
+                guard let imageLayer = taskBallViews[kind]?.layer else {
                     continue
                 }
                 let wave = Self.oneShotAnimation(
                     keyPath: "transform.translation.y",
-                    values: [0, -2.8, 0],
-                    keyTimes: [0, 0.48, 1],
-                    duration: 0.48
+                    values: [0, -4.2, 0.8, 0],
+                    keyTimes: [0, 0.42, 0.68, 1],
+                    duration: 0.58
                 )
-                wave.beginTime = startTime + Double(index) * 0.07
+                wave.beginTime = startTime
+                    + Double(index) * taskCompletionCelebrationProfile.waveStagger
                 imageLayer.add(wave, forKey: "completionWave")
             }
         case .failed:
@@ -1186,6 +1600,7 @@ final class QuotaPanelView: NSView {
         for rowView in taskRowAttentionViews.values {
             rowView.stopAnimations()
         }
+        taskCompletionCelebrationView.stopAnimations()
         collapsedTaskAttentionView.stopAnimations()
         lastBallAnimationKind = nil
         lastBallAnimationsEnabled = false
