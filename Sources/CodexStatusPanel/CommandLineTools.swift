@@ -1468,10 +1468,15 @@ func runTaskProgressSelfTest() -> Never {
     let celebrationChecks = [
         celebration.ringCount == 2,
         celebration.particleCount == 14,
-        celebration.totalDuration == 1.25,
+        celebration.totalDuration == 10,
+        celebration.cycleDuration == 2,
+        celebration.cycleCount == 5,
+        celebration.totalDuration
+            == celebration.cycleDuration * Double(celebration.cycleCount),
         celebration.waveStagger > 0 && celebration.waveStagger < 0.1,
         celebration.waveTravelsFromCompletedBall,
-        !celebration.repeats,
+        celebration.repeats,
+        !celebration.clipsToBallBand,
         taskCompletionWaveOrder == [
             .completed,
             .waitingForInput,
@@ -1510,7 +1515,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; text-effects=8/8; celebration=7/7; list=pass; layout=pass; icons=4/4; balls=5/5")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; text-effects=8/8; celebration=11/11; list=pass; layout=pass; icons=4/4; balls=5/5")
     exit(0)
 }
 

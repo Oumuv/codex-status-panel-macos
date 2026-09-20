@@ -134,18 +134,24 @@ struct TaskCompletionCelebrationProfile: Equatable {
     let ringCount: Int
     let particleCount: Int
     let totalDuration: CFTimeInterval
+    let cycleDuration: CFTimeInterval
+    let cycleCount: Int
     let waveStagger: CFTimeInterval
     let waveTravelsFromCompletedBall: Bool
     let repeats: Bool
+    let clipsToBallBand: Bool
 }
 
 let taskCompletionCelebrationProfile = TaskCompletionCelebrationProfile(
     ringCount: 2,
     particleCount: 14,
-    totalDuration: 1.25,
+    totalDuration: 10,
+    cycleDuration: 2,
+    cycleCount: 5,
     waveStagger: 0.065,
     waveTravelsFromCompletedBall: true,
-    repeats: false
+    repeats: true,
+    clipsToBallBand: false
 )
 
 let taskCompletionWaveOrder: [TaskProgressKind] = [
@@ -695,20 +701,20 @@ private final class TaskCompletionCelebrationView: NSView {
     private var reducedMotionHaloVisible = false
 
     private static let particleVectors: [CGPoint] = [
-        CGPoint(x: -30, y: -5),
-        CGPoint(x: -25, y: -17),
-        CGPoint(x: -17, y: -23),
-        CGPoint(x: -7, y: -18),
-        CGPoint(x: 1, y: -25),
-        CGPoint(x: 10, y: -19),
-        CGPoint(x: 19, y: -22),
-        CGPoint(x: 27, y: -13),
-        CGPoint(x: 30, y: 0),
-        CGPoint(x: 25, y: 12),
-        CGPoint(x: 17, y: 19),
-        CGPoint(x: 6, y: 22),
-        CGPoint(x: -10, y: 20),
-        CGPoint(x: -24, y: 12),
+        CGPoint(x: -38, y: -3),
+        CGPoint(x: -33, y: -16),
+        CGPoint(x: -25, y: -25),
+        CGPoint(x: -14, y: -21),
+        CGPoint(x: -5, y: -26),
+        CGPoint(x: 3, y: -15),
+        CGPoint(x: 11, y: -10),
+        CGPoint(x: 15, y: -5),
+        CGPoint(x: 18, y: 1),
+        CGPoint(x: 16, y: 7),
+        CGPoint(x: 12, y: 12),
+        CGPoint(x: 1, y: 15),
+        CGPoint(x: -14, y: 13),
+        CGPoint(x: -30, y: 9),
     ]
 
     private static let particleColors: [NSColor] = [
@@ -739,8 +745,14 @@ private final class TaskCompletionCelebrationView: NSView {
         celebrationCenter = center
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        configureRingGeometry(innerRingLayer, diameter: 39)
-        configureRingGeometry(outerRingLayer, diameter: 46)
+        configureRingGeometry(
+            innerRingLayer,
+            size: CGSize(width: 42, height: 24)
+        )
+        configureRingGeometry(
+            outerRingLayer,
+            size: CGSize(width: 50, height: 26)
+        )
         for (index, particleLayer) in particleLayers.enumerated() {
             let vector = Self.particleVectors[index]
             particleLayer.position = CGPoint(
@@ -751,26 +763,25 @@ private final class TaskCompletionCelebrationView: NSView {
         CATransaction.commit()
     }
 
-    func play() {
+    func play(startTime: CFTimeInterval) {
         guard celebrationCenter != .zero else { return }
         stopAnimations()
-        let startTime = CACurrentMediaTime()
 
         animateRing(
             innerRingLayer,
-            delay: 0.08,
-            duration: 0.68,
-            startScale: 0.58,
-            endScale: 1.72,
+            delay: 0.06,
+            activeDuration: 0.74,
+            startScale: 0.62,
+            endScale: 1.52,
             peakOpacity: 0.92,
             startTime: startTime
         )
         animateRing(
             outerRingLayer,
-            delay: 0.16,
-            duration: 0.78,
-            startScale: 0.62,
-            endScale: 1.58,
+            delay: 0.14,
+            activeDuration: 0.86,
+            startScale: 0.66,
+            endScale: 1.42,
             peakOpacity: 0.56,
             startTime: startTime
         )
@@ -851,7 +862,7 @@ private final class TaskCompletionCelebrationView: NSView {
 
     private func configureLayers() {
         wantsLayer = true
-        layer?.masksToBounds = true
+        layer?.masksToBounds = taskCompletionCelebrationProfile.clipsToBallBand
         configureRingLayer(
             innerRingLayer,
             color: NSColor(
@@ -925,10 +936,13 @@ private final class TaskCompletionCelebrationView: NSView {
 
     private func configureRingGeometry(
         _ ringLayer: CAShapeLayer,
-        diameter: CGFloat
+        size: CGSize
     ) {
-        ringLayer.bounds = CGRect(x: 0, y: 0, width: diameter, height: diameter)
-        ringLayer.position = celebrationCenter
+        ringLayer.bounds = CGRect(origin: .zero, size: size)
+        ringLayer.position = CGPoint(
+            x: celebrationCenter.x - 18,
+            y: celebrationCenter.y
+        )
         ringLayer.path = CGPath(
             ellipseIn: ringLayer.bounds.insetBy(dx: 1.5, dy: 1.5),
             transform: nil
@@ -938,7 +952,7 @@ private final class TaskCompletionCelebrationView: NSView {
     private func animateRing(
         _ ringLayer: CAShapeLayer,
         delay: CFTimeInterval,
-        duration: CFTimeInterval,
+        activeDuration: CFTimeInterval,
         startScale: CGFloat,
         endScale: CGFloat,
         peakOpacity: Float,
@@ -947,18 +961,22 @@ private final class TaskCompletionCelebrationView: NSView {
         let scale = CAKeyframeAnimation(keyPath: "transform.scale")
         scale.values = [startScale, 1.08, endScale]
         scale.keyTimes = [0, 0.38, 1]
-        scale.duration = duration
+        scale.beginTime = delay
+        scale.duration = activeDuration
+        scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
 
         let opacity = CAKeyframeAnimation(keyPath: "opacity")
         opacity.values = [0, peakOpacity, peakOpacity * 0.56, 0]
         opacity.keyTimes = [0, 0.16, 0.58, 1]
-        opacity.duration = duration
+        opacity.beginTime = delay
+        opacity.duration = activeDuration
+        opacity.timingFunction = CAMediaTimingFunction(name: .easeOut)
 
         let group = CAAnimationGroup()
         group.animations = [scale, opacity]
-        group.beginTime = startTime + delay
-        group.duration = duration
-        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        group.beginTime = startTime
+        group.duration = taskCompletionCelebrationProfile.cycleDuration
+        group.repeatCount = Float(taskCompletionCelebrationProfile.cycleCount)
         ringLayer.add(group, forKey: "celebration")
     }
 
@@ -969,6 +987,7 @@ private final class TaskCompletionCelebrationView: NSView {
         startTime: CFTimeInterval
     ) {
         let duration = 0.70 + Double(index % 3) * 0.06
+        let delay = 0.12 + Double(index) * 0.006
         let middle = CGPoint(
             x: celebrationCenter.x + vector.x * 0.48,
             y: celebrationCenter.y + vector.y * 0.42 - 2.5
@@ -985,29 +1004,37 @@ private final class TaskCompletionCelebrationView: NSView {
             NSValue(point: end),
         ]
         position.keyTimes = [0, 0.48, 1]
+        position.beginTime = delay
         position.duration = duration
+        position.timingFunction = CAMediaTimingFunction(name: .easeOut)
 
         let opacity = CAKeyframeAnimation(keyPath: "opacity")
         opacity.values = [0, 1, 0.92, 0]
         opacity.keyTimes = [0, 0.14, 0.68, 1]
+        opacity.beginTime = delay
         opacity.duration = duration
+        opacity.timingFunction = CAMediaTimingFunction(name: .easeOut)
 
         let scale = CAKeyframeAnimation(keyPath: "transform.scale")
         scale.values = [0.3, 1.12, 0.72]
         scale.keyTimes = [0, 0.34, 1]
+        scale.beginTime = delay
         scale.duration = duration
+        scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
 
         let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
         rotation.fromValue = 0
         rotation.toValue = (index.isMultiple(of: 2) ? 1.0 : -1.0)
             * Double.pi * 1.25
+        rotation.beginTime = delay
         rotation.duration = duration
+        rotation.timingFunction = CAMediaTimingFunction(name: .easeOut)
 
         let group = CAAnimationGroup()
         group.animations = [position, opacity, scale, rotation]
-        group.beginTime = startTime + 0.14 + Double(index) * 0.006
-        group.duration = duration
-        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        group.beginTime = startTime
+        group.duration = taskCompletionCelebrationProfile.cycleDuration
+        group.repeatCount = Float(taskCompletionCelebrationProfile.cycleCount)
         particleLayer.add(group, forKey: "celebration")
     }
 }
@@ -1308,13 +1335,7 @@ final class QuotaPanelView: NSView {
         let showsBalls = usesLayeredTaskBalls && !isCollapsed
         let ballSize: CGFloat = 36
         let ballY = bodyRect.minY + 28
-        let celebrationBand = NSRect(
-            x: bodyRect.minX + 1,
-            y: bodyRect.minY + 29,
-            width: bodyRect.width - 2,
-            height: 36
-        )
-        taskCompletionCelebrationView.frame = celebrationBand
+        taskCompletionCelebrationView.frame = bounds
         taskCompletionCelebrationView.alphaValue = showsBalls ? 1 : 0
         for specification in Self.taskBallSpecifications {
             guard let imageView = taskBallViews[specification.kind] else { continue }
@@ -1330,8 +1351,10 @@ final class QuotaPanelView: NSView {
         }
         if let completedBall = taskBallViews[.completed] {
             taskCompletionCelebrationView.updateCenter(CGPoint(
-                x: completedBall.frame.midX - celebrationBand.minX,
-                y: completedBall.frame.midY - celebrationBand.minY
+                x: completedBall.frame.midX
+                    - taskCompletionCelebrationView.frame.minX,
+                y: completedBall.frame.midY
+                    - taskCompletionCelebrationView.frame.minY
             ))
         }
 
@@ -1559,26 +1582,29 @@ final class QuotaPanelView: NSView {
         case .waitingForInput:
             activeView.playRadarPing()
         case .completed:
-            activeLayer.add(Self.oneShotAnimation(
+            let startTime = CACurrentMediaTime()
+            let entrance = Self.completionCycleAnimation(
                 keyPath: "transform.scale",
                 values: [0.88, 1.22, 0.94, 1.07, 1],
                 keyTimes: [0, 0.28, 0.50, 0.72, 1],
-                duration: 0.82
-            ), forKey: "entrance")
-            taskCompletionCelebrationView.play()
-            let startTime = CACurrentMediaTime()
+                activeDuration: 0.82
+            )
+            entrance.beginTime = startTime
+            activeLayer.add(entrance, forKey: "entrance")
+            taskCompletionCelebrationView.play(startTime: startTime)
             for (index, kind) in taskCompletionWaveOrder.enumerated() {
                 guard let imageLayer = taskBallViews[kind]?.layer else {
                     continue
                 }
-                let wave = Self.oneShotAnimation(
+                let wave = Self.completionCycleAnimation(
                     keyPath: "transform.translation.y",
                     values: [0, -4.2, 0.8, 0],
                     keyTimes: [0, 0.42, 0.68, 1],
-                    duration: 0.58
+                    activeDuration: 0.58,
+                    delay: Double(index)
+                        * taskCompletionCelebrationProfile.waveStagger
                 )
                 wave.beginTime = startTime
-                    + Double(index) * taskCompletionCelebrationProfile.waveStagger
                 imageLayer.add(wave, forKey: "completionWave")
             }
         case .failed:
@@ -1619,6 +1645,41 @@ final class QuotaPanelView: NSView {
             duration: duration
         )
         animation.repeatCount = .infinity
+        return animation
+    }
+
+    private static func completionCycleAnimation(
+        keyPath: String,
+        values: [CGFloat],
+        keyTimes: [NSNumber],
+        activeDuration: CFTimeInterval,
+        delay: CFTimeInterval = 0
+    ) -> CAKeyframeAnimation {
+        let cycleDuration = taskCompletionCelebrationProfile.cycleDuration
+        var cycleValues = values
+        var cycleKeyTimes = keyTimes.map {
+            NSNumber(value: (delay + $0.doubleValue * activeDuration)
+                / cycleDuration)
+        }
+
+        if delay > 0, let firstValue = values.first {
+            cycleValues.insert(firstValue, at: 0)
+            cycleKeyTimes.insert(0, at: 0)
+        }
+        if let lastValue = values.last,
+           (cycleKeyTimes.last?.doubleValue ?? 0) < 1
+        {
+            cycleValues.append(lastValue)
+            cycleKeyTimes.append(1)
+        }
+
+        let animation = oneShotAnimation(
+            keyPath: keyPath,
+            values: cycleValues,
+            keyTimes: cycleKeyTimes,
+            duration: cycleDuration
+        )
+        animation.repeatCount = Float(taskCompletionCelebrationProfile.cycleCount)
         return animation
     }
 
