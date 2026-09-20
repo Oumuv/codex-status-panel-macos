@@ -115,6 +115,8 @@ for PREVIEW_MODE in \
     --preview-usage "$PREVIEW_MODE" >/dev/null
   /usr/bin/file "$PREVIEW_PATH" | /usr/bin/grep -q 'PNG image data'
 done
+echo "检查完成态动效像素几何..."
+"$ROOT/scripts/test-task-animation-visual.sh" "$BIN"
 echo "检查面板折叠文案..."
 /usr/bin/grep -R -q --include='*.swift' '"折叠"' "$SOURCE_DIR"
 if /usr/bin/grep -R -q --include='*.swift' '"隐藏"' "$SOURCE_DIR"; then
