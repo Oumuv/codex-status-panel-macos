@@ -70,6 +70,7 @@ struct TaskStatusTextEffectProfile: Equatable {
 }
 
 let taskStatusAmbientScanRepeatCount = Float.infinity
+let taskWaitingRadarLineWidth: CGFloat = 1.5
 
 func taskStatusTextEffectProfile(
     for kind: TaskProgressKind
@@ -157,14 +158,16 @@ let taskCompletionCelebrationProfile = TaskCompletionCelebrationProfile(
 )
 
 let taskCompletionWaveOrder: [TaskProgressKind] = [
-    .completed,
     .waitingForInput,
     .reading,
     .running,
     .failed,
 ]
 
-let taskCompletionRingDiameters: [CGFloat] = [30, 36]
+let taskCompletionRingDiameters: [CGFloat] = [34, 40]
+let taskCompletedBallScaleValues: [CGFloat] = [1, 1.20, 1]
+let taskCompletedBallScaleKeyTimes: [NSNumber] = [0, 0.45, 1]
+let taskCompletedBallScaleDuration: CFTimeInterval = 0.42
 let taskCompletedBallAssetPixelSize = CGSize(width: 160, height: 160)
 // Alpha 边界中心，坐标原点与当前翻转视图一致，位于素材左上角。
 let taskCompletedBallVisibleCenterInPixels = CGPoint(x: 84.5, y: 89.5)
@@ -197,6 +200,42 @@ func taskCompletedBallVisualCenter(in imageFrame: CGRect) -> CGPoint {
         y: imageFrame.midY
             + (taskCompletedBallVisibleCenterInPixels.y
                 - taskCompletedBallAssetPixelSize.height / 2) * imageScale
+    )
+}
+
+func taskCompletedBallVisualCenterUnitPoint(
+    isGeometryFlipped: Bool
+) -> CGPoint {
+    let normalizedX = taskCompletedBallVisibleCenterInPixels.x
+        / taskCompletedBallAssetPixelSize.width
+    let normalizedYFromTop = taskCompletedBallVisibleCenterInPixels.y
+        / taskCompletedBallAssetPixelSize.height
+    return CGPoint(
+        x: normalizedX,
+        y: isGeometryFlipped ? normalizedYFromTop : 1 - normalizedYFromTop
+    )
+}
+
+func taskCompletedBallPinnedTransform(
+    visualCenterOffset: CGPoint,
+    scale: CGFloat
+) -> CATransform3D {
+    var transform = CATransform3DMakeScale(scale, scale, 1)
+    transform.m41 = (1 - scale) * visualCenterOffset.x
+    transform.m42 = (1 - scale) * visualCenterOffset.y
+    return transform
+}
+
+func taskCompletedBallScaledFrame(
+    _ imageFrame: CGRect,
+    scale: CGFloat
+) -> CGRect {
+    let visualCenter = taskCompletedBallVisualCenter(in: imageFrame)
+    return CGRect(
+        x: visualCenter.x + (imageFrame.minX - visualCenter.x) * scale,
+        y: visualCenter.y + (imageFrame.minY - visualCenter.y) * scale,
+        width: imageFrame.width * scale,
+        height: imageFrame.height * scale
     )
 }
 
@@ -708,6 +747,49 @@ private final class TaskBallImageView: NSImageView {
         radarSweepLayer.removeAllAnimations()
     }
 
+    func completedBallVisualCenter(
+        convertedTo targetView: NSView
+    ) -> CGPoint? {
+        guard let superview else { return nil }
+        return superview.convert(
+            taskCompletedBallVisualCenter(in: frame),
+            to: targetView
+        )
+    }
+
+    func completedBallPinnedTransforms(
+        scales: [CGFloat]
+    ) -> [CATransform3D]? {
+        guard let layer else { return nil }
+        let bounds = layer.bounds
+        let visualCenter = completedBallVisualCenter(in: layer)
+        let layerAnchor = CGPoint(
+            x: bounds.minX + bounds.width * layer.anchorPoint.x,
+            y: bounds.minY + bounds.height * layer.anchorPoint.y
+        )
+        let visualCenterOffset = CGPoint(
+            x: visualCenter.x - layerAnchor.x,
+            y: visualCenter.y - layerAnchor.y
+        )
+        return scales.map {
+            taskCompletedBallPinnedTransform(
+                visualCenterOffset: visualCenterOffset,
+                scale: $0
+            )
+        }
+    }
+
+    private func completedBallVisualCenter(in layer: CALayer) -> CGPoint {
+        let bounds = layer.bounds
+        let unitPoint = taskCompletedBallVisualCenterUnitPoint(
+            isGeometryFlipped: layer.isGeometryFlipped
+        )
+        return CGPoint(
+            x: bounds.minX + bounds.width * unitPoint.x,
+            y: bounds.minY + bounds.height * unitPoint.y
+        )
+    }
+
     private func configureRadarLayer() {
         wantsLayer = true
         layer?.masksToBounds = false
@@ -718,7 +800,7 @@ private final class TaskBallImageView: NSImageView {
         radarSweepLayer.mask = radarRingMaskLayer
         radarRingMaskLayer.fillColor = NSColor.clear.cgColor
         radarRingMaskLayer.strokeColor = NSColor.white.cgColor
-        radarRingMaskLayer.lineWidth = 0.9
+        radarRingMaskLayer.lineWidth = taskWaitingRadarLineWidth
         radarRingMaskLayer.lineCap = .round
         radarRingMaskLayer.lineDashPattern = [2.2, 2.8]
         radarSweepLayer.actions = [
@@ -1278,7 +1360,6 @@ final class QuotaPanelView: NSView {
         guard showsCompletionCelebration else { return }
 
         let waveOffsets: [TaskProgressKind: CGFloat] = [
-            .completed: -3.8,
             .waitingForInput: -2.5,
             .reading: -1.2,
             .running: -0.4,
@@ -1289,6 +1370,12 @@ final class QuotaPanelView: NSView {
         for (kind, offset) in waveOffsets {
             taskBallViews[kind]?.layer?.setAffineTransform(
                 CGAffineTransform(translationX: 0, y: offset)
+            )
+        }
+        if let completedBall = taskBallViews[.completed] {
+            completedBall.frame = taskCompletedBallScaledFrame(
+                completedBall.frame,
+                scale: taskCompletedBallScaleValues[1]
             )
         }
         CATransaction.commit()
@@ -1357,16 +1444,12 @@ final class QuotaPanelView: NSView {
             )
             imageView.isHidden = !showsBalls
         }
-        if let completedBall = taskBallViews[.completed] {
-            let visualCenter = taskCompletedBallVisualCenter(
-                in: completedBall.frame
-            )
-            taskCompletionCelebrationView.updateCenter(CGPoint(
-                x: visualCenter.x
-                    - taskCompletionCelebrationView.frame.minX,
-                y: visualCenter.y
-                    - taskCompletionCelebrationView.frame.minY
-            ))
+        if let completedBall = taskBallViews[.completed],
+           let visualCenter = completedBall.completedBallVisualCenter(
+                convertedTo: taskCompletionCelebrationView
+           )
+        {
+            taskCompletionCelebrationView.updateCenter(visualCenter)
         }
 
         for (index, item) in taskProgress.items.enumerated() {
@@ -1594,11 +1677,16 @@ final class QuotaPanelView: NSView {
             activeView.playRadarPing()
         case .completed:
             let startTime = CACurrentMediaTime()
-            let entrance = Self.completionCycleAnimation(
-                keyPath: "transform.scale",
-                values: [0.88, 1.22, 0.94, 1.07, 1],
-                keyTimes: [0, 0.28, 0.50, 0.72, 1],
-                activeDuration: 0.82
+            guard let transformValues = activeView.completedBallPinnedTransforms(
+                scales: taskCompletedBallScaleValues
+            ) else {
+                fputs("无法计算完成球缩放中心补偿\n", stderr)
+                return
+            }
+            let entrance = Self.completionTransformCycleAnimation(
+                values: transformValues,
+                keyTimes: taskCompletedBallScaleKeyTimes,
+                activeDuration: taskCompletedBallScaleDuration
             )
             entrance.beginTime = startTime
             activeLayer.add(entrance, forKey: "entrance")
@@ -1612,7 +1700,7 @@ final class QuotaPanelView: NSView {
                     values: [0, -4.2, 0.8, 0],
                     keyTimes: [0, 0.42, 0.68, 1],
                     activeDuration: 0.58,
-                    delay: Double(index)
+                    delay: Double(index + 1)
                         * taskCompletionCelebrationProfile.waveStagger
                 )
                 wave.beginTime = startTime
@@ -1691,6 +1779,32 @@ final class QuotaPanelView: NSView {
             duration: cycleDuration
         )
         animation.repeatCount = Float(taskCompletionCelebrationProfile.cycleCount)
+        return animation
+    }
+
+    private static func completionTransformCycleAnimation(
+        values: [CATransform3D],
+        keyTimes: [NSNumber],
+        activeDuration: CFTimeInterval
+    ) -> CAKeyframeAnimation {
+        let cycleDuration = taskCompletionCelebrationProfile.cycleDuration
+        var cycleValues = values
+        var cycleKeyTimes = keyTimes.map {
+            NSNumber(value: $0.doubleValue * activeDuration / cycleDuration)
+        }
+        if let lastValue = values.last,
+           (cycleKeyTimes.last?.doubleValue ?? 0) < 1
+        {
+            cycleValues.append(lastValue)
+            cycleKeyTimes.append(1)
+        }
+
+        let animation = CAKeyframeAnimation(keyPath: "transform")
+        animation.values = cycleValues.map { NSValue(caTransform3D: $0) }
+        animation.keyTimes = cycleKeyTimes
+        animation.duration = cycleDuration
+        animation.repeatCount = Float(taskCompletionCelebrationProfile.cycleCount)
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         return animation
     }
 

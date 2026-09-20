@@ -41,6 +41,24 @@ private struct PixelBounds {
             y: (CGFloat(minY + maxY) + 1) / 2
         )
     }
+
+    var width: Int { maxX - minX + 1 }
+    var height: Int { maxY - minY + 1 }
+}
+
+private struct PixelRegion {
+    let bounds: PixelBounds
+    let points: [CGPoint]
+}
+
+private struct PixelCircle {
+    let center: CGPoint
+    let radius: CGFloat
+}
+
+private struct DetectedRing {
+    let bounds: PixelBounds
+    let circle: PixelCircle
 }
 
 private enum VerificationError: LocalizedError {
@@ -218,64 +236,133 @@ private func isOuterRingPixel(
     alpha: Int
 ) -> Bool {
     alpha > 0
-        && red < 40
+        && red < 80
         && green > 70
-        && blue > 80
+        && blue > 70
         && green - red > 45
-        && blue - red > 60
-        && abs(green - blue) < 30
+        && blue - red > 40
+        && abs(green - blue) < 45
 }
 
-private func ringExtrema(
+private func median(_ values: [CGFloat]) -> CGFloat? {
+    guard !values.isEmpty else { return nil }
+    let sorted = values.sorted()
+    let middle = sorted.count / 2
+    if sorted.count.isMultiple(of: 2) {
+        return (sorted[middle - 1] + sorted[middle]) / 2
+    }
+    return sorted[middle]
+}
+
+private func detectOuterRing(
     in image: PixelImage,
     searchX: Range<Int>,
-    searchY: Range<Int>,
-    around center: CGPoint
-) throws -> PixelBounds {
-    let sampleX = min(
-        searchX.upperBound - 1,
-        max(searchX.lowerBound, Int(floor(center.x)))
+    searchY: Range<Int>
+) throws -> DetectedRing {
+    var candidates = [Bool](
+        repeating: false,
+        count: image.width * image.height
     )
-    let sampleY = min(
-        searchY.upperBound - 1,
-        max(searchY.lowerBound, Int(floor(center.y)))
-    )
-    var result = PixelBounds(
-        minX: image.width,
-        minY: image.height,
-        maxX: -1,
-        maxY: -1
-    )
-
-    for x in searchX {
-        let pixel = image.rgba(x: x, y: sampleY)
-        if isOuterRingPixel(
-            red: pixel.red,
-            green: pixel.green,
-            blue: pixel.blue,
-            alpha: pixel.alpha
-        ) {
-            result.minX = min(result.minX, x)
-            result.maxX = max(result.maxX, x)
-        }
-    }
     for y in searchY {
-        let pixel = image.rgba(x: sampleX, y: y)
-        if isOuterRingPixel(
-            red: pixel.red,
-            green: pixel.green,
-            blue: pixel.blue,
-            alpha: pixel.alpha
-        ) {
-            result.minY = min(result.minY, y)
-            result.maxY = max(result.maxY, y)
+        for x in searchX {
+            let pixel = image.rgba(x: x, y: y)
+            candidates[y * image.width + x] = isOuterRingPixel(
+                red: pixel.red,
+                green: pixel.green,
+                blue: pixel.blue,
+                alpha: pixel.alpha
+            )
         }
     }
 
-    guard result.maxX >= result.minX, result.maxY >= result.minY else {
-        throw VerificationError.detection("没有在绿球中心轴线上检测到完整外环")
+    var visited = [Bool](repeating: false, count: candidates.count)
+    var ringRegions: [PixelRegion] = []
+    for y in searchY {
+        for x in searchX {
+            let start = y * image.width + x
+            guard candidates[start], !visited[start] else { continue }
+
+            var queue = [start]
+            var cursor = 0
+            var regionBounds = PixelBounds(
+                minX: x,
+                minY: y,
+                maxX: x,
+                maxY: y
+            )
+            visited[start] = true
+            while cursor < queue.count {
+                let index = queue[cursor]
+                cursor += 1
+                let currentX = index % image.width
+                let currentY = index / image.width
+                regionBounds.minX = min(regionBounds.minX, currentX)
+                regionBounds.minY = min(regionBounds.minY, currentY)
+                regionBounds.maxX = max(regionBounds.maxX, currentX)
+                regionBounds.maxY = max(regionBounds.maxY, currentY)
+
+                for offsetY in -1...1 {
+                    for offsetX in -1...1 where offsetX != 0 || offsetY != 0 {
+                        let neighborX = currentX + offsetX
+                        let neighborY = currentY + offsetY
+                        guard searchX.contains(neighborX),
+                              searchY.contains(neighborY)
+                        else { continue }
+                        let neighbor = neighborY * image.width + neighborX
+                        guard candidates[neighbor], !visited[neighbor] else {
+                            continue
+                        }
+                        visited[neighbor] = true
+                        queue.append(neighbor)
+                    }
+                }
+            }
+
+            guard min(regionBounds.width, regionBounds.height) >= 16 else {
+                continue
+            }
+            ringRegions.append(PixelRegion(
+                bounds: regionBounds,
+                points: queue.map {
+                    CGPoint(
+                        x: CGFloat($0 % image.width) + 0.5,
+                        y: CGFloat($0 / image.width) + 0.5
+                    )
+                }
+            ))
+        }
     }
-    return result
+
+    guard let firstRegion = ringRegions.first else {
+        throw VerificationError.detection("没有独立检测到完整的圆形外环")
+    }
+    let ringBounds = ringRegions.dropFirst().reduce(firstRegion.bounds) { result, region in
+        PixelBounds(
+            minX: min(result.minX, region.bounds.minX),
+            minY: min(result.minY, region.bounds.minY),
+            maxX: max(result.maxX, region.bounds.maxX),
+            maxY: max(result.maxY, region.bounds.maxY)
+        )
+    }
+    let ringPoints = ringRegions.flatMap(\.points)
+    let edgeBand = max(1, Int(round(CGFloat(ringBounds.width) * 0.02)))
+    let leftLimit = CGFloat(ringBounds.minX + edgeBand)
+    let rightLimit = CGFloat(ringBounds.maxX - edgeBand + 1)
+    guard let leftCenterY = median(
+        ringPoints.filter { $0.x <= leftLimit }.map(\.y)
+    ), let rightCenterY = median(
+        ringPoints.filter { $0.x >= rightLimit }.map(\.y)
+    ) else {
+        throw VerificationError.detection("无法从外环两侧弧段计算圆心")
+    }
+    let circle = PixelCircle(
+        center: CGPoint(
+            x: ringBounds.center.x,
+            y: (leftCenterY + rightCenterY) / 2
+        ),
+        radius: CGFloat(ringBounds.width) / 2
+    )
+    return DetectedRing(bounds: ringBounds, circle: circle)
 }
 
 private func format(_ value: CGFloat) -> String {
@@ -307,24 +394,27 @@ private func run() throws {
         yRange: searchY,
         matching: isCompletedBallPixel
     )
-    let ringBounds = try ringExtrema(
+    let ring = try detectOuterRing(
         in: preview,
         searchX: searchX,
-        searchY: searchY,
-        around: ballBounds.center
+        searchY: searchY
     )
+    let ringBounds = ring.bounds
 
     let scale = CGFloat(Double(preview.width) / options.logicalPanelWidth)
     guard scale > 0 else {
         throw VerificationError.verification("无法从预览宽度计算 backing scale")
     }
     let centerErrorPixels = hypot(
-        ballBounds.center.x - ringBounds.center.x,
-        ballBounds.center.y - ringBounds.center.y
+        ballBounds.center.x - ring.circle.center.x,
+        ballBounds.center.y - ring.circle.center.y
     )
     let centerErrorPoints = centerErrorPixels / scale
-    let ringWidthPixels = CGFloat(ringBounds.maxX - ringBounds.minX + 1)
-    let ringHeightPixels = CGFloat(ringBounds.maxY - ringBounds.minY + 1)
+    let ringWidthPixels = CGFloat(ringBounds.width)
+    let ringHeightPixels = max(
+        0,
+        (ring.circle.center.y - CGFloat(ringBounds.minY)) * 2
+    )
     let circleDeltaPoints = abs(ringWidthPixels - ringHeightPixels) / scale
     let ringIsClipped = ringBounds.minX <= 0
         || ringBounds.minY <= 0
@@ -357,10 +447,11 @@ private func run() throws {
             + "\(format(ballBounds.center.y)))px"
     )
     print(
-        "outerRingExtrema=x[\(ringBounds.minX),\(ringBounds.maxX)]"
-            + " y[\(ringBounds.minY),\(ringBounds.maxY)]"
-            + " center=(\(format(ringBounds.center.x)),"
-            + "\(format(ringBounds.center.y)))px"
+        "outerRingBounds=[\(ringBounds.minX),\(ringBounds.minY)]"
+            + "-[\(ringBounds.maxX),\(ringBounds.maxY)]"
+            + " fittedCenter=(\(format(ring.circle.center.x)),"
+            + "\(format(ring.circle.center.y)))px"
+            + " radius=\(format(ring.circle.radius))px"
     )
     print(
         "centerError=\(format(centerErrorPoints))pt/"

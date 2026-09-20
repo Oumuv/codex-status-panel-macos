@@ -1440,6 +1440,55 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
+    let sampleVisualCenterOffset = CGPoint(x: 1.0125, y: 2.1375)
+    let pinnedTransforms = taskCompletedBallScaleValues.map {
+        taskCompletedBallPinnedTransform(
+            visualCenterOffset: sampleVisualCenterOffset,
+            scale: $0
+        )
+    }
+    let flippedVisualCenterUnitPoint = taskCompletedBallVisualCenterUnitPoint(
+        isGeometryFlipped: true
+    )
+    let unflippedVisualCenterUnitPoint = taskCompletedBallVisualCenterUnitPoint(
+        isGeometryFlipped: false
+    )
+    let pinnedCenters = zip(
+        pinnedTransforms,
+        taskCompletedBallScaleValues
+    ).map { transform, scale in
+        CGPoint(
+            x: transform.m41 + sampleVisualCenterOffset.x * scale,
+            y: transform.m42 + sampleVisualCenterOffset.y * scale
+        )
+    }
+    let sampleBallFrame = CGRect(x: 100, y: 40, width: 36, height: 36)
+    let sampleBallCenter = taskCompletedBallVisualCenter(in: sampleBallFrame)
+    let sampleScaledBallCenter = taskCompletedBallVisualCenter(
+        in: taskCompletedBallScaledFrame(sampleBallFrame, scale: 1.20)
+    )
+    let taskBallEffectChecks = [
+        taskWaitingRadarLineWidth == 1.5,
+        taskCompletedBallScaleValues == [1, 1.20, 1],
+        taskCompletedBallScaleKeyTimes == [0, 0.45, 1],
+        taskCompletedBallScaleDuration == 0.42,
+        abs(flippedVisualCenterUnitPoint.x - 0.528125) < 0.0001
+            && abs(flippedVisualCenterUnitPoint.y - 0.559375) < 0.0001,
+        abs(unflippedVisualCenterUnitPoint.x - 0.528125) < 0.0001
+            && abs(unflippedVisualCenterUnitPoint.y - 0.440625) < 0.0001,
+        pinnedCenters.allSatisfy {
+            abs($0.x - sampleVisualCenterOffset.x) < 0.0001
+                && abs($0.y - sampleVisualCenterOffset.y) < 0.0001
+        },
+        pinnedTransforms.allSatisfy { CATransform3DIsAffine($0) },
+        abs(sampleScaledBallCenter.x - sampleBallCenter.x) < 0.0001
+            && abs(sampleScaledBallCenter.y - sampleBallCenter.y) < 0.0001,
+    ]
+    guard taskBallEffectChecks.allSatisfy({ $0 }) else {
+        fputs("task ball effect profile failed\n", stderr)
+        exit(1)
+    }
+
     let runningTextEffect = taskStatusTextEffectProfile(for: .running)
     let waitingTextEffect = taskStatusTextEffectProfile(for: .waitingForInput)
     let completedTextEffect = taskStatusTextEffectProfile(for: .completed)
@@ -1497,8 +1546,8 @@ func runTaskProgressSelfTest() -> Never {
         celebration.waveTravelsFromCompletedBall,
         celebration.repeats,
         !celebration.clipsToBallBand,
-        taskCompletionRingDiameters.count == celebration.ringCount
-            && taskCompletionRingDiameters.allSatisfy({ $0 > 0 }),
+        taskCompletionRingDiameters == [34, 40]
+            && taskCompletionRingDiameters.count == celebration.ringCount,
         taskCompletedBallAssetPixelSize == CGSize(width: 160, height: 160),
         taskCompletedBallVisibleCenterInPixels == CGPoint(x: 84.5, y: 89.5),
         abs(completedBallVisualCenter.x - 119.0125) < 0.0001
@@ -1507,7 +1556,6 @@ func runTaskProgressSelfTest() -> Never {
         abs(particleVectorSum.x) < 0.001
             && abs(particleVectorSum.y) < 0.001,
         taskCompletionWaveOrder == [
-            .completed,
             .waitingForInput,
             .reading,
             .running,
@@ -1544,7 +1592,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; text-effects=10/10; celebration=17/17; list=pass; layout=pass; icons=4/4; balls=5/5")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; ball-effects=9/9; text-effects=10/10; celebration=17/17; list=pass; layout=pass; icons=4/4; balls=5/5")
     exit(0)
 }
 
