@@ -1446,16 +1446,27 @@ func runTaskProgressSelfTest() -> Never {
     let failedTextEffect = taskStatusTextEffectProfile(for: .failed)
     let readingTextEffect = taskStatusTextEffectProfile(for: .reading)
     let idleTextEffect = taskStatusTextEffectProfile(for: .idle)
+    let persistentTextEffects = [
+        readingTextEffect,
+        runningTextEffect,
+        waitingTextEffect,
+        completedTextEffect,
+        failedTextEffect,
+    ]
     let textEffectChecks = [
+        taskStatusAmbientScanRepeatCount.isInfinite,
+        persistentTextEffects.allSatisfy {
+            $0.ambientScanDuration != nil && $0.ambientActiveFraction > 0
+        },
         runningTextEffect.ambientScanDuration == 2.4,
         runningTextEffect.ambientActiveFraction > 0.5,
         waitingTextEffect.entranceScanCount == 3,
         waitingTextEffect.ambientScanDuration != nil,
         completedTextEffect.entranceScanCount == 1
-            && completedTextEffect.ambientScanDuration == nil,
+            && completedTextEffect.ambientScanDuration != nil,
         failedTextEffect.usesGlitchEntrance
             && failedTextEffect.ambientScanDuration != nil,
-        readingTextEffect.ambientScanDuration == nil,
+        readingTextEffect.ambientScanDuration != nil,
         idleTextEffect.ambientScanDuration == nil
             && idleTextEffect.glowOpacity == 0,
     ]
@@ -1470,6 +1481,10 @@ func runTaskProgressSelfTest() -> Never {
     ) {
         CGPoint(x: $0.x + $1.x, y: $0.y + $1.y)
     }
+    let completedBallFrame = CGRect(x: 100, y: 40, width: 36, height: 36)
+    let completedBallVisualCenter = taskCompletedBallVisualCenter(
+        in: completedBallFrame
+    )
     let celebrationChecks = [
         celebration.ringCount == 2,
         celebration.particleCount == 14,
@@ -1484,7 +1499,10 @@ func runTaskProgressSelfTest() -> Never {
         !celebration.clipsToBallBand,
         taskCompletionRingDiameters.count == celebration.ringCount
             && taskCompletionRingDiameters.allSatisfy({ $0 > 0 }),
-        taskCompletionRingCenterOffset == .zero,
+        taskCompletedBallAssetPixelSize == CGSize(width: 160, height: 160),
+        taskCompletedBallVisibleCenterInPixels == CGPoint(x: 84.5, y: 89.5),
+        abs(completedBallVisualCenter.x - 119.0125) < 0.0001
+            && abs(completedBallVisualCenter.y - 60.1375) < 0.0001,
         taskCompletionParticleVectors.count == celebration.particleCount,
         abs(particleVectorSum.x) < 0.001
             && abs(particleVectorSum.y) < 0.001,
@@ -1526,7 +1544,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; text-effects=8/8; celebration=15/15; list=pass; layout=pass; icons=4/4; balls=5/5")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; text-effects=10/10; celebration=17/17; list=pass; layout=pass; icons=4/4; balls=5/5")
     exit(0)
 }
 

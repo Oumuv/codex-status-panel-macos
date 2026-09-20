@@ -69,14 +69,16 @@ struct TaskStatusTextEffectProfile: Equatable {
     let glowOpacity: Float
 }
 
+let taskStatusAmbientScanRepeatCount = Float.infinity
+
 func taskStatusTextEffectProfile(
     for kind: TaskProgressKind
 ) -> TaskStatusTextEffectProfile {
     switch kind {
     case .reading:
         return TaskStatusTextEffectProfile(
-            ambientScanDuration: nil,
-            ambientActiveFraction: 0,
+            ambientScanDuration: 3.6,
+            ambientActiveFraction: 0.46,
             entranceScanCount: 0,
             entranceScanDuration: 0,
             usesGlitchEntrance: false,
@@ -102,8 +104,8 @@ func taskStatusTextEffectProfile(
         )
     case .completed:
         return TaskStatusTextEffectProfile(
-            ambientScanDuration: nil,
-            ambientActiveFraction: 0,
+            ambientScanDuration: 3.2,
+            ambientActiveFraction: 0.52,
             entranceScanCount: 1,
             entranceScanDuration: 0.72,
             usesGlitchEntrance: false,
@@ -163,7 +165,9 @@ let taskCompletionWaveOrder: [TaskProgressKind] = [
 ]
 
 let taskCompletionRingDiameters: [CGFloat] = [30, 36]
-let taskCompletionRingCenterOffset = CGPoint.zero
+let taskCompletedBallAssetPixelSize = CGSize(width: 160, height: 160)
+// Alpha 边界中心，坐标原点与当前翻转视图一致，位于素材左上角。
+let taskCompletedBallVisibleCenterInPixels = CGPoint(x: 84.5, y: 89.5)
 let taskCompletionParticleVectors: [CGPoint] = [
     CGPoint(x: 20, y: 0),
     CGPoint(x: 18, y: 6),
@@ -180,6 +184,21 @@ let taskCompletionParticleVectors: [CGPoint] = [
     CGPoint(x: 13, y: -11),
     CGPoint(x: 18, y: -6),
 ]
+
+func taskCompletedBallVisualCenter(in imageFrame: CGRect) -> CGPoint {
+    let imageScale = min(
+        imageFrame.width / taskCompletedBallAssetPixelSize.width,
+        imageFrame.height / taskCompletedBallAssetPixelSize.height
+    )
+    return CGPoint(
+        x: imageFrame.midX
+            + (taskCompletedBallVisibleCenterInPixels.x
+                - taskCompletedBallAssetPixelSize.width / 2) * imageScale,
+        y: imageFrame.midY
+            + (taskCompletedBallVisibleCenterInPixels.y
+                - taskCompletedBallAssetPixelSize.height / 2) * imageScale
+    )
+}
 
 private final class TaskAttentionRowView: NSView {
     private let statusTextLayer = CATextLayer()
@@ -281,7 +300,7 @@ private final class TaskAttentionRowView: NSView {
         ambientScanLayer.add(Self.scanAnimation(
             duration: duration,
             activeFraction: profile.ambientActiveFraction,
-            repeatCount: .infinity
+            repeatCount: taskStatusAmbientScanRepeatCount
         ), forKey: "ambientScan")
 
         if kind == .waitingForInput || kind == .failed {
@@ -939,10 +958,7 @@ private final class TaskCompletionCelebrationView: NSView {
             width: diameter,
             height: diameter
         )
-        ringLayer.position = CGPoint(
-            x: celebrationCenter.x + taskCompletionRingCenterOffset.x,
-            y: celebrationCenter.y + taskCompletionRingCenterOffset.y
-        )
+        ringLayer.position = celebrationCenter
         ringLayer.path = CGPath(
             ellipseIn: ringLayer.bounds.insetBy(dx: 1.5, dy: 1.5),
             transform: nil
@@ -1342,10 +1358,13 @@ final class QuotaPanelView: NSView {
             imageView.isHidden = !showsBalls
         }
         if let completedBall = taskBallViews[.completed] {
+            let visualCenter = taskCompletedBallVisualCenter(
+                in: completedBall.frame
+            )
             taskCompletionCelebrationView.updateCenter(CGPoint(
-                x: completedBall.frame.midX
+                x: visualCenter.x
                     - taskCompletionCelebrationView.frame.minX,
-                y: completedBall.frame.midY
+                y: visualCenter.y
                     - taskCompletionCelebrationView.frame.minY
             ))
         }
