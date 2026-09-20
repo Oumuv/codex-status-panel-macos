@@ -162,6 +162,25 @@ let taskCompletionWaveOrder: [TaskProgressKind] = [
     .failed,
 ]
 
+let taskCompletionRingDiameters: [CGFloat] = [30, 36]
+let taskCompletionRingCenterOffset = CGPoint.zero
+let taskCompletionParticleVectors: [CGPoint] = [
+    CGPoint(x: 20, y: 0),
+    CGPoint(x: 18, y: 6),
+    CGPoint(x: 12, y: 11),
+    CGPoint(x: 4, y: 14),
+    CGPoint(x: -5, y: 14),
+    CGPoint(x: -13, y: 11),
+    CGPoint(x: -18, y: 6),
+    CGPoint(x: -20, y: 0),
+    CGPoint(x: -18, y: -6),
+    CGPoint(x: -12, y: -11),
+    CGPoint(x: -4, y: -14),
+    CGPoint(x: 5, y: -14),
+    CGPoint(x: 13, y: -11),
+    CGPoint(x: 18, y: -6),
+]
+
 private final class TaskAttentionRowView: NSView {
     private let statusTextLayer = CATextLayer()
     private let ambientScanLayer = CAGradientLayer()
@@ -700,23 +719,6 @@ private final class TaskCompletionCelebrationView: NSView {
     private var celebrationCenter = CGPoint.zero
     private var reducedMotionHaloVisible = false
 
-    private static let particleVectors: [CGPoint] = [
-        CGPoint(x: -38, y: -3),
-        CGPoint(x: -33, y: -16),
-        CGPoint(x: -25, y: -25),
-        CGPoint(x: -14, y: -21),
-        CGPoint(x: -5, y: -26),
-        CGPoint(x: 3, y: -15),
-        CGPoint(x: 11, y: -10),
-        CGPoint(x: 15, y: -5),
-        CGPoint(x: 18, y: 1),
-        CGPoint(x: 16, y: 7),
-        CGPoint(x: 12, y: 12),
-        CGPoint(x: 1, y: 15),
-        CGPoint(x: -14, y: 13),
-        CGPoint(x: -30, y: 9),
-    ]
-
     private static let particleColors: [NSColor] = [
         NSColor(calibratedRed: 0.22, green: 1, blue: 0.70, alpha: 1),
         NSColor(calibratedRed: 0.13, green: 0.86, blue: 1, alpha: 1),
@@ -747,14 +749,14 @@ private final class TaskCompletionCelebrationView: NSView {
         CATransaction.setDisableActions(true)
         configureRingGeometry(
             innerRingLayer,
-            size: CGSize(width: 42, height: 24)
+            diameter: taskCompletionRingDiameters[0]
         )
         configureRingGeometry(
             outerRingLayer,
-            size: CGSize(width: 50, height: 26)
+            diameter: taskCompletionRingDiameters[1]
         )
         for (index, particleLayer) in particleLayers.enumerated() {
-            let vector = Self.particleVectors[index]
+            let vector = taskCompletionParticleVectors[index]
             particleLayer.position = CGPoint(
                 x: center.x + vector.x,
                 y: center.y + vector.y
@@ -781,7 +783,7 @@ private final class TaskCompletionCelebrationView: NSView {
             delay: 0.14,
             activeDuration: 0.86,
             startScale: 0.66,
-            endScale: 1.42,
+            endScale: 1.30,
             peakOpacity: 0.56,
             startTime: startTime
         )
@@ -789,7 +791,7 @@ private final class TaskCompletionCelebrationView: NSView {
         for (index, particleLayer) in particleLayers.enumerated() {
             animateParticle(
                 particleLayer,
-                vector: Self.particleVectors[index],
+                vector: taskCompletionParticleVectors[index],
                 index: index,
                 startTime: startTime
             )
@@ -816,22 +818,17 @@ private final class TaskCompletionCelebrationView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         innerRingLayer.opacity = 0.76
-        innerRingLayer.transform = CATransform3DMakeScale(1.28, 1.28, 1)
+        innerRingLayer.transform = CATransform3DMakeScale(1.32, 1.32, 1)
         outerRingLayer.opacity = 0.42
-        outerRingLayer.transform = CATransform3DMakeScale(1.48, 1.48, 1)
+        outerRingLayer.transform = CATransform3DMakeScale(1.30, 1.30, 1)
         for (index, particleLayer) in particleLayers.enumerated() {
-            let vector = Self.particleVectors[index]
+            let vector = taskCompletionParticleVectors[index]
             particleLayer.position = CGPoint(
                 x: celebrationCenter.x + vector.x * 0.68,
                 y: celebrationCenter.y + vector.y * 0.68
             )
             particleLayer.opacity = index.isMultiple(of: 4) ? 0.58 : 0.92
-            particleLayer.transform = CATransform3DMakeRotation(
-                CGFloat(index) * 0.48,
-                0,
-                0,
-                1
-            )
+            particleLayer.transform = CATransform3DIdentity
         }
         CATransaction.commit()
     }
@@ -849,7 +846,7 @@ private final class TaskCompletionCelebrationView: NSView {
         innerRingLayer.transform = CATransform3DIdentity
         outerRingLayer.transform = CATransform3DIdentity
         for (index, particleLayer) in particleLayers.enumerated() {
-            let vector = Self.particleVectors[index]
+            let vector = taskCompletionParticleVectors[index]
             particleLayer.opacity = 0
             particleLayer.position = CGPoint(
                 x: celebrationCenter.x + vector.x,
@@ -888,12 +885,10 @@ private final class TaskCompletionCelebrationView: NSView {
 
         for index in 0..<taskCompletionCelebrationProfile.particleCount {
             let particleLayer = CALayer()
-            let isDot = index.isMultiple(of: 4)
-            let size = isDot
-                ? CGSize(width: 3.2, height: 3.2)
-                : CGSize(width: 1.8, height: index.isMultiple(of: 3) ? 6 : 4.6)
+            let diameter: CGFloat = index.isMultiple(of: 4) ? 3.2 : 2.4
+            let size = CGSize(width: diameter, height: diameter)
             particleLayer.bounds = CGRect(origin: .zero, size: size)
-            particleLayer.cornerRadius = isDot ? size.width / 2 : 0.9
+            particleLayer.cornerRadius = diameter / 2
             particleLayer.backgroundColor = Self.particleColors[
                 index % Self.particleColors.count
             ].cgColor
@@ -922,7 +917,7 @@ private final class TaskCompletionCelebrationView: NSView {
         ringLayer.lineWidth = lineWidth
         ringLayer.shadowColor = color.cgColor
         ringLayer.shadowOpacity = 0.68
-        ringLayer.shadowRadius = 3
+        ringLayer.shadowRadius = 2.4
         ringLayer.shadowOffset = .zero
         ringLayer.opacity = 0
         ringLayer.actions = [
@@ -936,12 +931,17 @@ private final class TaskCompletionCelebrationView: NSView {
 
     private func configureRingGeometry(
         _ ringLayer: CAShapeLayer,
-        size: CGSize
+        diameter: CGFloat
     ) {
-        ringLayer.bounds = CGRect(origin: .zero, size: size)
+        ringLayer.bounds = CGRect(
+            x: 0,
+            y: 0,
+            width: diameter,
+            height: diameter
+        )
         ringLayer.position = CGPoint(
-            x: celebrationCenter.x - 18,
-            y: celebrationCenter.y
+            x: celebrationCenter.x + taskCompletionRingCenterOffset.x,
+            y: celebrationCenter.y + taskCompletionRingCenterOffset.y
         )
         ringLayer.path = CGPath(
             ellipseIn: ringLayer.bounds.insetBy(dx: 1.5, dy: 1.5),
@@ -1022,16 +1022,8 @@ private final class TaskCompletionCelebrationView: NSView {
         scale.duration = duration
         scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
 
-        let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
-        rotation.fromValue = 0
-        rotation.toValue = (index.isMultiple(of: 2) ? 1.0 : -1.0)
-            * Double.pi * 1.25
-        rotation.beginTime = delay
-        rotation.duration = duration
-        rotation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-
         let group = CAAnimationGroup()
-        group.animations = [position, opacity, scale, rotation]
+        group.animations = [position, opacity, scale]
         group.beginTime = startTime
         group.duration = taskCompletionCelebrationProfile.cycleDuration
         group.repeatCount = Float(taskCompletionCelebrationProfile.cycleCount)

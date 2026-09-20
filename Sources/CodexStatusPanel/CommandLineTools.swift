@@ -1465,6 +1465,11 @@ func runTaskProgressSelfTest() -> Never {
     }
 
     let celebration = taskCompletionCelebrationProfile
+    let particleVectorSum = taskCompletionParticleVectors.reduce(
+        CGPoint.zero
+    ) {
+        CGPoint(x: $0.x + $1.x, y: $0.y + $1.y)
+    }
     let celebrationChecks = [
         celebration.ringCount == 2,
         celebration.particleCount == 14,
@@ -1477,6 +1482,12 @@ func runTaskProgressSelfTest() -> Never {
         celebration.waveTravelsFromCompletedBall,
         celebration.repeats,
         !celebration.clipsToBallBand,
+        taskCompletionRingDiameters.count == celebration.ringCount
+            && taskCompletionRingDiameters.allSatisfy({ $0 > 0 }),
+        taskCompletionRingCenterOffset == .zero,
+        taskCompletionParticleVectors.count == celebration.particleCount,
+        abs(particleVectorSum.x) < 0.001
+            && abs(particleVectorSum.y) < 0.001,
         taskCompletionWaveOrder == [
             .completed,
             .waitingForInput,
@@ -1515,7 +1526,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; text-effects=8/8; celebration=11/11; list=pass; layout=pass; icons=4/4; balls=5/5")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; text-effects=8/8; celebration=15/15; list=pass; layout=pass; icons=4/4; balls=5/5")
     exit(0)
 }
 
