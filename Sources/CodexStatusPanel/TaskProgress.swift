@@ -1,6 +1,7 @@
 // Codex 额度响应模型，以及本机任务日志的发现、解析和展示状态整理。
 // 阅读任务逻辑时，可从 TaskProgressSnapshot.displaying() 和 CodexTaskProgressReader.read() 开始。
 
+import Darwin
 import Foundation
 
 struct RateLimitWindow: Decodable {
@@ -46,9 +47,15 @@ enum TaskProgressKind: String, Hashable {
     case idle
 }
 
+enum TaskProgressSource: String, Hashable {
+    case codex
+    case pi
+}
+
 enum CodexTaskClient: String, Equatable {
     case cli
     case app
+    case pi
     case unknown
 }
 
@@ -57,6 +64,21 @@ struct TaskProgressTarget: Equatable {
     let client: CodexTaskClient
     let workingDirectory: String?
     let rolloutPath: String
+    let processID: pid_t?
+
+    init(
+        threadID: String?,
+        client: CodexTaskClient,
+        workingDirectory: String?,
+        rolloutPath: String,
+        processID: pid_t? = nil
+    ) {
+        self.threadID = threadID
+        self.client = client
+        self.workingDirectory = workingDirectory
+        self.rolloutPath = rolloutPath
+        self.processID = processID
+    }
 }
 
 struct TaskProgressItem: Equatable {
@@ -64,6 +86,8 @@ struct TaskProgressItem: Equatable {
     let kind: TaskProgressKind
     let startedAt: Date
     let statusOverride: String?
+    let source: TaskProgressSource
+    let taskID: String?
     let target: TaskProgressTarget?
 
     init(
@@ -71,12 +95,16 @@ struct TaskProgressItem: Equatable {
         kind: TaskProgressKind,
         startedAt: Date = .distantPast,
         statusOverride: String? = nil,
+        source: TaskProgressSource = .codex,
+        taskID: String? = nil,
         target: TaskProgressTarget? = nil
     ) {
         self.title = title
         self.kind = kind
         self.startedAt = startedAt
         self.statusOverride = statusOverride
+        self.source = source
+        self.taskID = taskID
         self.target = target
     }
 
@@ -122,14 +150,17 @@ struct TaskProgressSnapshot: Equatable {
 
         // Codex 的周期任务每次运行都会新建线程；紧凑面板无法区分同名线程，
         // 因此只保留排序后优先级最高、时间最新的那一条。
-        var seenTitles = Set<String>()
+        var seenItems = Set<String>()
         let deduplicated = sourceItems.filter { item in
-            let key = item.title
+            let normalizedTitle = item.title
                 .components(separatedBy: .whitespacesAndNewlines)
                 .filter { !$0.isEmpty }
                 .joined(separator: " ")
                 .lowercased()
-            return seenTitles.insert(key).inserted
+            let key = item.taskID.map {
+                "\(item.source.rawValue):id:\($0.lowercased())"
+            } ?? "\(item.source.rawValue):title:\(normalizedTitle)"
+            return seenItems.insert(key).inserted
         }
         guard !deduplicated.isEmpty else { return .idle }
         return TaskProgressSnapshot(items: Array(
@@ -141,6 +172,19 @@ struct TaskProgressSnapshot: Equatable {
 struct TaskProgressReadResult: Equatable {
     let allItems: [TaskProgressItem]
     let snapshot: TaskProgressSnapshot
+}
+
+func sortedTaskProgressItems(
+    _ sourceItems: [TaskProgressItem]
+) -> [TaskProgressItem] {
+    sourceItems.sorted {
+        let leftTerminal = $0.kind == .completed || $0.kind == .failed
+        let rightTerminal = $1.kind == .completed || $1.kind == .failed
+        if leftTerminal != rightTerminal { return !leftTerminal }
+        if $0.startedAt == $1.startedAt { return $0.title < $1.title }
+        if leftTerminal { return $0.startedAt > $1.startedAt }
+        return $0.startedAt < $1.startedAt
+    }
 }
 
 /// 从本机 Codex rollout JSONL 日志中恢复用户可见任务的当前状态。
@@ -273,6 +317,8 @@ final class CodexTaskProgressReader {
                 kind: item.kind,
                 startedAt: item.startedAt,
                 statusOverride: item.statusOverride,
+                source: item.source,
+                taskID: item.taskID,
                 target: item.target
             )
 
@@ -292,18 +338,10 @@ final class CodexTaskProgressReader {
         parsedCache = parsedCache.filter { activePaths.contains($0.key) }
         lastReadDiagnostics.cacheEntryCount = parsedCache.count
 
-        // 进行中的任务排在终态任务之前；同组内再按开始时间稳定排序。
-        items.sort {
-            let leftTerminal = $0.kind == .completed || $0.kind == .failed
-            let rightTerminal = $1.kind == .completed || $1.kind == .failed
-            if leftTerminal != rightTerminal { return !leftTerminal }
-            if $0.startedAt == $1.startedAt { return $0.title < $1.title }
-            if leftTerminal { return $0.startedAt > $1.startedAt }
-            return $0.startedAt < $1.startedAt
-        }
+        let sortedItems = sortedTaskProgressItems(items)
         return TaskProgressReadResult(
-            allItems: items,
-            snapshot: .displaying(items)
+            allItems: sortedItems,
+            snapshot: .displaying(sortedItems)
         )
     }
 

@@ -47,6 +47,9 @@ final class TaskAttentionTracker {
 }
 
 func taskAttentionIdentifier(for item: TaskProgressItem) -> String? {
+    if let taskID = item.taskID, !taskID.isEmpty {
+        return "task:\(item.source.rawValue):\(taskID.lowercased())"
+    }
     if let target = item.target {
         if let threadID = target.threadID, !threadID.isEmpty {
             return "thread:\(threadID.lowercased())"

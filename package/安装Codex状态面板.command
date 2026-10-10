@@ -13,6 +13,14 @@ PLIST_DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 CONFIG_SOURCE="$ROOT/panel/default-panel-config.json"
 CONFIG_DIR="$HOME/Library/Application Support/io.github.mayday-materials.codex-status-panel"
 CONFIG_PATH="$CONFIG_DIR/panel-config.json"
+PI_EXTENSION_SOURCE="$ROOT/panel/pi-status-bridge.ts"
+PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+if [[ "$PI_AGENT_DIR" == '~/'* ]]; then
+  PI_AGENT_DIR="$HOME/${PI_AGENT_DIR#\~/}"
+fi
+PI_EXTENSION_DIR="$PI_AGENT_DIR/extensions"
+PI_EXTENSION_DEST="$PI_EXTENSION_DIR/io.github.mayday-materials.codex-status-panel.ts"
+PI_STATE_DIR="$CONFIG_DIR/pi-sessions"
 LOG_PATH="$HOME/Library/Logs/Codex 状态面板.log"
 HEALTH_DIR="$HOME/Library/Caches/io.github.mayday-materials.codex-status-panel"
 HEALTH_PATH="$HEALTH_DIR/panel-health.json"
@@ -129,8 +137,8 @@ fi
 [[ -d "$APP_SOURCE" && -x "$APP_SOURCE/Contents/MacOS/CodexStatusPanel" \
       && -f "$APP_INFO_PLIST" ]] \
   || fail "面板 App 文件不完整，请重新解压整个分享包。"
-[[ -f "$PLIST_SOURCE" && -f "$CONFIG_SOURCE" ]] \
-  || fail "启动项模板或默认配置缺失，请重新解压整个分享包。"
+[[ -f "$PLIST_SOURCE" && -f "$CONFIG_SOURCE" && -f "$PI_EXTENSION_SOURCE" ]] \
+  || fail "启动项模板、默认配置或 Pi 桥接扩展缺失，请重新解压整个分享包。"
 PANEL_VERSION="$(
   /usr/bin/plutil -extract CFBundleShortVersionString raw \
     "$APP_INFO_PLIST" 2>/dev/null
@@ -154,7 +162,9 @@ mkdir -p "$HOME/Applications" \
   "$HOME/Library/LaunchAgents" \
   "$HOME/Library/Logs" \
   "$HEALTH_DIR" \
-  "$CONFIG_DIR"
+  "$CONFIG_DIR" \
+  "$PI_EXTENSION_DIR" \
+  "$PI_STATE_DIR"
 
 for EXISTING_PLIST in "$HOME/Library/LaunchAgents"/*.plist(N); do
   EXISTING_LABEL="$(/usr/bin/plutil -extract Label raw "$EXISTING_PLIST" 2>/dev/null || true)"
@@ -184,6 +194,11 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
 else
   echo "保留已有配置：$CONFIG_PATH"
 fi
+
+/bin/cp "$PI_EXTENSION_SOURCE" "$PI_EXTENSION_DEST"
+/bin/chmod 600 "$PI_EXTENSION_DEST"
+/bin/chmod 700 "$PI_STATE_DIR"
+echo "已安装 Pi CLI 状态桥接：$PI_EXTENSION_DEST"
 
 /bin/cp "$PLIST_SOURCE" "$PLIST_DEST"
 /usr/bin/plutil -replace ProgramArguments.0 -string "$APP_BINARY" "$PLIST_DEST"
@@ -221,8 +236,10 @@ echo "安装完成："
 echo "  ✓ Codex 状态面板"
 echo "  ✓ 可编辑配置文件"
 echo "  ✓ 随登录自动启动"
+echo "  ✓ Pi CLI 会话状态桥接"
 echo ""
 echo "配置文件：$CONFIG_PATH"
 echo "日志文件：$LOG_PATH"
 echo "额度读取使用本机 Codex 登录状态，不需要 API Key。"
+echo "已打开的 Pi CLI 请执行 /reload 或重新启动，以加载状态桥接。"
 pause_before_exit

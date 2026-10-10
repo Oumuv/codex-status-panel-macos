@@ -13,6 +13,8 @@
 - BTC/ETH 行情默认关闭；如用户在配置中开启，会请求公共行情接口，不需要 API Key。
 - macOS 日志位于当前用户的 `~/Library/Logs`。
 - 健康状态文件只记录面板版本、进程、连接状态、跟随状态、是否显示行情和面板定位误差，不记录真实额度值、token 或邮箱。
+- Pi 状态桥接只在本机写入会话 ID、Pi 进程 PID、运行模式、工作目录、会话文件路径、状态和时间戳。任务标题最多 80 字符；未命名会话可能使用首条提示首行的前 80 字符。桥接不读取 Pi 认证文件，也不保存其余提示内容、回复、工具参数或工具输出。
+- Pi 桥接状态位于当前用户的 `~/Library/Application Support/io.github.mayday-materials.codex-status-panel/pi-sessions`，卸载时删除。
 
 ## 发布前审计
 

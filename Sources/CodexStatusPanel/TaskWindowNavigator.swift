@@ -24,7 +24,11 @@ final class TaskWindowNavigator {
         }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.openCLIOrFallback(target)
+            if target.client == .pi {
+                self?.openPiCLI(target)
+            } else {
+                self?.openCLIOrFallback(target)
+            }
         }
     }
 
@@ -88,6 +92,23 @@ final class TaskWindowNavigator {
         return String(trimmed.dropFirst().dropLast())
     }
 
+    private func openPiCLI(_ target: TaskProgressTarget) {
+        guard let processID = target.processID, processID > 1 else {
+            fputs("task-navigation: Pi 任务缺少有效进程 ID，无法定位终端\n", stderr)
+            return
+        }
+        guard focusTerminal(
+            processID: processID,
+            workingDirectory: target.workingDirectory
+        ) else {
+            fputs(
+                "task-navigation: 无法定位 Pi 进程 \(processID) 所在的终端窗口\n",
+                stderr
+            )
+            return
+        }
+    }
+
     private func openCLIOrFallback(_ target: TaskProgressTarget) {
         let processIDs = codexProcessIDs(for: target.rolloutPath)
         guard !processIDs.isEmpty else {
@@ -96,21 +117,8 @@ final class TaskWindowNavigator {
         }
 
         for processID in processIDs {
-            guard let tty = tty(for: processID) else { continue }
-            if let owner = owningApplication(for: processID) {
-                focus(
-                    terminalKind: Self.terminalKind(
-                        forBundleIdentifier: owner.bundleIdentifier ?? ""
-                    ),
-                    application: owner,
-                    tty: tty,
-                    workingDirectory: target.workingDirectory
-                )
-                return
-            }
-
-            if focusKnownTerminal(
-                tty: tty,
+            if focusTerminal(
+                processID: processID,
                 workingDirectory: target.workingDirectory
             ) {
                 return
@@ -118,6 +126,29 @@ final class TaskWindowNavigator {
         }
 
         openInCodexApp(target)
+    }
+
+    private func focusTerminal(
+        processID: pid_t,
+        workingDirectory: String?
+    ) -> Bool {
+        guard let tty = tty(for: processID) else { return false }
+        if let owner = owningApplication(for: processID) {
+            focus(
+                terminalKind: Self.terminalKind(
+                    forBundleIdentifier: owner.bundleIdentifier ?? ""
+                ),
+                application: owner,
+                tty: tty,
+                workingDirectory: workingDirectory
+            )
+            return true
+        }
+
+        return focusKnownTerminal(
+            tty: tty,
+            workingDirectory: workingDirectory
+        )
     }
 
     private func codexProcessIDs(for rolloutPath: String) -> [pid_t] {

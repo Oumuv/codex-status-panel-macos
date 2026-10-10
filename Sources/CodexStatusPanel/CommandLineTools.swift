@@ -105,7 +105,7 @@ func printPanelConfiguration() -> Never {
 }
 
 func printTaskProgressOnce() -> Never {
-    let snapshot = CodexTaskProgressReader().read()
+    let snapshot = CombinedTaskProgressReader().read()
     let details = snapshot.items.enumerated().map { index, item in
         "\(index + 1):\(item.title)[\(item.kind.rawValue)]"
     }.joined(separator: " | ")
@@ -1092,6 +1092,145 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
     return failures
 }
 
+private func piTaskProgressFailures(now: Date) -> [String] {
+    var failures: [String] = []
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [
+        .withInternetDateTime,
+        .withFractionalSeconds,
+    ]
+    let stateURL = URL(fileURLWithPath: "/tmp/42.json")
+
+    func stateData(
+        status: String,
+        heartbeatOffset: TimeInterval = 0,
+        stateChangedOffset: TimeInterval = 0,
+        source: String = "pi",
+        title: String = "实现 Pi 状态桥接"
+    ) -> Data {
+        let payload: [String: Any] = [
+            "schemaVersion": 1,
+            "source": source,
+            "pid": 42,
+            "sessionId": "01a12489-c668-74df-a151-df5eeb3fe542",
+            "sessionFile": "/tmp/pi-session.jsonl",
+            "mode": "tui",
+            "cwd": "/tmp/pi-project/../pi-project",
+            "title": title,
+            "status": status,
+            "startedAt": formatter.string(from: now.addingTimeInterval(-30)),
+            "stateChangedAt": formatter.string(
+                from: now.addingTimeInterval(stateChangedOffset)
+            ),
+            "heartbeatAt": formatter.string(
+                from: now.addingTimeInterval(heartbeatOffset)
+            ),
+        ]
+        return (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+    }
+
+    func item(
+        status: String,
+        heartbeatOffset: TimeInterval = 0,
+        stateChangedOffset: TimeInterval = 0
+    ) -> TaskProgressItem? {
+        PiTaskProgressReader.item(
+            from: stateData(
+                status: status,
+                heartbeatOffset: heartbeatOffset,
+                stateChangedOffset: stateChangedOffset
+            ),
+            stateURL: stateURL,
+            now: now
+        )
+    }
+
+    let running = item(status: "running")
+    if running?.kind != .running
+        || running?.title != "π 实现 Pi 状态桥接"
+        || running?.source != .pi
+        || abs(
+            (running?.startedAt ?? .distantPast).timeIntervalSince(
+                now.addingTimeInterval(-30)
+            )
+        ) > 0.001
+        || running?.target?.client != .pi
+        || running?.target?.processID != 42
+        || running?.target?.workingDirectory != "/tmp/pi-project"
+        || running?.target?.rolloutPath != "/tmp/pi-session.jsonl"
+    {
+        failures.append("running-metadata")
+    }
+    if item(status: "waitingForInput")?.kind != .waitingForInput {
+        failures.append("waiting")
+    }
+    if item(status: "completed")?.kind != .completed {
+        failures.append("completed")
+    }
+    if item(status: "failed")?.kind != .failed {
+        failures.append("failed")
+    }
+    if item(status: "running", heartbeatOffset: -21) != nil {
+        failures.append("stale-heartbeat")
+    }
+    if item(status: "completed", stateChangedOffset: -121) != nil {
+        failures.append("stale-terminal")
+    }
+    if PiTaskProgressReader.item(
+        from: stateData(status: "running", source: "other"),
+        stateURL: stateURL,
+        now: now
+    ) != nil {
+        failures.append("source-validation")
+    }
+    if PiTaskProgressReader.item(
+        from: stateData(status: "running", title: String(repeating: "x", count: 81)),
+        stateURL: stateURL,
+        now: now
+    ) != nil {
+        failures.append("title-bound")
+    }
+    if PiTaskProgressReader.item(
+        from: stateData(status: "running"),
+        stateURL: URL(fileURLWithPath: "/tmp/43.json"),
+        now: now
+    ) != nil {
+        failures.append("pid-filename")
+    }
+
+    let codexItem = TaskProgressItem(
+        title: "相同任务",
+        kind: .running,
+        startedAt: now,
+        source: .codex
+    )
+    let piItem = TaskProgressItem(
+        title: "相同任务",
+        kind: .running,
+        startedAt: now,
+        source: .pi,
+        taskID: "pi-session:42"
+    )
+    let merged = CombinedTaskProgressReader.merged([
+        TaskProgressReadResult(
+            allItems: [codexItem],
+            snapshot: .displaying([codexItem])
+        ),
+        TaskProgressReadResult(
+            allItems: [piItem, piItem],
+            snapshot: .displaying([piItem, piItem])
+        ),
+    ])
+    if merged.allItems.count != 3
+        || merged.snapshot.items.count != 2
+        || Set(merged.snapshot.items.map(\.source)) != Set([.codex, .pi])
+    {
+        failures.append("merge-source-dedup")
+    }
+
+    return failures
+}
+
 func runTaskProgressSelfTest() -> Never {
     let now = Date()
     let started = #"{"type":"event_msg","payload":{"type":"task_started"}}"#
@@ -1218,6 +1357,13 @@ func runTaskProgressSelfTest() -> Never {
             ) == .other,
         TaskWindowNavigator.appleScriptResult(from: "\"focused\"\n")
             == "focused",
+        TaskProgressTarget(
+            threadID: "pi-session",
+            client: .pi,
+            workingDirectory: "/tmp/pi-project",
+            rolloutPath: "/tmp/pi-session.jsonl",
+            processID: 42
+        ).processID == 42,
         taskProgressItemIndex(
             at: secondTaskPoint,
             taskCount: 3,
@@ -1364,6 +1510,17 @@ func runTaskProgressSelfTest() -> Never {
         fputs(
             "task progress incremental checks failed: "
                 + incrementalFailures.joined(separator: ", ")
+                + "\n",
+            stderr
+        )
+        exit(1)
+    }
+
+    let piFailures = piTaskProgressFailures(now: now)
+    guard piFailures.isEmpty else {
+        fputs(
+            "Pi task progress checks failed: "
+                + piFailures.joined(separator: ", ")
                 + "\n",
             stderr
         )
@@ -1655,7 +1812,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; ball-effects=9/9; text-effects=10/10; celebration=17/17; list=pass; layout=pass; icons=4/4; balls=5/5")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; pi=10/10; navigation=9/9; attention=9/9; animation=4/4; ball-effects=9/9; text-effects=10/10; celebration=17/17; list=pass; layout=pass; icons=4/4; balls=5/5")
     exit(0)
 }
 

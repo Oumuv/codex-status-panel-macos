@@ -10,6 +10,13 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 HEALTH="$HOME/Library/Caches/io.github.mayday-materials.codex-status-panel/panel-health.json"
 LOG_PATH="$HOME/Library/Logs/Codex 状态面板.log"
+CONFIG_DIR="$HOME/Library/Application Support/io.github.mayday-materials.codex-status-panel"
+PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+if [[ "$PI_AGENT_DIR" == '~/'* ]]; then
+  PI_AGENT_DIR="$HOME/${PI_AGENT_DIR#\~/}"
+fi
+PI_EXTENSION="$PI_AGENT_DIR/extensions/io.github.mayday-materials.codex-status-panel.ts"
+PI_STATE_DIR="$CONFIG_DIR/pi-sessions"
 PANEL_VERSION="$(
   /usr/bin/plutil -extract CFBundleShortVersionString raw \
     "$APP_INFO_PLIST" 2>/dev/null
@@ -43,6 +50,8 @@ check "配置打印正常" '[[ -x "$BIN" ]] && "$BIN" --print-panel-config >/dev
 check "跟随定位自测正常" '[[ -x "$BIN" ]] && "$BIN" --self-test-placement >/dev/null'
 check "菜单控制自测正常" '[[ -x "$BIN" ]] && "$BIN" --self-test-menu-controls >/dev/null'
 check "任务进度自测正常" '[[ -x "$BIN" ]] && "$BIN" --self-test-task-progress >/dev/null'
+check "Pi CLI 状态桥接已安装" '[[ -f "$PI_EXTENSION" ]] && /usr/bin/grep -Fq '"'"'pi.on("agent_settled"'"'"' "$PI_EXTENSION"'
+check "Pi CLI 状态目录存在" '[[ -d "$PI_STATE_DIR" ]]'
 check "认证回退自测正常" '[[ -x "$BIN" ]] && "$BIN" --self-test-authentication-fallback >/dev/null'
 check "行情数据自测正常" '[[ -x "$BIN" ]] && "$BIN" --self-test-market-data >/dev/null'
 check "正常退出不会立即重启" '[[ -f "$PLIST" ]] && [[ "$(/usr/bin/plutil -extract KeepAlive.SuccessfulExit raw "$PLIST" 2>/dev/null)" == "false" ]]'
