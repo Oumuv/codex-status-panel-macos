@@ -1234,8 +1234,71 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    let unreadState = CodexTaskProgressReader.UnreadThreadState(ids: [threadID], isAvailable: true)
-    let readState = CodexTaskProgressReader.UnreadThreadState(ids: [], isAvailable: true)
+    let otherThreadID = "abcdef12-3456-4abc-8def-abcdef123456"
+    let currentUnreadStateData = Data("""
+    {
+      "electron-thread-read-state-v1": {
+        "version": 1,
+        "unreadByIdentity": {
+          "identity-a": {
+            "local-a": ["\(threadID.uppercased())"],
+            "remote-a": ["\(otherThreadID)"]
+          }
+        }
+      }
+    }
+    """.utf8)
+    let currentReadStateData = Data("""
+    {
+      "electron-thread-read-state-v1": {
+        "version": 1,
+        "unreadByIdentity": {}
+      }
+    }
+    """.utf8)
+    let legacyUnreadStateData = Data("""
+    {
+      "electron-persisted-atom-state": {
+        "unread-thread-ids-by-host-v1": {
+          "local-a": ["\(threadID.uppercased())"]
+        }
+      }
+    }
+    """.utf8)
+    let malformedCurrentStateData = Data("""
+    {
+      "electron-thread-read-state-v1": {
+        "version": 1,
+        "unreadByIdentity": []
+      },
+      "electron-persisted-atom-state": {
+        "unread-thread-ids-by-host-v1": {
+          "local-a": ["\(threadID)"]
+        }
+      }
+    }
+    """.utf8)
+    guard let unreadState = CodexTaskProgressReader.unreadThreadState(
+              from: currentUnreadStateData
+          ),
+          unreadState.isAvailable,
+          unreadState.ids == Set([threadID, otherThreadID]),
+          let readState = CodexTaskProgressReader.unreadThreadState(
+              from: currentReadStateData
+          ),
+          readState.isAvailable,
+          readState.ids.isEmpty,
+          let legacyUnreadState = CodexTaskProgressReader.unreadThreadState(
+              from: legacyUnreadStateData
+          ),
+          legacyUnreadState.ids == Set([threadID]),
+          CodexTaskProgressReader.unreadThreadState(
+              from: malformedCurrentStateData
+          ) == nil
+    else {
+        fputs("Codex unread state schema parsing failed\n", stderr)
+        exit(1)
+    }
     let unavailableState = CodexTaskProgressReader.UnreadThreadState(ids: [], isAvailable: false)
     let visibilityChecks = [
         CodexTaskProgressReader.shouldDisplay(

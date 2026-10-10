@@ -988,11 +988,7 @@ final class CodexTaskProgressReader {
         }
 
         guard let data = try? Data(contentsOf: stateURL),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let atomState = root["electron-persisted-atom-state"] as? [String: Any],
-              let unreadByHost = atomState[
-                  "unread-thread-ids-by-host-v1"
-              ] as? [String: Any]
+              let unreadState = Self.unreadThreadState(from: data)
         else {
             return UnreadThreadState(
                 ids: cachedUnreadThreadIDs,
@@ -1000,15 +996,53 @@ final class CodexTaskProgressReader {
             )
         }
 
-        var ids = Set<String>()
-        for value in unreadByHost.values {
-            guard let hostIDs = value as? [String] else { continue }
-            ids.formUnion(hostIDs.map { $0.lowercased() })
-        }
-        cachedUnreadThreadIDs = ids
+        cachedUnreadThreadIDs = unreadState.ids
         cachedUnreadStateModificationDate = modificationDate
         hasCachedUnreadState = true
+        return unreadState
+    }
+
+    static func unreadThreadState(from data: Data) -> UnreadThreadState? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+
+        if let rawThreadReadState = root["electron-thread-read-state-v1"] {
+            guard let threadReadState = rawThreadReadState as? [String: Any],
+                  let unreadByIdentity = threadReadState[
+                      "unreadByIdentity"
+                  ] as? [String: Any]
+            else { return nil }
+
+            var ids = Set<String>()
+            for value in unreadByIdentity.values {
+                guard let unreadByHost = value as? [String: Any],
+                      let identityIDs = unreadThreadIDs(from: unreadByHost)
+                else { return nil }
+                ids.formUnion(identityIDs)
+            }
+            return UnreadThreadState(ids: ids, isAvailable: true)
+        }
+
+        guard let atomState = root[
+            "electron-persisted-atom-state"
+        ] as? [String: Any],
+        let unreadByHost = atomState[
+            "unread-thread-ids-by-host-v1"
+        ] as? [String: Any],
+        let ids = unreadThreadIDs(from: unreadByHost)
+        else { return nil }
         return UnreadThreadState(ids: ids, isAvailable: true)
+    }
+
+    private static func unreadThreadIDs(
+        from unreadByHost: [String: Any]
+    ) -> Set<String>? {
+        var ids = Set<String>()
+        for value in unreadByHost.values {
+            guard let hostIDs = value as? [String] else { return nil }
+            ids.formUnion(hostIDs.map { $0.lowercased() })
+        }
+        return ids
     }
 
     private func recentRollouts(
