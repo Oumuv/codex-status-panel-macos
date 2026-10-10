@@ -3,6 +3,18 @@
 
 import Foundation
 
+struct QuotaRateLimitOption: Equatable {
+    let id: String
+    let displayName: String
+    let valueText: String
+    let progressPercent: Int
+    let isDepleted: Bool
+
+    var compactDisplayName: String {
+        displayName.replacingOccurrences(of: " ", with: "")
+    }
+}
+
 struct QuotaPresentation: Equatable {
     let sourceName: String
     let valueText: String
@@ -10,6 +22,8 @@ struct QuotaPresentation: Equatable {
     let detailText: String
     let dailyTokenText: String?
     let showsInlineUsageMetrics: Bool
+    let rateLimitOptions: [QuotaRateLimitOption]
+    let selectedRateLimitID: String?
     let isDepleted: Bool
 
     init(
@@ -19,6 +33,8 @@ struct QuotaPresentation: Equatable {
         detailText: String,
         dailyTokenText: String? = nil,
         showsInlineUsageMetrics: Bool = false,
+        rateLimitOptions: [QuotaRateLimitOption] = [],
+        selectedRateLimitID: String? = nil,
         isDepleted: Bool
     ) {
         self.sourceName = sourceName
@@ -27,7 +43,46 @@ struct QuotaPresentation: Equatable {
         self.detailText = detailText
         self.dailyTokenText = dailyTokenText
         self.showsInlineUsageMetrics = showsInlineUsageMetrics
+        self.rateLimitOptions = rateLimitOptions
+        self.selectedRateLimitID = selectedRateLimitID
         self.isDepleted = isDepleted
+    }
+
+    var selectedRateLimitOption: QuotaRateLimitOption? {
+        guard let selectedRateLimitID else { return nil }
+        return rateLimitOptions.first {
+            $0.id == selectedRateLimitID
+        }
+    }
+
+    var hasSwitchableRateLimits: Bool {
+        rateLimitOptions.count > 1
+    }
+
+    func selectingRateLimit(id: String) -> QuotaPresentation {
+        guard let option = rateLimitOptions.first(where: { $0.id == id }) else {
+            return self
+        }
+        return QuotaPresentation(
+            sourceName: sourceName,
+            valueText: option.valueText,
+            progressPercent: option.progressPercent,
+            detailText: detailText,
+            dailyTokenText: dailyTokenText,
+            showsInlineUsageMetrics: showsInlineUsageMetrics,
+            rateLimitOptions: rateLimitOptions,
+            selectedRateLimitID: option.id,
+            isDepleted: option.isDepleted
+        )
+    }
+
+    func cyclingRateLimit() -> QuotaPresentation {
+        guard hasSwitchableRateLimits else { return self }
+        let currentIndex = rateLimitOptions.firstIndex {
+            $0.id == selectedRateLimitID
+        } ?? -1
+        let nextIndex = (currentIndex + 1) % rateLimitOptions.count
+        return selectingRateLimit(id: rateLimitOptions[nextIndex].id)
     }
 }
 
@@ -58,6 +113,9 @@ func quotaPresentationAfterRefresh(
 ) -> QuotaPresentation? {
     switch result {
     case .success(let presentation):
+        if let selectedRateLimitID = previous?.selectedRateLimitID {
+            return presentation.selectingRateLimit(id: selectedRateLimitID)
+        }
         return presentation
     case .failure:
         return previous
@@ -535,9 +593,11 @@ enum Sub2APIUsageError: LocalizedError, Equatable {
 
 enum Sub2APIUsageMapper {
     private struct Cycle {
+        let id: String
         let name: String
         let limit: Double
         let used: Double
+        let remaining: Double
         let resetAt: Date?
     }
 
@@ -563,6 +623,53 @@ enum Sub2APIUsageMapper {
 
         switch payload.mode.lowercased() {
         case "quota_limited":
+            let candidates = (payload.rateLimits ?? []).compactMap {
+                entry -> Cycle? in
+                let normalizedWindow = entry.window
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                guard !normalizedWindow.isEmpty,
+                      entry.limit.isFinite,
+                      entry.limit > 0,
+                      entry.used?.isFinite != false,
+                      entry.remaining?.isFinite != false,
+                      entry.remaining != nil || entry.used != nil
+                else { return nil }
+                let remaining = max(
+                    0,
+                    entry.remaining
+                        ?? entry.limit - (entry.used ?? 0)
+                )
+                let used = max(
+                    0,
+                    entry.used ?? entry.limit - remaining
+                )
+                return Cycle(
+                    id: normalizedWindow,
+                    name: windowName(normalizedWindow),
+                    limit: entry.limit,
+                    used: used,
+                    remaining: remaining,
+                    resetAt: parseISO8601(entry.resetAt)
+                )
+            }
+            if !candidates.isEmpty {
+                let dailyCycle = candidates.first {
+                    $0.name == "1 天"
+                } ?? candidates[0]
+                return try rateLimitPresentation(
+                    cycles: candidates,
+                    detail: usedAmountDetail(
+                        used: dailyCycle.used,
+                        limit: max(dailyCycle.limit, dailyCycle.used),
+                        unit: payload.unit
+                    ),
+                    unit: payload.unit,
+                    dailyTokenText: dailyTokenText
+                )
+            }
+
+            // 旧版或精简响应可能只返回 quota；没有有效 rate_limits 时继续兼容。
             if let quota = payload.quota {
                 guard quota.limit.isFinite else {
                     throw Sub2APIUsageError.invalidResponse
@@ -596,42 +703,7 @@ enum Sub2APIUsageMapper {
                     dailyTokenText: dailyTokenText
                 )
             }
-            let candidates = (payload.rateLimits ?? []).compactMap {
-                entry -> Cycle? in
-                guard entry.limit.isFinite,
-                      entry.limit > 0,
-                      entry.used?.isFinite != false,
-                      entry.remaining?.isFinite != false,
-                      entry.remaining != nil || entry.used != nil
-                else { return nil }
-                return Cycle(
-                    name: windowName(entry.window),
-                    limit: entry.limit,
-                    used: entry.used ?? max(
-                        0,
-                        entry.limit - (entry.remaining ?? entry.limit)
-                    ),
-                    resetAt: parseISO8601(entry.resetAt)
-                )
-            }
-            guard let tightest = tightestCycle(candidates) else {
-                throw Sub2APIUsageError.invalidResponse
-            }
-            let remaining = max(0, tightest.limit - tightest.used)
-            let dailyUsed = candidates.first {
-                $0.name == "1 天"
-            }?.used ?? tightest.used
-            return try percentagePresentation(
-                remaining: remaining,
-                limit: tightest.limit,
-                detail: usedAmountDetail(
-                    used: dailyUsed,
-                    limit: max(tightest.limit, dailyUsed),
-                    unit: payload.unit
-                ),
-                unit: payload.unit,
-                dailyTokenText: dailyTokenText
-            )
+            throw Sub2APIUsageError.invalidResponse
 
         case "unrestricted":
             if let subscription = payload.subscription {
@@ -709,6 +781,50 @@ enum Sub2APIUsageMapper {
         }
     }
 
+    private static func rateLimitPresentation(
+        cycles: [Cycle],
+        detail: String,
+        unit: String?,
+        dailyTokenText: String?
+    ) throws -> QuotaPresentation {
+        let options = try cycles.map { cycle -> QuotaRateLimitOption in
+            guard cycle.remaining.isFinite,
+                  cycle.limit.isFinite,
+                  cycle.limit > 0
+            else {
+                throw Sub2APIUsageError.invalidResponse
+            }
+            let boundedRemaining = min(
+                cycle.limit,
+                max(0, cycle.remaining)
+            )
+            let percent = Int(
+                (boundedRemaining / cycle.limit * 100).rounded()
+            )
+            return QuotaRateLimitOption(
+                id: cycle.id,
+                displayName: cycle.name,
+                valueText: "剩余 \(money(boundedRemaining, unit: unit))",
+                progressPercent: percent,
+                isDepleted: boundedRemaining <= 0
+            )
+        }
+        guard let first = options.first else {
+            throw Sub2APIUsageError.invalidResponse
+        }
+        return QuotaPresentation(
+            sourceName: "Sub2API",
+            valueText: first.valueText,
+            progressPercent: first.progressPercent,
+            detailText: detail,
+            dailyTokenText: dailyTokenText,
+            showsInlineUsageMetrics: true,
+            rateLimitOptions: options,
+            selectedRateLimitID: first.id,
+            isDepleted: first.isDepleted
+        )
+    }
+
     private static func percentagePresentation(
         remaining: Double,
         limit: Double,
@@ -757,18 +873,20 @@ enum Sub2APIUsageMapper {
         guard let limit, limit.isFinite, limit > 0,
               let used, used.isFinite
         else { return }
+        let normalizedUsed = max(0, used)
         cycles.append(Cycle(
+            id: name,
             name: name,
             limit: limit,
-            used: max(0, used),
+            used: normalizedUsed,
+            remaining: max(0, limit - normalizedUsed),
             resetAt: resetAt
         ))
     }
 
     private static func tightestCycle(_ cycles: [Cycle]) -> Cycle? {
         cycles.min {
-            max(0, $0.limit - $0.used) / $0.limit
-                < max(0, $1.limit - $1.used) / $1.limit
+            $0.remaining / $0.limit < $1.remaining / $1.limit
         }
     }
 

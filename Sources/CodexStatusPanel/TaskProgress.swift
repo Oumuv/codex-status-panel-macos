@@ -37,7 +37,7 @@ struct RPCResponse: Decodable {
     let error: RPCError?
 }
 
-enum TaskProgressKind: String, Equatable {
+enum TaskProgressKind: String, Hashable {
     case reading
     case running
     case waitingForInput
@@ -46,22 +46,38 @@ enum TaskProgressKind: String, Equatable {
     case idle
 }
 
+enum CodexTaskClient: String, Equatable {
+    case cli
+    case app
+    case unknown
+}
+
+struct TaskProgressTarget: Equatable {
+    let threadID: String?
+    let client: CodexTaskClient
+    let workingDirectory: String?
+    let rolloutPath: String
+}
+
 struct TaskProgressItem: Equatable {
     let title: String
     let kind: TaskProgressKind
     let startedAt: Date
     let statusOverride: String?
+    let target: TaskProgressTarget?
 
     init(
         title: String,
         kind: TaskProgressKind,
         startedAt: Date = .distantPast,
-        statusOverride: String? = nil
+        statusOverride: String? = nil,
+        target: TaskProgressTarget? = nil
     ) {
         self.title = title
         self.kind = kind
         self.startedAt = startedAt
         self.statusOverride = statusOverride
+        self.target = target
     }
 
     var statusText: String {
@@ -122,12 +138,9 @@ struct TaskProgressSnapshot: Equatable {
     }
 }
 
-func shouldAnimateRunningArrow(
-    isWindowVisible: Bool,
-    isCollapsed: Bool,
-    hasRunningTask: Bool
-) -> Bool {
-    isWindowVisible && !isCollapsed && hasRunningTask
+struct TaskProgressReadResult: Equatable {
+    let allItems: [TaskProgressItem]
+    let snapshot: TaskProgressSnapshot
 }
 
 /// 从本机 Codex rollout JSONL 日志中恢复用户可见任务的当前状态。
@@ -138,23 +151,73 @@ final class CodexTaskProgressReader {
         let isAvailable: Bool
     }
 
+    struct ReadDiagnostics: Equatable {
+        var bytesRead = 0
+        var fullRebuildCount = 0
+        var incrementalReadCount = 0
+        var cacheHitCount = 0
+        var completeLineCount = 0
+        var stringFilterLineCount = 0
+        var jsonDecodingAttemptCount = 0
+        var cacheEntryCount = 0
+    }
+
     private struct RolloutCandidate {
         let url: URL
         let modificationDate: Date
     }
 
-    private struct ParsedCacheEntry {
-        let modificationDate: Date
-        let snapshot: TaskProgressSnapshot
+    private struct FileIdentity: Equatable {
+        let systemNumber: UInt64
+        let fileNumber: UInt64
     }
 
-    private let fileManager = FileManager.default
+    private struct FileMetadata {
+        let identity: FileIdentity
+        let size: UInt64
+        let modificationDate: Date
+    }
+
+    private struct LifecycleState {
+        var lifecycle: TaskProgressKind?
+        var pendingInteractionCalls = Set<String>()
+        var latestUserTitle: String?
+        var activeTaskTitle: String?
+        var taskStartedAt: Date?
+    }
+
+    private struct ParsedCacheEntry {
+        let identity: FileIdentity
+        var fileSize: UInt64
+        var offset: UInt64
+        var modificationDate: Date
+        var pendingLineData: Data
+        var isDiscardingLeadingFragment: Bool
+        var lifecycleState: LifecycleState
+        let target: TaskProgressTarget
+        var snapshot: TaskProgressSnapshot
+    }
+
+    private struct RolloutSessionInfo {
+        let isUserVisible: Bool
+        let target: TaskProgressTarget
+    }
+
+    private struct SessionInfoCacheEntry {
+        let identity: FileIdentity
+        let info: RolloutSessionInfo
+    }
+
+    private let fileManager: FileManager
+    private let rolloutURLsProvider: (() -> [URL])?
+    private let threadTitlesOverride: [String: String]?
+    private let unreadStateOverride: UnreadThreadState?
     private let maximumTailBytes: UInt64 = 1_048_576
     private let rolloutRescanInterval: TimeInterval = 5
     private let activeTaskFreshness: TimeInterval = 30 * 60
     private let completedTaskVisibility: TimeInterval = 2 * 60
     private var cachedRollouts: [RolloutCandidate] = []
-    private var cachedRolloutVisibility: [String: Bool] = [:]
+    private var sessionInfoCache: [String: SessionInfoCacheEntry] = [:]
     private var parsedCache: [String: ParsedCacheEntry] = [:]
     private var cachedThreadTitles: [String: String] = [:]
     private var cachedThreadIndexModificationDate: Date?
@@ -163,32 +226,41 @@ final class CodexTaskProgressReader {
     private var hasCachedUnreadState = false
     private var nextRolloutScanAt = Date.distantPast
 
-    func read() -> TaskProgressSnapshot {
-        let now = Date()
-        let threadTitles = readThreadTitleIndex()
-        let unreadState = readUnreadThreadState()
+    private(set) var lastReadDiagnostics = ReadDiagnostics()
+
+    init(
+        fileManager: FileManager = .default,
+        rolloutURLsProvider: (() -> [URL])? = nil,
+        threadTitlesOverride: [String: String]? = nil,
+        unreadStateOverride: UnreadThreadState? = nil
+    ) {
+        self.fileManager = fileManager
+        self.rolloutURLsProvider = rolloutURLsProvider
+        self.threadTitlesOverride = threadTitlesOverride
+        self.unreadStateOverride = unreadStateOverride
+    }
+
+    func read(at now: Date = Date()) -> TaskProgressSnapshot {
+        readResult(at: now).snapshot
+    }
+
+    func readResult(at now: Date = Date()) -> TaskProgressReadResult {
+        lastReadDiagnostics = ReadDiagnostics()
+        let threadTitles = threadTitlesOverride ?? readThreadTitleIndex()
+        let unreadState = unreadStateOverride ?? readUnreadThreadState()
         var items: [TaskProgressItem] = []
 
-        // 文件修改时间未变时直接复用解析结果，避免每两秒重复解析同一个大日志。
-        for candidate in recentRollouts(at: now, unreadThreadIDs: unreadState.ids) {
+        let candidates = recentRollouts(at: now, unreadThreadIDs: unreadState.ids)
+        for candidate in candidates {
             let cacheKey = candidate.url.path
-            let snapshot: TaskProgressSnapshot
-            if let cached = parsedCache[cacheKey],
-               cached.modificationDate == candidate.modificationDate
-            {
-                snapshot = cached.snapshot
-            } else {
-                guard let lines = readTailLines(from: candidate.url) else { continue }
-                snapshot = Self.parse(
-                    lines: lines,
-                    modificationDate: candidate.modificationDate,
-                    now: now
-                )
-                parsedCache[cacheKey] = ParsedCacheEntry(
-                    modificationDate: candidate.modificationDate,
-                    snapshot: snapshot
-                )
-            }
+            guard let metadata = fileMetadata(for: candidate.url),
+                  let snapshot = readSnapshot(
+                      from: candidate.url,
+                      metadata: metadata,
+                      cacheKey: cacheKey,
+                      now: now
+                  )
+            else { continue }
 
             guard var item = snapshot.items.first, item.kind != .idle else { continue }
             let resolvedTitle = Self.resolvedTitle(
@@ -196,26 +268,29 @@ final class CodexTaskProgressReader {
                 indexedTitles: threadTitles,
                 fallback: item.title
             )
-            if resolvedTitle != item.title {
-                item = TaskProgressItem(
-                    title: resolvedTitle,
-                    kind: item.kind,
-                    startedAt: item.startedAt,
-                    statusOverride: item.statusOverride
-                )
-            }
+            item = TaskProgressItem(
+                title: resolvedTitle,
+                kind: item.kind,
+                startedAt: item.startedAt,
+                statusOverride: item.statusOverride,
+                target: item.target
+            )
 
             let threadID = Self.threadID(from: candidate.url)
             guard Self.shouldDisplay(
                 kind: item.kind,
                 threadID: threadID,
-                modificationDate: candidate.modificationDate,
+                modificationDate: metadata.modificationDate,
                 now: now,
                 unreadState: unreadState,
                 fallbackVisibility: completedTaskVisibility
             ) else { continue }
             items.append(item)
         }
+
+        let activePaths = Set(candidates.map { $0.url.path })
+        parsedCache = parsedCache.filter { activePaths.contains($0.key) }
+        lastReadDiagnostics.cacheEntryCount = parsedCache.count
 
         // 进行中的任务排在终态任务之前；同组内再按开始时间稳定排序。
         items.sort {
@@ -226,107 +301,433 @@ final class CodexTaskProgressReader {
             if leftTerminal { return $0.startedAt > $1.startedAt }
             return $0.startedAt < $1.startedAt
         }
-        return .displaying(items)
+        return TaskProgressReadResult(
+            allItems: items,
+            snapshot: .displaying(items)
+        )
+    }
+
+    private func readSnapshot(
+        from url: URL,
+        metadata: FileMetadata,
+        cacheKey: String,
+        now: Date
+    ) -> TaskProgressSnapshot? {
+        if var cached = parsedCache[cacheKey], cached.identity == metadata.identity {
+            if cached.fileSize == metadata.size,
+               cached.offset == metadata.size,
+               cached.modificationDate == metadata.modificationDate
+            {
+                lastReadDiagnostics.cacheHitCount += 1
+                cached.snapshot = Self.snapshot(
+                    from: cached.lifecycleState,
+                    modificationDate: metadata.modificationDate,
+                    now: now,
+                    target: cached.target
+                )
+                parsedCache[cacheKey] = cached
+                return cached.snapshot
+            }
+
+            if cached.offset == cached.fileSize, metadata.size > cached.offset {
+                let appendedByteCount = metadata.size - cached.offset
+                if appendedByteCount <= maximumTailBytes,
+                   let data = readData(
+                       from: url,
+                       offset: cached.offset,
+                       byteCount: Int(appendedByteCount)
+                   )
+                {
+                    lastReadDiagnostics.bytesRead += data.count
+                    lastReadDiagnostics.incrementalReadCount += 1
+                    consume(
+                        data,
+                        into: &cached,
+                        modificationDate: metadata.modificationDate
+                    )
+                    cached.fileSize = metadata.size
+                    cached.offset = metadata.size
+                    cached.modificationDate = metadata.modificationDate
+                    cached.snapshot = Self.snapshot(
+                        from: cached.lifecycleState,
+                        modificationDate: metadata.modificationDate,
+                        now: now,
+                        target: cached.target
+                    )
+                    parsedCache[cacheKey] = cached
+                    return cached.snapshot
+                }
+            }
+        }
+
+        guard let currentMetadata = fileMetadata(for: url),
+              let rebuilt = rebuildCache(
+                  from: url,
+                  metadata: currentMetadata,
+                  now: now
+              )
+        else { return nil }
+        parsedCache[cacheKey] = rebuilt
+        return rebuilt.snapshot
+    }
+
+    private func rebuildCache(
+        from url: URL,
+        metadata: FileMetadata,
+        now: Date
+    ) -> ParsedCacheEntry? {
+        let startOffset = metadata.size > maximumTailBytes
+            ? metadata.size - maximumTailBytes
+            : 0
+        let byteCount = Int(metadata.size - startOffset)
+        guard let data = readData(
+            from: url,
+            offset: startOffset,
+            byteCount: byteCount
+        ) else { return nil }
+
+        lastReadDiagnostics.bytesRead += data.count
+        lastReadDiagnostics.fullRebuildCount += 1
+        let target = sessionInfo(
+            for: url,
+            metadata: metadata
+        ).target
+        var entry = ParsedCacheEntry(
+            identity: metadata.identity,
+            fileSize: metadata.size,
+            offset: startOffset + UInt64(data.count),
+            modificationDate: metadata.modificationDate,
+            pendingLineData: Data(),
+            isDiscardingLeadingFragment: startOffset > 0,
+            lifecycleState: LifecycleState(),
+            target: target,
+            snapshot: .idle
+        )
+        consume(
+            data,
+            into: &entry,
+            modificationDate: metadata.modificationDate
+        )
+        entry.snapshot = Self.snapshot(
+            from: entry.lifecycleState,
+            modificationDate: metadata.modificationDate,
+            now: now,
+            target: target
+        )
+        return entry
+    }
+
+    private func consume(
+        _ newData: Data,
+        into entry: inout ParsedCacheEntry,
+        modificationDate: Date
+    ) {
+        var data = newData
+        if entry.isDiscardingLeadingFragment {
+            guard let firstNewline = data.firstIndex(of: 0x0A) else { return }
+            let firstCompleteIndex = data.index(after: firstNewline)
+            data = firstCompleteIndex < data.endIndex
+                ? data.subdata(in: firstCompleteIndex..<data.endIndex)
+                : Data()
+            entry.isDiscardingLeadingFragment = false
+        }
+
+        if !entry.pendingLineData.isEmpty {
+            var combined = entry.pendingLineData
+            combined.append(data)
+            data = combined
+            entry.pendingLineData.removeAll(keepingCapacity: false)
+        }
+
+        var lineStart = data.startIndex
+        while lineStart < data.endIndex,
+              let newline = data[lineStart...].firstIndex(of: 0x0A)
+        {
+            let lineRange = lineStart..<newline
+            if !lineRange.isEmpty {
+                lastReadDiagnostics.completeLineCount += 1
+                if lineRange.count <= maximumTailBytes {
+                    Self.consumeRelevantLine(
+                        in: data,
+                        range: lineRange,
+                        state: &entry.lifecycleState,
+                        modificationDate: modificationDate,
+                        diagnostics: &lastReadDiagnostics
+                    )
+                }
+            }
+            lineStart = data.index(after: newline)
+        }
+
+        guard lineStart < data.endIndex else { return }
+        let fragment = data.subdata(in: lineStart..<data.endIndex)
+        if fragment.count <= maximumTailBytes {
+            entry.pendingLineData = fragment
+        } else {
+            entry.isDiscardingLeadingFragment = true
+        }
+    }
+
+    private func readData(
+        from url: URL,
+        offset: UInt64,
+        byteCount: Int
+    ) -> Data? {
+        guard byteCount >= 0,
+              let handle = try? FileHandle(forReadingFrom: url)
+        else { return nil }
+        defer { try? handle.close() }
+
+        do {
+            try handle.seek(toOffset: offset)
+            guard byteCount > 0 else { return Data() }
+            guard let data = try handle.read(upToCount: byteCount),
+                  data.count == byteCount
+            else { return nil }
+            return data
+        } catch {
+            return nil
+        }
+    }
+
+    private func sessionInfo(
+        for url: URL,
+        metadata: FileMetadata
+    ) -> RolloutSessionInfo {
+        if let cached = sessionInfoCache[url.path],
+           cached.identity == metadata.identity
+        {
+            return cached.info
+        }
+
+        let maximumMetadataBytes = 262_144
+        let data = readData(
+            from: url,
+            offset: 0,
+            byteCount: Int(min(UInt64(maximumMetadataBytes), metadata.size))
+        ) ?? Data()
+        let payload = Self.sessionMetadataPayload(data: data)
+        let info = RolloutSessionInfo(
+            isUserVisible: payload.map(Self.isUserVisibleSessionMetadata) ?? true,
+            target: Self.taskTarget(payload: payload, rolloutURL: url)
+        )
+        sessionInfoCache[url.path] = SessionInfoCacheEntry(
+            identity: metadata.identity,
+            info: info
+        )
+        return info
+    }
+
+    private func fileMetadata(for url: URL) -> FileMetadata? {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let size = attributes[.size] as? NSNumber,
+              let modificationDate = attributes[.modificationDate] as? Date,
+              let systemNumber = attributes[.systemNumber] as? NSNumber,
+              let fileNumber = attributes[.systemFileNumber] as? NSNumber
+        else { return nil }
+        return FileMetadata(
+            identity: FileIdentity(
+                systemNumber: systemNumber.uint64Value,
+                fileNumber: fileNumber.uint64Value
+            ),
+            size: size.uint64Value,
+            modificationDate: modificationDate
+        )
     }
 
     static func parse(
         lines: [String],
         modificationDate: Date,
-        now: Date
+        now: Date,
+        target: TaskProgressTarget? = nil
     ) -> TaskProgressSnapshot {
-        var lifecycle: TaskProgressKind?
-        var pendingUserInputCalls = Set<String>()
-        var latestUserTitle: String?
-        var activeTaskTitle: String?
-        var taskStartedAt = modificationDate
+        var state = LifecycleState()
 
         for line in lines {
             // 先用字符串筛选可能相关的行，再做 JSON 解析，降低大日志的刷新成本。
-            guard line.contains("task_started")
-                || line.contains("task_complete")
-                || line.contains("task_failed")
-                || line.contains("turn_aborted")
-                || line.contains(#""type":"error""#)
-                || line.contains("user_message")
-                || line.contains("request_user_input")
-                || line.contains("function_call_output")
-                || line.contains("custom_tool_call_output")
-            else { continue }
+            guard isPotentiallyRelevant(line: line) else { continue }
 
             guard let data = line.data(using: .utf8),
-                  let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let payload = record["payload"] as? [String: Any],
-                  let payloadType = payload["type"] as? String
+                  let record = try? JSONSerialization.jsonObject(
+                      with: data
+                  ) as? [String: Any]
             else { continue }
-
-            if record["type"] as? String == "event_msg" {
-                if payloadType == "user_message",
-                   let message = payload["message"] as? String,
-                   let title = taskTitle(from: message)
-                {
-                    latestUserTitle = title
-                } else if payloadType == "task_started" {
-                    lifecycle = .running
-                    pendingUserInputCalls.removeAll()
-                    activeTaskTitle = latestUserTitle ?? activeTaskTitle
-                    taskStartedAt = timestamp(from: record) ?? modificationDate
-                } else if payloadType == "task_complete" {
-                    lifecycle = .completed
-                    pendingUserInputCalls.removeAll()
-                } else if ["task_failed", "turn_aborted", "error"].contains(payloadType) {
-                    lifecycle = .failed
-                    pendingUserInputCalls.removeAll()
-                }
-                continue
-            }
-
-            // request_user_input 发出后记录 call_id；收到对应输出才视为用户已响应。
-            if ["function_call", "custom_tool_call"].contains(payloadType),
-               payload["name"] as? String == "request_user_input",
-               let callID = payload["call_id"] as? String
-            {
-                pendingUserInputCalls.insert(callID)
-                continue
-            }
-
-            if ["function_call_output", "custom_tool_call_output"].contains(payloadType),
-               let callID = payload["call_id"] as? String
-            {
-                pendingUserInputCalls.remove(callID)
-            }
+            apply(
+                record: record,
+                to: &state,
+                modificationDate: modificationDate
+            )
         }
 
-        let title = activeTaskTitle ?? latestUserTitle ?? "Codex 任务"
-        if lifecycle == .running, !pendingUserInputCalls.isEmpty {
+        return snapshot(
+            from: state,
+            modificationDate: modificationDate,
+            now: now,
+            target: target
+        )
+    }
+
+    private static func consumeRelevantLine(
+        in data: Data,
+        range: Range<Data.Index>,
+        state: inout LifecycleState,
+        modificationDate: Date,
+        diagnostics: inout ReadDiagnostics
+    ) {
+        guard relevantLineMarkers.contains(where: {
+            data.range(of: $0, options: [], in: range) != nil
+        }) else { return }
+
+        diagnostics.jsonDecodingAttemptCount += 1
+        let lineData = data.subdata(in: range)
+        guard let record = try? JSONSerialization.jsonObject(
+            with: lineData
+        ) as? [String: Any] else { return }
+        apply(
+            record: record,
+            to: &state,
+            modificationDate: modificationDate
+        )
+    }
+
+    private static func apply(
+        record: [String: Any],
+        to state: inout LifecycleState,
+        modificationDate: Date
+    ) {
+        guard let payload = record["payload"] as? [String: Any],
+              let payloadType = payload["type"] as? String
+        else { return }
+
+        if record["type"] as? String == "event_msg" {
+            if payloadType == "user_message",
+               let message = payload["message"] as? String,
+               let title = taskTitle(from: message)
+            {
+                state.latestUserTitle = title
+            } else if payloadType == "task_started" {
+                state.lifecycle = .running
+                state.pendingInteractionCalls.removeAll()
+                state.activeTaskTitle = state.latestUserTitle ?? state.activeTaskTitle
+                state.taskStartedAt = timestamp(from: record) ?? modificationDate
+            } else if payloadType == "task_complete" {
+                state.lifecycle = .completed
+                state.pendingInteractionCalls.removeAll()
+            } else if ["task_failed", "turn_aborted", "error"].contains(payloadType) {
+                state.lifecycle = .failed
+                state.pendingInteractionCalls.removeAll()
+            }
+            return
+        }
+
+        // 用户输入或命令审批发出后记录 call_id；收到对应输出才视为用户已响应。
+        if ["function_call", "custom_tool_call"].contains(payloadType),
+           isPendingInteractionCall(payload),
+           let callID = payload["call_id"] as? String
+        {
+            state.pendingInteractionCalls.insert(callID)
+            return
+        }
+
+        if ["function_call_output", "custom_tool_call_output"].contains(payloadType),
+           let callID = payload["call_id"] as? String
+        {
+            state.pendingInteractionCalls.remove(callID)
+        }
+    }
+
+    private static func isPendingInteractionCall(_ payload: [String: Any]) -> Bool {
+        guard let name = payload["name"] as? String else { return false }
+        if name == "request_user_input" { return true }
+
+        if name == "exec_command",
+           let rawArguments = payload["arguments"] as? String,
+           let data = rawArguments.data(using: .utf8),
+           let arguments = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            return arguments["sandbox_permissions"] as? String == "require_escalated"
+        }
+
+        guard name == "exec",
+              let input = payload["input"] as? String,
+              input.contains("tools.exec_command")
+        else { return false }
+        return input.range(
+            of: #"[\"']?sandbox_permissions[\"']?\s*:\s*[\"']require_escalated[\"']"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func snapshot(
+        from state: LifecycleState,
+        modificationDate: Date,
+        now: Date,
+        target: TaskProgressTarget?
+    ) -> TaskProgressSnapshot {
+        let title = state.activeTaskTitle ?? state.latestUserTitle ?? "Codex 任务"
+        let taskStartedAt = state.taskStartedAt ?? modificationDate
+        if state.lifecycle == .running, !state.pendingInteractionCalls.isEmpty {
             return TaskProgressSnapshot(items: [TaskProgressItem(
                 title: title,
                 kind: .waitingForInput,
-                startedAt: taskStartedAt
+                startedAt: taskStartedAt,
+                target: target
             )])
         }
-        if let lifecycle {
+        if let lifecycle = state.lifecycle {
             return TaskProgressSnapshot(items: [TaskProgressItem(
                 title: title,
                 kind: lifecycle,
-                startedAt: taskStartedAt
+                startedAt: taskStartedAt,
+                target: target
             )])
         }
-        if !pendingUserInputCalls.isEmpty {
+        if !state.pendingInteractionCalls.isEmpty {
             return TaskProgressSnapshot(items: [TaskProgressItem(
                 title: title,
                 kind: .waitingForInput,
-                startedAt: taskStartedAt
+                startedAt: taskStartedAt,
+                target: target
             )])
         }
         if now.timeIntervalSince(modificationDate) <= 30 * 60 {
             return TaskProgressSnapshot(items: [TaskProgressItem(
                 title: title,
                 kind: .running,
-                startedAt: taskStartedAt
+                startedAt: taskStartedAt,
+                target: target
             )])
         }
         return .idle
     }
+
+    private static func isPotentiallyRelevant(line: String) -> Bool {
+        line.contains("task_started")
+            || line.contains("task_complete")
+            || line.contains("task_failed")
+            || line.contains("turn_aborted")
+            || line.contains(#""error""#)
+            || line.contains("user_message")
+            || line.contains("request_user_input")
+            || line.contains("require_escalated")
+            || line.contains("function_call_output")
+            || line.contains("custom_tool_call_output")
+    }
+
+    private static let relevantLineMarkers = [
+        Data("task_started".utf8),
+        Data("task_complete".utf8),
+        Data("task_failed".utf8),
+        Data("turn_aborted".utf8),
+        Data(#""type":"error""#.utf8),
+        Data(#""error""#.utf8),
+        Data("user_message".utf8),
+        Data("request_user_input".utf8),
+        Data("require_escalated".utf8),
+        Data("function_call_output".utf8),
+        Data("custom_tool_call_output".utf8),
+    ]
 
     private static func taskTitle(from rawMessage: String) -> String? {
         var value = rawMessage
@@ -386,14 +787,27 @@ final class CodexTaskProgressReader {
     }
 
     static func isUserVisibleSessionMetadata(line: String) -> Bool {
-        guard let data = line.data(using: .utf8),
-              let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              record["type"] as? String == "session_meta",
-              let payload = record["payload"] as? [String: Any]
-        else {
-            return true
-        }
+        isUserVisibleSessionMetadata(data: Data(line.utf8))
+    }
 
+    static func isUserVisibleSessionMetadata(data: Data) -> Bool {
+        guard let payload = sessionMetadataPayload(data: data) else { return true }
+        return isUserVisibleSessionMetadata(payload: payload)
+    }
+
+    static func taskTarget(
+        sessionMetadataLine: String,
+        rolloutURL: URL
+    ) -> TaskProgressTarget {
+        taskTarget(
+            payload: sessionMetadataPayload(data: Data(sessionMetadataLine.utf8)),
+            rolloutURL: rolloutURL
+        )
+    }
+
+    private static func isUserVisibleSessionMetadata(
+        payload: [String: Any]
+    ) -> Bool {
         let threadSource = (payload["thread_source"] as? String)?.lowercased()
         if threadSource == "subagent" || threadSource == "automation" {
             return false
@@ -402,6 +816,73 @@ final class CodexTaskProgressReader {
             return false
         }
         return true
+    }
+
+    private static func sessionMetadataPayload(data: Data) -> [String: Any]? {
+        let lineEnd = data.firstIndex(of: 0x0A) ?? data.endIndex
+        let firstLineData = data.subdata(in: data.startIndex..<lineEnd)
+        guard let record = try? JSONSerialization.jsonObject(
+            with: firstLineData
+        ) as? [String: Any],
+        record["type"] as? String == "session_meta"
+        else { return nil }
+        return record["payload"] as? [String: Any]
+    }
+
+    private static func taskTarget(
+        payload: [String: Any]?,
+        rolloutURL: URL
+    ) -> TaskProgressTarget {
+        let payloadThreadID = (payload?["id"] as? String)
+            ?? (payload?["thread_id"] as? String)
+        let normalizedPayloadThreadID = payloadThreadID.flatMap(normalizedThreadID)
+        let workingDirectory: String? = (payload?["cwd"] as? String).flatMap {
+            rawValue -> String? in
+            let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            return URL(fileURLWithPath: trimmed).standardizedFileURL.path
+        }
+
+        return TaskProgressTarget(
+            threadID: normalizedPayloadThreadID ?? threadID(from: rolloutURL),
+            client: taskClient(from: payload),
+            workingDirectory: workingDirectory,
+            rolloutPath: rolloutURL.path
+        )
+    }
+
+    private static func normalizedThreadID(_ value: String) -> String? {
+        let pattern = #"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"#
+        guard value.range(of: pattern, options: .regularExpression) != nil else {
+            return nil
+        }
+        return value.lowercased()
+    }
+
+    private static func taskClient(from payload: [String: Any]?) -> CodexTaskClient {
+        let originator = (payload?["originator"] as? String)?.lowercased() ?? ""
+        let sourceName: String
+        if let source = payload?["source"] as? String {
+            sourceName = source.lowercased()
+        } else if let source = payload?["source"] as? [String: Any] {
+            sourceName = source.keys.map { $0.lowercased() }.joined(separator: " ")
+        } else {
+            sourceName = ""
+        }
+
+        if sourceName.contains("vscode")
+            || originator.contains("desktop")
+            || originator.contains("codex_work")
+        {
+            return .app
+        }
+        if sourceName.contains("cli")
+            || originator.contains("codex-tui")
+            || originator.contains("codex_cli")
+        {
+            return .cli
+        }
+        return .unknown
     }
 
     static func shouldDisplay(
@@ -507,11 +988,7 @@ final class CodexTaskProgressReader {
         }
 
         guard let data = try? Data(contentsOf: stateURL),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let atomState = root["electron-persisted-atom-state"] as? [String: Any],
-              let unreadByHost = atomState[
-                  "unread-thread-ids-by-host-v1"
-              ] as? [String: Any]
+              let unreadState = Self.unreadThreadState(from: data)
         else {
             return UnreadThreadState(
                 ids: cachedUnreadThreadIDs,
@@ -519,21 +996,69 @@ final class CodexTaskProgressReader {
             )
         }
 
-        var ids = Set<String>()
-        for value in unreadByHost.values {
-            guard let hostIDs = value as? [String] else { continue }
-            ids.formUnion(hostIDs.map { $0.lowercased() })
-        }
-        cachedUnreadThreadIDs = ids
+        cachedUnreadThreadIDs = unreadState.ids
         cachedUnreadStateModificationDate = modificationDate
         hasCachedUnreadState = true
+        return unreadState
+    }
+
+    static func unreadThreadState(from data: Data) -> UnreadThreadState? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+
+        if let rawThreadReadState = root["electron-thread-read-state-v1"] {
+            guard let threadReadState = rawThreadReadState as? [String: Any],
+                  let unreadByIdentity = threadReadState[
+                      "unreadByIdentity"
+                  ] as? [String: Any]
+            else { return nil }
+
+            var ids = Set<String>()
+            for value in unreadByIdentity.values {
+                guard let unreadByHost = value as? [String: Any],
+                      let identityIDs = unreadThreadIDs(from: unreadByHost)
+                else { return nil }
+                ids.formUnion(identityIDs)
+            }
+            return UnreadThreadState(ids: ids, isAvailable: true)
+        }
+
+        guard let atomState = root[
+            "electron-persisted-atom-state"
+        ] as? [String: Any],
+        let unreadByHost = atomState[
+            "unread-thread-ids-by-host-v1"
+        ] as? [String: Any],
+        let ids = unreadThreadIDs(from: unreadByHost)
+        else { return nil }
         return UnreadThreadState(ids: ids, isAvailable: true)
+    }
+
+    private static func unreadThreadIDs(
+        from unreadByHost: [String: Any]
+    ) -> Set<String>? {
+        var ids = Set<String>()
+        for value in unreadByHost.values {
+            guard let hostIDs = value as? [String] else { return nil }
+            ids.formUnion(hostIDs.map { $0.lowercased() })
+        }
+        return ids
     }
 
     private func recentRollouts(
         at now: Date,
         unreadThreadIDs: Set<String>
     ) -> [RolloutCandidate] {
+        if let rolloutURLsProvider {
+            return rolloutURLsProvider().compactMap { url in
+                guard isUserVisibleRollout(url) else { return nil }
+                let modified = (try? url.resourceValues(
+                    forKeys: [.contentModificationDateKey]
+                ).contentModificationDate) ?? now
+                return RolloutCandidate(url: url, modificationDate: modified)
+            }
+        }
+
         if let override = ProcessInfo.processInfo.environment[
             "CODEX_STATUS_PANEL_TASK_ROLLOUT_FILE"
         ],
@@ -605,57 +1130,8 @@ final class CodexTaskProgressReader {
     }
 
     private func isUserVisibleRollout(_ url: URL) -> Bool {
-        if let cached = cachedRolloutVisibility[url.path] { return cached }
-
-        var isVisible = true
-        if let handle = try? FileHandle(forReadingFrom: url) {
-            // defer 会在当前作用域退出时执行，确保所有分支都能关闭文件句柄。
-            defer { try? handle.close() }
-            if let data = try? handle.read(upToCount: 262_144),
-               let text = String(data: data, encoding: .utf8),
-               let firstLine = text.split(
-                   separator: "\n",
-                   maxSplits: 1
-               ).first
-            {
-                isVisible = Self.isUserVisibleSessionMetadata(
-                    line: String(firstLine)
-                )
-            }
-        }
-        cachedRolloutVisibility[url.path] = isVisible
-        return isVisible
-    }
-
-    private func readTailLines(from url: URL) -> [String]? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return nil
-        }
-        defer { try? handle.close() }
-
-        // 只读取末尾最多 1 MiB；任务生命周期事件位于日志尾部，无需加载整个文件。
-        let fileSize = (try? handle.seekToEnd()) ?? 0
-        let startOffset = fileSize > maximumTailBytes
-            ? fileSize - maximumTailBytes
-            : 0
-        do {
-            try handle.seek(toOffset: startOffset)
-            guard var data = try handle.readToEnd(), !data.isEmpty else {
-                return []
-            }
-            // 从文件中间开始时，第一段通常是不完整 JSON，丢到首个换行符之后再解析。
-            if startOffset > 0,
-               let firstNewline = data.firstIndex(of: 0x0A)
-            {
-                data.removeSubrange(...firstNewline)
-            }
-            guard let text = String(data: data, encoding: .utf8) else {
-                return nil
-            }
-            return text.split(whereSeparator: \.isNewline).map(String.init)
-        } catch {
-            return nil
-        }
+        guard let metadata = fileMetadata(for: url) else { return true }
+        return sessionInfo(for: url, metadata: metadata).isUserVisible
     }
 
     private static let iso8601WithFractional: ISO8601DateFormatter = {

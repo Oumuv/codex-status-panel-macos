@@ -114,6 +114,20 @@ func printTaskProgressOnce() -> Never {
 }
 
 func runMenuControlsSelfTest() -> Never {
+    let redrawView = QuotaPanelView(
+        frame: NSRect(origin: .zero, size: expandedPanelSize)
+    )
+    var redrawRequestCount = 0
+    let redrawObservation = redrawView.observe(\.needsDisplay) { _, _ in
+        redrawRequestCount += 1
+    }
+    redrawView.followStatusText = "跟随中"
+    let followStatusDoesNotInvalidatePanel = redrawRequestCount == 0
+    let followStatusValueUpdated = redrawView.followStatusText == "跟随中"
+    redrawView.statusText = "已更新"
+    let renderedStatusInvalidatesPanel = redrawRequestCount > 0
+    withExtendedLifetime(redrawObservation) {}
+
     let visibleExpandedState = panelMenuControlState(
         isPanelVisible: true,
         isPanelHiddenByUser: false,
@@ -138,6 +152,16 @@ func runMenuControlsSelfTest() -> Never {
         showsMarketPrices: true,
         showsStockPrices: false
     )
+    let redrawChecks = [
+        ("follow-status-invalidated-panel", followStatusDoesNotInvalidatePanel),
+        ("follow-status-value-not-updated", followStatusValueUpdated),
+        ("rendered-status-did-not-invalidate-panel", renderedStatusInvalidatesPanel),
+    ]
+    if let failedRedrawCheck = redrawChecks.first(where: { !$0.1 }) {
+        fputs("menu-controls-self-test: failed (\(failedRedrawCheck.0))\n", stderr)
+        exit(1)
+    }
+
     let checks = [
         statusBarSymbolName(for: menuBarDisplayState(
             isRefreshing: true,
@@ -161,6 +185,8 @@ func runMenuControlsSelfTest() -> Never {
         )) == "bolt.circle",
         collapsedMenuItemTitle(isCollapsed: false) == "折叠面板",
         collapsedMenuItemTitle(isCollapsed: true) == "展开面板",
+        panelVisibilityMenuItemTitle(showPanelEnabled: true) == "显示面板",
+        panelVisibilityMenuItemTitle(showPanelEnabled: false) == "隐藏面板",
         visibleExpandedState == PanelMenuControlState(
             showPanelEnabled: false,
             hidePanelEnabled: true,
@@ -564,6 +590,8 @@ func runMarketDataSelfTest() -> Never {
 }
 
 func printPanelPlacementOnce(savedStateOnly: Bool = false) -> Never {
+    // CLI 路径也可能需要读取 NSScreen；先显式完成 AppKit 应用初始化。
+    _ = NSApplication.shared
     let locator = PetWindowLocator()
     let result = savedStateOnly ? locator.locateSavedState() : locator.locate()
     guard let location = result else {
@@ -587,6 +615,16 @@ func printPanelPlacementOnce(savedStateOnly: Bool = false) -> Never {
             + "gap=\(String(format: "%.1f", placement.actualGap)) "
             + "centerError=\(String(format: "%.1f", placement.centerError))"
     )
+    exit(0)
+}
+
+func printPetWindowDiagnostics() -> Never {
+    let diagnostics = PetWindowLocator().windowDiagnostics()
+    if diagnostics.isEmpty {
+        print("pet-window-diagnostics: 没有可见的 Codex/ChatGPT 窗口")
+    } else {
+        diagnostics.forEach { print($0) }
+    }
     exit(0)
 }
 
@@ -653,6 +691,45 @@ func runPlacementSelfTest() -> Never {
         }
     }
 
+    let primaryScreen = NSRect(x: 0, y: 0, width: 1_512, height: 982)
+    let secondaryScreen = NSRect(x: -1_920, y: -98, width: 1_920, height: 1_080)
+    let standaloneSize = NSSize(width: 232, height: 143)
+    let savedSecondaryOrigin = NSPoint(x: -500, y: 400)
+    guard standalonePanelOrigin(
+        savedOrigin: savedSecondaryOrigin,
+        panelSize: standaloneSize,
+        screenVisibleFrames: [primaryScreen, secondaryScreen],
+        preferredScreenVisibleFrame: primaryScreen
+    ) == savedSecondaryOrigin else {
+        fputs("standalone-placement: saved secondary position was not preserved\n", stderr)
+        exit(1)
+    }
+    guard standalonePanelOrigin(
+        savedOrigin: NSPoint(x: 5_000, y: 5_000),
+        panelSize: standaloneSize,
+        screenVisibleFrames: [primaryScreen, secondaryScreen],
+        preferredScreenVisibleFrame: primaryScreen
+    ) == NSPoint(x: 1_256, y: 815) else {
+        fputs("standalone-placement: offscreen position did not use preferred screen\n", stderr)
+        exit(1)
+    }
+    guard standalonePanelOrigin(
+        savedOrigin: NSPoint(x: 1_450, y: 950),
+        panelSize: standaloneSize,
+        screenVisibleFrames: [primaryScreen, secondaryScreen],
+        preferredScreenVisibleFrame: secondaryScreen
+    ) == NSPoint(x: 1_272, y: 831) else {
+        fputs("standalone-placement: partially visible position was not constrained\n", stderr)
+        exit(1)
+    }
+
+    guard PetWindowLocator.stateCompatibilitySelfTest(),
+          PetWindowLocator.candidateOwnershipSelfTest()
+    else {
+        fputs("pet-state-compatibility: state parsing or self-window rejection failed\n", stderr)
+        exit(1)
+    }
+
     let staleStateURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("codex-panel-stale-display-state-\(UUID().uuidString).json")
     let staleState = #"{"electron-avatar-overlay-open":true,"electron-avatar-overlay-bounds":{"x":500,"y":300,"displayId":2,"placement":"top-end","byDisplayId":{"3":{"x":100,"y":300,"width":356,"height":320,"displayId":3,"placement":"top-end","mascot":{"left":221,"top":196,"width":107,"height":116}}}}}"#
@@ -689,8 +766,330 @@ func runPlacementSelfTest() -> Never {
         exit(1)
     }
 
-    print("placement-self-test: 8/8 passed; gap=14.0; centerError=0.0")
+    print("placement-self-test: 13/13 passed; standalone=3/3; legacy-state=pass; compact-state=pass; anchor-state=pass; self-window=pass; gap=14.0; centerError=0.0")
     exit(0)
+}
+
+private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
+    let fileManager = FileManager.default
+    let fixtureDirectory = fileManager.temporaryDirectory.appendingPathComponent(
+        "codex-status-panel-task-progress-\(UUID().uuidString)",
+        isDirectory: true
+    )
+    try fileManager.createDirectory(
+        at: fixtureDirectory,
+        withIntermediateDirectories: true
+    )
+    defer { try? fileManager.removeItem(at: fixtureDirectory) }
+
+    let sessionMetadata = #"{"type":"session_meta","payload":{"thread_source":"user"}}"#
+    let navigationThreadID = "12345678-1234-4abc-8def-1234567890ab"
+    let navigationMetadata = #"{"type":"session_meta","payload":{"id":"\#(navigationThreadID)","cwd":"/tmp/navigation-project","originator":"codex-tui","source":"cli","thread_source":"user"}}"#
+    let userMessage = #"{"type":"event_msg","payload":{"type":"user_message","message":"阶段二增量任务"}}"#
+    let started = #"{"type":"event_msg","payload":{"type":"task_started"}}"#
+    let completed = #"{"type":"event_msg","payload":{"type":"task_complete"}}"#
+    let taskFailed = #"{"type":"event_msg","payload":{"type":"task_failed"}}"#
+    let aborted = #"{"type":"event_msg","payload":{"type":"turn_aborted"}}"#
+    let request = #"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call-stage-2"}}"#
+    let response = #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-stage-2"}}"#
+    let cliApproval = #"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"date\",\"sandbox_permissions\":\"require_escalated\"}","call_id":"call-cli-incremental"}}"#
+    let noUnreadState = CodexTaskProgressReader.UnreadThreadState(
+        ids: [],
+        isAvailable: false
+    )
+    var clockOffset: TimeInterval = 0
+    var failures: [String] = []
+
+    func nextDate() -> Date {
+        clockOffset += 1
+        return now.addingTimeInterval(clockOffset)
+    }
+
+    @discardableResult
+    func setModificationDate(for url: URL) throws -> Date {
+        let date = nextDate()
+        try fileManager.setAttributes(
+            [.modificationDate: date],
+            ofItemAtPath: url.path
+        )
+        return date
+    }
+
+    @discardableResult
+    func writeLines(_ lines: [String], to url: URL) throws -> Date {
+        let text = lines.joined(separator: "\n") + "\n"
+        try Data(text.utf8).write(to: url, options: .atomic)
+        return try setModificationDate(for: url)
+    }
+
+    @discardableResult
+    func append(_ data: Data, to url: URL) throws -> Date {
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+        return try setModificationDate(for: url)
+    }
+
+    @discardableResult
+    func overwriteInPlace(_ lines: [String], at url: URL) throws -> Date {
+        let data = Data((lines.joined(separator: "\n") + "\n").utf8)
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: data)
+        return try setModificationDate(for: url)
+    }
+
+    func makeReader(
+        urls: @escaping () -> [URL]
+    ) -> CodexTaskProgressReader {
+        CodexTaskProgressReader(
+            rolloutURLsProvider: urls,
+            threadTitlesOverride: [:],
+            unreadStateOverride: noUnreadState
+        )
+    }
+
+    func record(_ name: String, _ condition: @autoclosure () -> Bool) {
+        if !condition() { failures.append(name) }
+    }
+
+    let lifecycleURL = fixtureDirectory.appendingPathComponent("lifecycle.jsonl")
+    try writeLines([sessionMetadata, userMessage, started], to: lifecycleURL)
+    let lifecycleReader = makeReader { [lifecycleURL] }
+    let initial = lifecycleReader.read(at: nextDate())
+    record(
+        "initial-rebuild",
+        initial.kind == .running
+            && initial.items.first?.title == "阶段二增量任务"
+            && lifecycleReader.lastReadDiagnostics.fullRebuildCount == 1
+            && lifecycleReader.lastReadDiagnostics.bytesRead > 0
+    )
+
+    let unchanged = lifecycleReader.read(at: nextDate())
+    record(
+        "unchanged-zero-read",
+        unchanged == initial
+            && lifecycleReader.lastReadDiagnostics.bytesRead == 0
+            && lifecycleReader.lastReadDiagnostics.cacheHitCount == 1
+    )
+
+    let requestData = Data((request + "\n").utf8)
+    try append(requestData, to: lifecycleURL)
+    let waiting = lifecycleReader.read(at: nextDate())
+    record(
+        "append-waiting",
+        waiting.kind == .waitingForInput
+            && lifecycleReader.lastReadDiagnostics.bytesRead == requestData.count
+            && lifecycleReader.lastReadDiagnostics.incrementalReadCount == 1
+            && lifecycleReader.lastReadDiagnostics.fullRebuildCount == 0
+    )
+
+    let responseData = Data((response + "\n").utf8)
+    try append(responseData, to: lifecycleURL)
+    let resumed = lifecycleReader.read(at: nextDate())
+    record(
+        "append-resumed",
+        resumed.kind == .running
+            && lifecycleReader.lastReadDiagnostics.bytesRead == responseData.count
+            && lifecycleReader.lastReadDiagnostics.incrementalReadCount == 1
+    )
+
+    let completedData = Data((completed + "\n").utf8)
+    try append(completedData, to: lifecycleURL)
+    let completedSnapshot = lifecycleReader.read(at: nextDate())
+    record(
+        "append-completed",
+        completedSnapshot.kind == .completed
+            && lifecycleReader.lastReadDiagnostics.bytesRead == completedData.count
+            && lifecycleReader.lastReadDiagnostics.incrementalReadCount == 1
+    )
+
+    let partialURL = fixtureDirectory.appendingPathComponent("partial.jsonl")
+    try writeLines([sessionMetadata, started], to: partialURL)
+    let partialReader = makeReader { [partialURL] }
+    _ = partialReader.read(at: nextDate())
+    let requestBytes = Data(cliApproval.utf8)
+    let splitIndex = requestBytes.count / 2
+    let firstHalf = requestBytes.subdata(in: 0..<splitIndex)
+    let secondHalf = requestBytes.subdata(in: splitIndex..<requestBytes.count)
+        + Data("\n".utf8)
+    try append(firstHalf, to: partialURL)
+    let partialSnapshot = partialReader.read(at: nextDate())
+    let firstHalfWasBuffered = partialSnapshot.kind == .running
+        && partialReader.lastReadDiagnostics.completeLineCount == 0
+    try append(secondHalf, to: partialURL)
+    let completedPartialSnapshot = partialReader.read(at: nextDate())
+    record(
+        "partial-cli-approval-line-once",
+        firstHalfWasBuffered
+            && completedPartialSnapshot.kind == .waitingForInput
+            && partialReader.lastReadDiagnostics.completeLineCount == 1
+            && partialReader.lastReadDiagnostics.bytesRead == secondHalf.count
+    )
+
+    let truncatedURL = fixtureDirectory.appendingPathComponent("truncated.jsonl")
+    try writeLines([sessionMetadata, userMessage, started], to: truncatedURL)
+    let truncatedReader = makeReader { [truncatedURL] }
+    _ = truncatedReader.read(at: nextDate())
+    let truncatedTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"截断后任务"}}"#
+    try overwriteInPlace(
+        [sessionMetadata, truncatedTitle, started],
+        at: truncatedURL
+    )
+    let truncatedSnapshot = truncatedReader.read(at: nextDate())
+    record(
+        "truncated-rebuild",
+        truncatedSnapshot.items.first?.title == "截断后任务"
+            && truncatedReader.lastReadDiagnostics.fullRebuildCount == 1
+    )
+
+    let replacedURL = fixtureDirectory.appendingPathComponent("replaced.jsonl")
+    try writeLines([sessionMetadata, userMessage, started], to: replacedURL)
+    let replacedReader = makeReader { [replacedURL] }
+    _ = replacedReader.read(at: nextDate())
+    try fileManager.removeItem(at: replacedURL)
+    let replacementTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"替换后任务"}}"#
+    try writeLines([sessionMetadata, replacementTitle, started], to: replacedURL)
+    let replacedSnapshot = replacedReader.read(at: nextDate())
+    record(
+        "same-path-replacement",
+        replacedSnapshot.items.first?.title == "替换后任务"
+            && replacedReader.lastReadDiagnostics.fullRebuildCount == 1
+    )
+
+    let oversizedURL = fixtureDirectory.appendingPathComponent("oversized.jsonl")
+    try writeLines([sessionMetadata, started], to: oversizedURL)
+    let oversizedReader = makeReader { [oversizedURL] }
+    _ = oversizedReader.read(at: nextDate())
+    let oversizedRecord = "{\"type\":\"noop\",\"padding\":\""
+        + String(repeating: "x", count: 1_048_576 + 1_024)
+        + "\"}\n"
+    try append(Data(oversizedRecord.utf8), to: oversizedURL)
+    let oversizedSnapshot = oversizedReader.read(at: nextDate())
+    record(
+        "oversized-bounded-rebuild",
+        oversizedSnapshot.kind == .running
+            && oversizedReader.lastReadDiagnostics.fullRebuildCount == 1
+            && oversizedReader.lastReadDiagnostics.incrementalReadCount == 0
+            && oversizedReader.lastReadDiagnostics.bytesRead <= 1_048_576
+    )
+
+    let irrelevantURL = fixtureDirectory.appendingPathComponent("irrelevant.jsonl")
+    try writeLines([sessionMetadata, started], to: irrelevantURL)
+    let irrelevantReader = makeReader { [irrelevantURL] }
+    _ = irrelevantReader.read(at: nextDate())
+    let irrelevantRecord = "{\"type\":\"noop\",\"padding\":\""
+        + String(repeating: "界", count: 170_000)
+        + "\"}\n"
+    let irrelevantData = Data(irrelevantRecord.utf8)
+    try append(irrelevantData, to: irrelevantURL)
+    let irrelevantSnapshot = irrelevantReader.read(at: nextDate())
+    record(
+        "irrelevant-byte-filter",
+        irrelevantSnapshot.kind == .running
+            && irrelevantReader.lastReadDiagnostics.bytesRead == irrelevantData.count
+            && irrelevantReader.lastReadDiagnostics.incrementalReadCount == 1
+            && irrelevantReader.lastReadDiagnostics.stringFilterLineCount == 0
+            && irrelevantReader.lastReadDiagnostics.jsonDecodingAttemptCount == 0
+    )
+
+    let middleURL = fixtureDirectory.appendingPathComponent("middle.jsonl")
+    let middleTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"中段读取任务"}}"#
+    let middleData = Data(
+        (navigationMetadata + "\n"
+            + String(repeating: "x", count: 1_048_576 + 4_096)
+            + "\n\(middleTitle)\n\(started)\n").utf8
+    )
+    try middleData.write(to: middleURL, options: .atomic)
+    try setModificationDate(for: middleURL)
+    let middleReader = makeReader { [middleURL] }
+    let middleSnapshot = middleReader.read(at: nextDate())
+    record(
+        "middle-first-line-discarded",
+        middleSnapshot.items.first?.title == "中段读取任务"
+            && middleSnapshot.items.first?.target?.threadID == navigationThreadID
+            && middleSnapshot.items.first?.target?.client == .cli
+            && middleSnapshot.items.first?.target?.workingDirectory
+                == "/tmp/navigation-project"
+            && middleReader.lastReadDiagnostics.bytesRead <= 1_048_576
+    )
+
+    let firstCacheURL = fixtureDirectory.appendingPathComponent("cache-1.jsonl")
+    let secondCacheURL = fixtureDirectory.appendingPathComponent("cache-2.jsonl")
+    let firstCacheTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"缓存一"}}"#
+    let secondCacheTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"缓存二"}}"#
+    try writeLines([sessionMetadata, firstCacheTitle, started], to: firstCacheURL)
+    try writeLines([sessionMetadata, secondCacheTitle, started], to: secondCacheURL)
+    var cachedURLs = [firstCacheURL]
+    let evictionReader = makeReader { cachedURLs }
+    _ = evictionReader.read(at: nextDate())
+    cachedURLs = [secondCacheURL]
+    let secondCacheSnapshot = evictionReader.read(at: nextDate())
+    record(
+        "cache-eviction",
+        secondCacheSnapshot.items.first?.title == "缓存二"
+            && evictionReader.lastReadDiagnostics.cacheEntryCount == 1
+    )
+
+    let spacedErrorURL = fixtureDirectory.appendingPathComponent("spaced-error.jsonl")
+    let spacedError = #"{"type" : "event_msg", "payload" : {"type" : "error"}}"#
+    try writeLines([sessionMetadata, spacedError], to: spacedErrorURL)
+    let spacedErrorReader = makeReader { [spacedErrorURL] }
+    record(
+        "spaced-error-marker",
+        spacedErrorReader.read(at: nextDate()).kind == .failed
+    )
+
+    let semanticURL = fixtureDirectory.appendingPathComponent("semantic.jsonl")
+    let unicodeTitle = #"{"type" : "event_msg", "payload" : {"type" : "user_message", "message" : "蓝色小龙任务"}}"#
+    let semanticLines = [unicodeTitle, started, request, response, completed]
+    try writeLines([sessionMetadata] + semanticLines, to: semanticURL)
+    let semanticReader = makeReader { [semanticURL] }
+    let semanticSnapshot = semanticReader.read(at: nextDate())
+    let referenceSnapshot = CodexTaskProgressReader.parse(
+        lines: semanticLines,
+        modificationDate: try semanticURL.resourceValues(
+            forKeys: [.contentModificationDateKey]
+        ).contentModificationDate ?? now,
+        now: nextDate(),
+        target: CodexTaskProgressReader.taskTarget(
+            sessionMetadataLine: sessionMetadata,
+            rolloutURL: semanticURL
+        )
+    )
+    record("semantic-equivalence", semanticSnapshot == referenceSnapshot)
+
+    let failedURL = fixtureDirectory.appendingPathComponent("task-failed.jsonl")
+    try writeLines([sessionMetadata, started], to: failedURL)
+    let failedReader = makeReader { [failedURL] }
+    _ = failedReader.read(at: nextDate())
+    let taskFailedData = Data((taskFailed + "\n").utf8)
+    try append(taskFailedData, to: failedURL)
+    let failedSnapshot = failedReader.read(at: nextDate())
+    record(
+        "append-task-failed",
+        failedSnapshot.kind == .failed
+            && failedReader.lastReadDiagnostics.bytesRead == taskFailedData.count
+            && failedReader.lastReadDiagnostics.incrementalReadCount == 1
+    )
+
+    let abortedURL = fixtureDirectory.appendingPathComponent("turn-aborted.jsonl")
+    try writeLines([sessionMetadata, started], to: abortedURL)
+    let abortedReader = makeReader { [abortedURL] }
+    _ = abortedReader.read(at: nextDate())
+    let abortedData = Data((aborted + "\n").utf8)
+    try append(abortedData, to: abortedURL)
+    let abortedSnapshot = abortedReader.read(at: nextDate())
+    record(
+        "append-turn-aborted",
+        abortedSnapshot.kind == .failed
+            && abortedReader.lastReadDiagnostics.bytesRead == abortedData.count
+            && abortedReader.lastReadDiagnostics.incrementalReadCount == 1
+    )
+
+    return failures
 }
 
 func runTaskProgressSelfTest() -> Never {
@@ -700,10 +1099,32 @@ func runTaskProgressSelfTest() -> Never {
     let failed = #"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
     let request = #"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call-1"}}"#
     let response = #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1"}}"#
+    let cliApproval = #"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"date\",\"sandbox_permissions\":\"require_escalated\"}","call_id":"call-cli-approval"}}"#
+    let cliApprovalResponse = #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-cli-approval"}}"#
+    let bridgedApproval = #"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const result = await tools.exec_command({ cmd: \"date\", sandbox_permissions: \"require_escalated\" });","call_id":"call-bridged-approval"}}"#
+    let bridgedApprovalResponse = #"{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-bridged-approval"}}"#
+    let regularExec = #"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const result = await tools.exec_command({ cmd: \"date\" });","call_id":"call-regular-exec"}}"#
+    let escalationMention = #"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const value = \"sandbox_permissions: require_escalated\";","call_id":"call-escalation-mention"}}"#
     let lifecycleCases: [(String, [String], Date, TaskProgressKind)] = [
         ("running", [started], now, .running),
         ("waiting", [started, request], now, .waitingForInput),
         ("resumed", [started, request, response], now, .running),
+        ("cli-approval", [started, cliApproval], now, .waitingForInput),
+        (
+            "cli-approval-resumed",
+            [started, cliApproval, cliApprovalResponse],
+            now,
+            .running
+        ),
+        ("bridged-approval", [started, bridgedApproval], now, .waitingForInput),
+        (
+            "bridged-approval-resumed",
+            [started, bridgedApproval, bridgedApprovalResponse],
+            now,
+            .running
+        ),
+        ("regular-exec", [started, regularExec], now, .running),
+        ("escalation-mention", [started, escalationMention], now, .running),
         ("completed", [started, completed], now, .completed),
         ("failed", [started, failed], now, .failed),
         ("fresh-tail-fallback", [], now, .running),
@@ -745,8 +1166,139 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    let unreadState = CodexTaskProgressReader.UnreadThreadState(ids: [threadID], isAvailable: true)
-    let readState = CodexTaskProgressReader.UnreadThreadState(ids: [], isAvailable: true)
+    let cliMetadata = #"{"type":"session_meta","payload":{"id":"\#(threadID)","cwd":"/tmp/cli-project/../cli-project","originator":"codex-tui","source":"cli","thread_source":"user"}}"#
+    let appThreadID = "87654321-4321-4cba-8fed-ba0987654321"
+    let appMetadata = #"{"type":"session_meta","payload":{"id":"\#(appThreadID)","cwd":"/tmp/app-project","originator":"Codex Desktop","source":"vscode","thread_source":"user"}}"#
+    let cliTarget = CodexTaskProgressReader.taskTarget(
+        sessionMetadataLine: cliMetadata,
+        rolloutURL: rolloutURL
+    )
+    let appTarget = CodexTaskProgressReader.taskTarget(
+        sessionMetadataLine: appMetadata,
+        rolloutURL: URL(fileURLWithPath: "/tmp/app-rollout.jsonl")
+    )
+    let deepLink = TaskWindowNavigator.codexDeepLink(threadID: appThreadID)
+    let lsofOutput = """
+    p42
+    f7
+    n/tmp/other.jsonl
+    p73
+    f9
+    n\(rolloutURL.path)
+    """
+    let bodyRect = NSRect(x: 10, y: 20, width: 220, height: 180)
+    let secondTaskPoint = NSPoint(
+        x: bodyRect.midX,
+        y: taskProgressRowRect(index: 1, in: bodyRect).midY
+    )
+    let navigationChecks = [
+        cliTarget.client == .cli
+            && cliTarget.threadID == threadID
+            && cliTarget.workingDirectory == "/tmp/cli-project",
+        appTarget.client == .app && appTarget.threadID == appThreadID,
+        deepLink?.absoluteString == "codex://threads/\(appThreadID)",
+        TaskWindowNavigator.processIDs(
+            fromLsofOutput: lsofOutput,
+            rolloutPath: rolloutURL.path
+        ) == [73],
+        TaskWindowNavigator.tty(
+            fromLsofOutput: "p73\nf0\nn/dev/ttys007\n"
+        ) == "/dev/ttys007",
+        TaskWindowNavigator.terminalKind(
+            forBundleIdentifier: "com.apple.Terminal"
+        ) == .terminal
+            && TaskWindowNavigator.terminalKind(
+                forBundleIdentifier: "com.googlecode.iterm2"
+            ) == .iTerm2
+            && TaskWindowNavigator.terminalKind(
+                forBundleIdentifier: "com.mitchellh.ghostty"
+            ) == .ghostty
+            && TaskWindowNavigator.terminalKind(
+                forBundleIdentifier: "dev.warp.Warp-Stable"
+            ) == .other,
+        TaskWindowNavigator.appleScriptResult(from: "\"focused\"\n")
+            == "focused",
+        taskProgressItemIndex(
+            at: secondTaskPoint,
+            taskCount: 3,
+            in: bodyRect
+        ) == 1
+            && taskProgressItemIndex(
+                at: NSPoint(x: bodyRect.midX, y: bodyRect.minY + 10),
+                taskCount: 3,
+                in: bodyRect
+            ) == nil,
+    ]
+    guard navigationChecks.allSatisfy({ $0 }) else {
+        fputs("task window navigation mapping failed\n", stderr)
+        exit(1)
+    }
+
+    let otherThreadID = "abcdef12-3456-4abc-8def-abcdef123456"
+    let currentUnreadStateData = Data("""
+    {
+      "electron-thread-read-state-v1": {
+        "version": 1,
+        "unreadByIdentity": {
+          "identity-a": {
+            "local-a": ["\(threadID.uppercased())"],
+            "remote-a": ["\(otherThreadID)"]
+          }
+        }
+      }
+    }
+    """.utf8)
+    let currentReadStateData = Data("""
+    {
+      "electron-thread-read-state-v1": {
+        "version": 1,
+        "unreadByIdentity": {}
+      }
+    }
+    """.utf8)
+    let legacyUnreadStateData = Data("""
+    {
+      "electron-persisted-atom-state": {
+        "unread-thread-ids-by-host-v1": {
+          "local-a": ["\(threadID.uppercased())"]
+        }
+      }
+    }
+    """.utf8)
+    let malformedCurrentStateData = Data("""
+    {
+      "electron-thread-read-state-v1": {
+        "version": 1,
+        "unreadByIdentity": []
+      },
+      "electron-persisted-atom-state": {
+        "unread-thread-ids-by-host-v1": {
+          "local-a": ["\(threadID)"]
+        }
+      }
+    }
+    """.utf8)
+    guard let unreadState = CodexTaskProgressReader.unreadThreadState(
+              from: currentUnreadStateData
+          ),
+          unreadState.isAvailable,
+          unreadState.ids == Set([threadID, otherThreadID]),
+          let readState = CodexTaskProgressReader.unreadThreadState(
+              from: currentReadStateData
+          ),
+          readState.isAvailable,
+          readState.ids.isEmpty,
+          let legacyUnreadState = CodexTaskProgressReader.unreadThreadState(
+              from: legacyUnreadStateData
+          ),
+          legacyUnreadState.ids == Set([threadID]),
+          CodexTaskProgressReader.unreadThreadState(
+              from: malformedCurrentStateData
+          ) == nil
+    else {
+        fputs("Codex unread state schema parsing failed\n", stderr)
+        exit(1)
+    }
     let unavailableState = CodexTaskProgressReader.UnreadThreadState(ids: [], isAvailable: false)
     let visibilityChecks = [
         CodexTaskProgressReader.shouldDisplay(
@@ -780,64 +1332,43 @@ func runTaskProgressSelfTest() -> Never {
     let userMetadata = #"{"type":"session_meta","payload":{"thread_source":"user","source":{"cli":{}}}}"#
     let subagentMetadata = #"{"type":"session_meta","payload":{"thread_source":"subagent","source":{"subagent":{"thread_spawn":{}}}}}"#
     let automationMetadata = #"{"type":"session_meta","payload":{"thread_source":"automation","source":"vscode"}}"#
+    var boundarySplitMetadata = Data((subagentMetadata + "\n").utf8)
+    boundarySplitMetadata.append(Data(
+        repeating: 0x78,
+        count: 262_144 - boundarySplitMetadata.count - 1
+    ))
+    // 模拟 256 KiB 读取块在三字节 UTF-8 字符首字节后截断。
+    boundarySplitMetadata.append(0xE7)
     guard CodexTaskProgressReader.isUserVisibleSessionMetadata(line: userMetadata),
           !CodexTaskProgressReader.isUserVisibleSessionMetadata(line: subagentMetadata),
-          !CodexTaskProgressReader.isUserVisibleSessionMetadata(line: automationMetadata)
+          !CodexTaskProgressReader.isUserVisibleSessionMetadata(line: automationMetadata),
+          !CodexTaskProgressReader.isUserVisibleSessionMetadata(
+              data: boundarySplitMetadata
+          )
     else {
         fputs("task non-user session filtering failed\n", stderr)
         exit(1)
     }
 
-    let largeRolloutURL = FileManager.default.temporaryDirectory
-        .appendingPathComponent(
-            "rollout-2026-07-23T12-02-00-66666666-6666-4666-8666-666666666666.jsonl"
-        )
-    let largeMetadata = "{\"type\":\"session_meta\",\"payload\":{"
-        + "\"thread_source\":\"user\",\"padding\":\""
-        + String(repeating: "x", count: 40 * 1_024)
-        + "\"}}"
-    let largeTitle = #"{"type":"event_msg","payload":{"type":"user_message","message":"大文件运行任务"}}"#
-    let largeNoopTail = String(
-        repeating: #"{"type":"noop","payload":{}}"# + "\n",
-        count: 12_000
-    )
-    let previousRolloutOverride = ProcessInfo.processInfo.environment[
-        "CODEX_STATUS_PANEL_TASK_ROLLOUT_FILE"
-    ]
+    let incrementalFailures: [String]
     do {
-        try Data(
-            "\(largeMetadata)\n\(largeTitle)\n\(started)\n\(largeNoopTail)".utf8
-        ).write(to: largeRolloutURL)
-        try FileManager.default.setAttributes(
-            [.modificationDate: now.addingTimeInterval(-31 * 60)],
-            ofItemAtPath: largeRolloutURL.path
-        )
-        setenv(
-            "CODEX_STATUS_PANEL_TASK_ROLLOUT_FILE",
-            largeRolloutURL.path,
-            1
-        )
-        let largeRolloutSnapshot = CodexTaskProgressReader().read()
-        guard largeRolloutSnapshot.items.contains(where: {
-            $0.title == "大文件运行任务" && $0.kind == .running
-        }) else {
-            fputs("large rollout task discovery failed\n", stderr)
-            exit(1)
-        }
+        incrementalFailures = try taskProgressIncrementalFailures(now: now)
     } catch {
-        fputs("large rollout fixture failed: \(error.localizedDescription)\n", stderr)
+        fputs(
+            "task progress incremental fixture failed: \(error.localizedDescription)\n",
+            stderr
+        )
         exit(1)
     }
-    if let previousRolloutOverride {
-        setenv(
-            "CODEX_STATUS_PANEL_TASK_ROLLOUT_FILE",
-            previousRolloutOverride,
-            1
+    guard incrementalFailures.isEmpty else {
+        fputs(
+            "task progress incremental checks failed: "
+                + incrementalFailures.joined(separator: ", ")
+                + "\n",
+            stderr
         )
-    } else {
-        unsetenv("CODEX_STATUS_PANEL_TASK_ROLLOUT_FILE")
+        exit(1)
     }
-    try? FileManager.default.removeItem(at: largeRolloutURL)
 
     let truncated = TaskProgressSnapshot.displaying((0..<7).map { index in
         TaskProgressItem(title: "任务 \(index + 1)", kind: .running, startedAt: now)
@@ -855,6 +1386,85 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
+    func attentionItem(
+        id: String,
+        title: String,
+        kind: TaskProgressKind
+    ) -> TaskProgressItem {
+        TaskProgressItem(
+            title: title,
+            kind: kind,
+            startedAt: now,
+            target: TaskProgressTarget(
+                threadID: id,
+                client: .app,
+                workingDirectory: nil,
+                rolloutPath: "/tmp/\(id).jsonl"
+            )
+        )
+    }
+
+    let tracker = TaskAttentionTracker()
+    let attentionRunning = attentionItem(
+        id: "attention-running",
+        title: "动效任务",
+        kind: .running
+    )
+    let attentionWaiting = attentionItem(
+        id: "attention-running",
+        title: "动效任务",
+        kind: .waitingForInput
+    )
+    let attentionCompleted = attentionItem(
+        id: "attention-running",
+        title: "动效任务",
+        kind: .completed
+    )
+    let attentionFailed = attentionItem(
+        id: "attention-failed",
+        title: "失败任务",
+        kind: .failed
+    )
+    let baselineEvents = tracker.update(with: [attentionRunning])
+    let unchangedEvents = tracker.update(with: [attentionRunning])
+    let waitingEvents = tracker.update(with: [attentionWaiting])
+    let repeatedWaitingEvents = tracker.update(with: [attentionWaiting])
+    let completedEvents = tracker.update(with: [attentionCompleted])
+    let newFailedEvents = tracker.update(with: [
+        attentionCompleted,
+        attentionFailed,
+    ])
+    let attentionChecks = [
+        baselineEvents.isEmpty,
+        unchangedEvents.isEmpty,
+        waitingEvents.count == 1
+            && waitingEvents[0].previousKind == .running
+            && waitingEvents[0].kind == .waitingForInput,
+        repeatedWaitingEvents.isEmpty,
+        completedEvents.count == 1
+            && completedEvents[0].previousKind == .waitingForInput
+            && completedEvents[0].kind == .completed,
+        newFailedEvents.count == 1
+            && newFailedEvents[0].previousKind == nil
+            && newFailedEvents[0].kind == .failed,
+        dominantTaskProgressKind(in: [
+            attentionRunning,
+            attentionWaiting,
+            attentionCompleted,
+            attentionFailed,
+        ]) == .failed,
+        dominantTaskProgressKind(in: [
+            attentionRunning,
+            attentionCompleted,
+        ]) == .running,
+        taskAttentionIdentifier(for: attentionRunning)
+            == "thread:attention-running",
+    ]
+    guard attentionChecks.allSatisfy({ $0 }) else {
+        fputs("task attention transition tracking failed\n", stderr)
+        exit(1)
+    }
+
     let oneTaskWithoutMarket = panelSizeForTaskRows(1, showsMarketPrices: false)
     let threeTasksWithMarket = panelSizeForTaskRows(3, showsMarketPrices: true)
     guard abs(
@@ -867,29 +1477,156 @@ func runTaskProgressSelfTest() -> Never {
     }
 
     let animationChecks = [
-        shouldAnimateRunningArrow(
+        shouldAnimateTaskEffects(
             isWindowVisible: true,
-            isCollapsed: false,
-            hasRunningTask: true
+            isWindowOccluded: false,
+            reduceMotion: false
         ),
-        !shouldAnimateRunningArrow(
+        !shouldAnimateTaskEffects(
             isWindowVisible: false,
-            isCollapsed: false,
-            hasRunningTask: true
+            isWindowOccluded: false,
+            reduceMotion: false
         ),
-        !shouldAnimateRunningArrow(
+        !shouldAnimateTaskEffects(
             isWindowVisible: true,
-            isCollapsed: true,
-            hasRunningTask: true
+            isWindowOccluded: true,
+            reduceMotion: false
         ),
-        !shouldAnimateRunningArrow(
+        !shouldAnimateTaskEffects(
             isWindowVisible: true,
-            isCollapsed: false,
-            hasRunningTask: false
+            isWindowOccluded: false,
+            reduceMotion: true
         ),
     ]
     guard animationChecks.allSatisfy({ $0 }) else {
         fputs("running task animation lifecycle failed\n", stderr)
+        exit(1)
+    }
+
+    let sampleVisualCenterOffset = CGPoint(x: 1.0125, y: 2.1375)
+    let pinnedTransforms = taskCompletedBallScaleValues.map {
+        taskCompletedBallPinnedTransform(
+            visualCenterOffset: sampleVisualCenterOffset,
+            scale: $0
+        )
+    }
+    let flippedVisualCenterUnitPoint = taskCompletedBallVisualCenterUnitPoint(
+        isGeometryFlipped: true
+    )
+    let unflippedVisualCenterUnitPoint = taskCompletedBallVisualCenterUnitPoint(
+        isGeometryFlipped: false
+    )
+    let pinnedCenters = zip(
+        pinnedTransforms,
+        taskCompletedBallScaleValues
+    ).map { transform, scale in
+        CGPoint(
+            x: transform.m41 + sampleVisualCenterOffset.x * scale,
+            y: transform.m42 + sampleVisualCenterOffset.y * scale
+        )
+    }
+    let sampleBallFrame = CGRect(x: 100, y: 40, width: 36, height: 36)
+    let sampleBallCenter = taskCompletedBallVisualCenter(in: sampleBallFrame)
+    let sampleScaledBallCenter = taskCompletedBallVisualCenter(
+        in: taskCompletedBallScaledFrame(sampleBallFrame, scale: 1.20)
+    )
+    let taskBallEffectChecks = [
+        taskWaitingRadarLineWidth == 1.5,
+        taskCompletedBallScaleValues == [1, 1.20, 1],
+        taskCompletedBallScaleKeyTimes == [0, 0.45, 1],
+        taskCompletedBallScaleDuration == 0.42,
+        abs(flippedVisualCenterUnitPoint.x - 0.528125) < 0.0001
+            && abs(flippedVisualCenterUnitPoint.y - 0.559375) < 0.0001,
+        abs(unflippedVisualCenterUnitPoint.x - 0.528125) < 0.0001
+            && abs(unflippedVisualCenterUnitPoint.y - 0.440625) < 0.0001,
+        pinnedCenters.allSatisfy {
+            abs($0.x - sampleVisualCenterOffset.x) < 0.0001
+                && abs($0.y - sampleVisualCenterOffset.y) < 0.0001
+        },
+        pinnedTransforms.allSatisfy { CATransform3DIsAffine($0) },
+        abs(sampleScaledBallCenter.x - sampleBallCenter.x) < 0.0001
+            && abs(sampleScaledBallCenter.y - sampleBallCenter.y) < 0.0001,
+    ]
+    guard taskBallEffectChecks.allSatisfy({ $0 }) else {
+        fputs("task ball effect profile failed\n", stderr)
+        exit(1)
+    }
+
+    let runningTextEffect = taskStatusTextEffectProfile(for: .running)
+    let waitingTextEffect = taskStatusTextEffectProfile(for: .waitingForInput)
+    let completedTextEffect = taskStatusTextEffectProfile(for: .completed)
+    let failedTextEffect = taskStatusTextEffectProfile(for: .failed)
+    let readingTextEffect = taskStatusTextEffectProfile(for: .reading)
+    let idleTextEffect = taskStatusTextEffectProfile(for: .idle)
+    let persistentTextEffects = [
+        readingTextEffect,
+        runningTextEffect,
+        waitingTextEffect,
+        completedTextEffect,
+        failedTextEffect,
+    ]
+    let textEffectChecks = [
+        taskStatusAmbientScanRepeatCount.isInfinite,
+        persistentTextEffects.allSatisfy {
+            $0.ambientScanDuration != nil && $0.ambientActiveFraction > 0
+        },
+        runningTextEffect.ambientScanDuration == 2.4,
+        runningTextEffect.ambientActiveFraction > 0.5,
+        waitingTextEffect.entranceScanCount == 3,
+        waitingTextEffect.ambientScanDuration != nil,
+        completedTextEffect.entranceScanCount == 1
+            && completedTextEffect.ambientScanDuration != nil,
+        failedTextEffect.usesGlitchEntrance
+            && failedTextEffect.ambientScanDuration != nil,
+        readingTextEffect.ambientScanDuration != nil,
+        idleTextEffect.ambientScanDuration == nil
+            && idleTextEffect.glowOpacity == 0,
+    ]
+    guard textEffectChecks.allSatisfy({ $0 }) else {
+        fputs("task status text effect profile failed\n", stderr)
+        exit(1)
+    }
+
+    let celebration = taskCompletionCelebrationProfile
+    let particleVectorSum = taskCompletionParticleVectors.reduce(
+        CGPoint.zero
+    ) {
+        CGPoint(x: $0.x + $1.x, y: $0.y + $1.y)
+    }
+    let completedBallFrame = CGRect(x: 100, y: 40, width: 36, height: 36)
+    let completedBallVisualCenter = taskCompletedBallVisualCenter(
+        in: completedBallFrame
+    )
+    let celebrationChecks = [
+        celebration.ringCount == 2,
+        celebration.particleCount == 14,
+        celebration.totalDuration == 10,
+        celebration.cycleDuration == 2,
+        celebration.cycleCount == 5,
+        celebration.totalDuration
+            == celebration.cycleDuration * Double(celebration.cycleCount),
+        celebration.waveStagger > 0 && celebration.waveStagger < 0.1,
+        celebration.waveTravelsFromCompletedBall,
+        celebration.repeats,
+        !celebration.clipsToBallBand,
+        taskCompletionRingDiameters == [34, 40]
+            && taskCompletionRingDiameters.count == celebration.ringCount,
+        taskCompletedBallAssetPixelSize == CGSize(width: 160, height: 160),
+        taskCompletedBallVisibleCenterInPixels == CGPoint(x: 84.5, y: 89.5),
+        abs(completedBallVisualCenter.x - 119.0125) < 0.0001
+            && abs(completedBallVisualCenter.y - 60.1375) < 0.0001,
+        taskCompletionParticleVectors.count == celebration.particleCount,
+        abs(particleVectorSum.x) < 0.001
+            && abs(particleVectorSum.y) < 0.001,
+        taskCompletionWaveOrder == [
+            .waitingForInput,
+            .reading,
+            .running,
+            .failed,
+        ],
+    ]
+    guard celebrationChecks.allSatisfy({ $0 }) else {
+        fputs("task completion celebration profile failed\n", stderr)
         exit(1)
     }
 
@@ -899,8 +1636,18 @@ func runTaskProgressSelfTest() -> Never {
         "task-completed-icon.png",
         "task-failed-icon.png",
     ]
+    let taskBallNames = [
+        "01-red.png",
+        "02-blue.png",
+        "03-pink.png",
+        "04-orange.png",
+        "05-green.png",
+    ]
     guard let resourceURL = Bundle.main.resourceURL,
           taskIconNames.allSatisfy({
+              NSImage(contentsOf: resourceURL.appendingPathComponent($0)) != nil
+          }),
+          taskBallNames.allSatisfy({
               NSImage(contentsOf: resourceURL.appendingPathComponent($0)) != nil
           })
     else {
@@ -908,7 +1655,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=7/7; title=pass; visibility=pass; filtering=pass; large-rollout=pass; animation=4/4; list=pass; layout=pass; icons=4/4")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; navigation=8/8; attention=9/9; animation=4/4; ball-effects=9/9; text-effects=10/10; celebration=17/17; list=pass; layout=pass; icons=4/4; balls=5/5")
     exit(0)
 }
 
@@ -1368,6 +2115,7 @@ private func sub2APIProviderChecks() -> (
 
     let quotaData = Data(#"{"mode":"quota_limited","isValid":true,"quota":{"limit":100,"used":6,"remaining":94,"unit":"USD"},"usage":{"today":{"total_tokens":123456789}}}"#.utf8)
     let rateData = Data(#"{"mode":"quota_limited","isValid":true,"unit":"USD","rate_limits":[{"window":"5h","limit":20,"used":12,"remaining":8,"reset_at":"2026-07-25T00:00:00Z"},{"window":"1d","limit":100,"used":10,"remaining":90}],"usage":{"today":{"total_tokens":123456789}}}"#.utf8)
+    let switchableRateData = Data(#"{"mode":"quota_limited","isValid":true,"unit":"USD","quota":{"limit":100,"used":6,"remaining":94},"rate_limits":[{"window":"1d","limit":200,"used":19.5068814,"remaining":180.4931186,"reset_at":"2026-07-29T00:00:00+08:00"},{"window":"7d","limit":2000,"used":197.780476,"remaining":1802.219524,"reset_at":"2026-07-31T00:00:00+08:00"}],"usage":{"today":{"total_tokens":123456789}}}"#.utf8)
     let subscriptionData = Data(#"{"mode":"unrestricted","isValid":true,"planName":"Pro","unit":"USD","subscription":{"daily_usage_usd":2,"daily_limit_usd":10,"weekly_usage_usd":70,"weekly_limit_usd":100,"monthly_usage_usd":5,"monthly_limit_usd":100,"weekly_window_start":"2026-07-20T00:00:00Z"},"usage":{"today":{"total_tokens":123456789}}}"#.utf8)
     let zeroWalletData = Data(#"{"mode":"unrestricted","isValid":true,"unit":"USD","balance":0,"usage":{"today":{"total_tokens":0}}}"#.utf8)
     let walletWithoutUsageData = Data(#"{"mode":"unrestricted","isValid":true,"unit":"USD","balance":9.99}"#.utf8)
@@ -1383,6 +2131,10 @@ private func sub2APIProviderChecks() -> (
     )
     let rate = try? Sub2APIUsageMapper.presentation(
         from: rateData,
+        now: fixedNow
+    )
+    let switchableRate = try? Sub2APIUsageMapper.presentation(
+        from: switchableRateData,
         now: fixedNow
     )
     let subscription = try? Sub2APIUsageMapper.presentation(
@@ -1401,6 +2153,25 @@ private func sub2APIProviderChecks() -> (
         from: extremeQuotaData,
         now: fixedNow
     )
+    let weeklyRate: QuotaPresentation?
+    if let switchableRate,
+       let option = switchableRate.rateLimitOptions.first(where: {
+           $0.displayName == "7 天"
+       })
+    {
+        weeklyRate = switchableRate.selectingRateLimit(id: option.id)
+    } else {
+        weeklyRate = nil
+    }
+    let refreshedWeeklyRate: QuotaPresentation?
+    if let switchableRate, let weeklyRate {
+        refreshedWeeklyRate = quotaPresentationAfterRefresh(
+            previous: weeklyRate,
+            result: .success(switchableRate)
+        )
+    } else {
+        refreshedWeeklyRate = nil
+    }
     var boundedBuffer = BoundedHTTPResponseBuffer(maximumBytes: 4)
     let acceptedAtLimit = boundedBuffer.append(Data(repeating: 1, count: 4))
     let rejectedPastLimit = !boundedBuffer.append(Data([2]))
@@ -1508,6 +2279,26 @@ private func sub2APIProviderChecks() -> (
                 && rate?.detailText == "今日已用 $10.00"
                 && rate?.dailyTokenText == "今日Token 1.23亿"
                 && rate?.showsInlineUsageMetrics == true,
+            switchableRate?.valueText == "剩余 $180.49"
+                && switchableRate?.progressPercent == 90
+                && switchableRate?.detailText == "今日已用 $19.51"
+                && switchableRate?.rateLimitOptions.map(\.displayName)
+                    == ["1 天", "7 天"]
+                && switchableRate?.selectedRateLimitOption?.displayName
+                    == "1 天",
+            weeklyRate?.valueText == "剩余 $1802.22"
+                && weeklyRate?.progressPercent == 90
+                && weeklyRate?.detailText == "今日已用 $19.51"
+                && weeklyRate?.selectedRateLimitOption?.displayName
+                    == "7 天",
+            switchableRate?.cyclingRateLimit() == weeklyRate,
+            weeklyRate?.cyclingRateLimit()
+                .selectedRateLimitOption?.displayName == "1 天",
+            refreshedWeeklyRate?.selectedRateLimitOption?.displayName
+                == "7 天"
+                && refreshedWeeklyRate?.valueText == "剩余 $1802.22",
+            switchableRate?.selectingRateLimit(id: "missing")
+                == switchableRate,
             subscription?.valueText == "剩余 $30.00"
                 && subscription?.detailText == "今日已用 $2.00"
                 && subscription?.dailyTokenText == "今日Token 1.23亿"
@@ -1630,8 +2421,56 @@ enum PreviewUsageMode: String {
     case unconfigured
     case sub2apiWallet = "sub2api-wallet"
     case sub2apiEmptyWallet = "sub2api-empty-wallet"
+    case sub2apiRate1d = "sub2api-rate-1d"
+    case sub2apiRate7d = "sub2api-rate-7d"
     case sub2apiWarning = "sub2api-warning"
     case sub2apiDanger = "sub2api-danger"
+}
+
+enum PreviewTaskMode: String {
+    case showcase
+    case reading
+    case running
+    case waiting
+    case completed
+    case failed
+    case idle
+}
+
+private func previewSub2APIRateLimitPresentation(
+    selectedIndex: Int
+) -> QuotaPresentation {
+    let options = [
+        QuotaRateLimitOption(
+            id: "1d",
+            displayName: "1 天",
+            valueText: "剩余 $180.49",
+            progressPercent: 90,
+            isDepleted: false
+        ),
+        QuotaRateLimitOption(
+            id: "7d",
+            displayName: "7 天",
+            valueText: "剩余 $1802.22",
+            progressPercent: 90,
+            isDepleted: false
+        ),
+    ]
+    let first = options[0]
+    let presentation = QuotaPresentation(
+        sourceName: "Sub2API",
+        valueText: first.valueText,
+        progressPercent: first.progressPercent,
+        detailText: "今日已用 $19.51",
+        dailyTokenText: "今日Token 1.23亿",
+        showsInlineUsageMetrics: true,
+        rateLimitOptions: options,
+        selectedRateLimitID: first.id,
+        isDepleted: false
+    )
+    return presentation.selectingRateLimit(
+        id: options[min(max(0, selectedIndex), options.count - 1)].id
+    )
 }
 
 private func previewQuotaPresentation(
@@ -1668,6 +2507,10 @@ private func previewQuotaPresentation(
             showsInlineUsageMetrics: true,
             isDepleted: true
         )
+    case .sub2apiRate1d:
+        return previewSub2APIRateLimitPresentation(selectedIndex: 0)
+    case .sub2apiRate7d:
+        return previewSub2APIRateLimitPresentation(selectedIndex: 1)
     case .sub2apiWarning:
         return QuotaPresentation(
             sourceName: "Sub2API",
@@ -1694,21 +2537,65 @@ private func previewQuotaPresentation(
 func renderPreviewOnce(
     to outputPath: String,
     collapsed: Bool,
-    usageMode: PreviewUsageMode
+    usageMode: PreviewUsageMode,
+    taskMode: PreviewTaskMode
 ) -> Never {
     // 离屏创建 NSView 并缓存到位图，不需要真正显示窗口即可生成 UI 预览 PNG。
-    let previewTaskProgress = TaskProgressSnapshot(items: [
-        TaskProgressItem(
-            title: "web3+ai科普视频",
+    let previewTaskItems: [TaskProgressItem]
+    switch taskMode {
+    case .showcase:
+        previewTaskItems = [
+            TaskProgressItem(
+                title: "web3+ai科普视频",
+                kind: .running,
+                startedAt: Date()
+            ),
+            TaskProgressItem(
+                title: "等待发布确认",
+                kind: .waitingForInput,
+                startedAt: Date()
+            ),
+            TaskProgressItem(
+                title: "蓝色卜卜宠物",
+                kind: .completed,
+                startedAt: Date()
+            ),
+            TaskProgressItem(
+                title: "回归测试失败",
+                kind: .failed,
+                startedAt: Date()
+            ),
+        ]
+    case .reading:
+        previewTaskItems = TaskProgressSnapshot.reading.items
+    case .running:
+        previewTaskItems = [TaskProgressItem(
+            title: "正在实现任务动效",
             kind: .running,
             startedAt: Date()
-        ),
-        TaskProgressItem(
-            title: "蓝色卜卜宠物",
+        )]
+    case .waiting:
+        previewTaskItems = [TaskProgressItem(
+            title: "等待发布确认",
+            kind: .waitingForInput,
+            startedAt: Date()
+        )]
+    case .completed:
+        previewTaskItems = [TaskProgressItem(
+            title: "任务动效实现",
             kind: .completed,
             startedAt: Date()
-        ),
-    ])
+        )]
+    case .failed:
+        previewTaskItems = [TaskProgressItem(
+            title: "回归测试失败",
+            kind: .failed,
+            startedAt: Date()
+        )]
+    case .idle:
+        previewTaskItems = TaskProgressSnapshot.idle.items
+    }
+    let previewTaskProgress = TaskProgressSnapshot(items: previewTaskItems)
     let previewStockConfigurations = Array(
         PanelMarkets.defaults.stockQuotes.prefix(2)
     )
@@ -1749,7 +2636,10 @@ func renderPreviewOnce(
     view.isCollapsed = collapsed
     view.showsMarketPrices = true
     view.showsStockPrices = true
-    view.taskProgress = previewTaskProgress
+    view.applyTaskProgress(TaskProgressReadResult(
+        allItems: previewTaskProgress.items,
+        snapshot: previewTaskProgress
+    ))
     let presentation = previewQuotaPresentation(for: usageMode)
     if let presentation {
         view.quotaSourceName = presentation.sourceName
@@ -1781,6 +2671,7 @@ func renderPreviewOnce(
     view.stockMarketState = .trading
     view.stockUpdatedText = "14:32"
     view.layoutSubtreeIfNeeded()
+    view.prepareTaskEffectPreviewFrame()
 
     let scale: CGFloat = 2
     guard let bitmap = NSBitmapImageRep(

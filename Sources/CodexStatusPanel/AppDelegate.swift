@@ -10,11 +10,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configuration: panelConfig.usageProvider
     )
     private let taskProgressReader = CodexTaskProgressReader()
+    private let taskAttentionTracker = TaskAttentionTracker()
     private let btcPriceClient = MarketPriceClient(symbol: "BTCUSDT")
     private let ethPriceClient = MarketPriceClient(symbol: "ETHUSDT")
     private let stockMarketClient = EastMoneyMarketClient()
     private let stockQuoteCache = StockQuoteCache()
     private let locator = PetWindowLocator()
+    private let taskWindowNavigator = TaskWindowNavigator()
     private let healthWriter = RuntimeHealthWriter()
     private let quotaView = QuotaPanelView(frame: NSRect(origin: .zero, size: expandedPanelSize))
     private var currentExpandedPanelSize = expandedPanelSize
@@ -22,13 +24,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var panel: NSPanel!
     private var statusItem: NSStatusItem?
     private let statusMenu = NSMenu()
+    private let statusDetailsMenuItem = NSMenuItem(
+        title: "状态",
+        action: nil,
+        keyEquivalent: ""
+    )
+    private let statusDetailsMenu = NSMenu(title: "状态")
     private let codexStatusMenuItem = NSMenuItem()
     private let followStatusMenuItem = NSMenuItem()
     private let stockStatusMenuItem = NSMenuItem()
-    private let showPanelMenuItem = NSMenuItem(title: "显示面板", action: #selector(showPanelFromMenu(_:)), keyEquivalent: "")
-    private let hidePanelMenuItem = NSMenuItem(title: "隐藏面板", action: #selector(hidePanelFromMenu(_:)), keyEquivalent: "")
+    private let panelMenuItem = NSMenuItem(
+        title: "面板",
+        action: nil,
+        keyEquivalent: ""
+    )
+    private let panelMenu = NSMenu(title: "面板")
+    private let togglePanelVisibilityMenuItem = NSMenuItem(
+        title: "隐藏面板",
+        action: #selector(togglePanelVisibilityFromMenu(_:)),
+        keyEquivalent: ""
+    )
     private let collapsePanelMenuItem = NSMenuItem(title: "折叠面板", action: #selector(toggleCollapsedFromMenu(_:)), keyEquivalent: "")
     private let refreshQuotaMenuItem = NSMenuItem(title: "立即刷新额度", action: #selector(refreshQuotaFromMenu(_:)), keyEquivalent: "r")
+    private let quotaMenuItem = NSMenuItem(
+        title: "额度",
+        action: nil,
+        keyEquivalent: ""
+    )
+    private let quotaMenu = NSMenu(title: "额度")
+    private let displayContentMenuItem = NSMenuItem(
+        title: "显示内容",
+        action: nil,
+        keyEquivalent: ""
+    )
+    private let displayContentMenu = NSMenu(title: "显示内容")
     private let toggleMarketPricesMenuItem = NSMenuItem(
         title: "显示币价（BTC/ETH）",
         action: #selector(toggleMarketPricesFromMenu(_:)),
@@ -40,6 +69,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         keyEquivalent: ""
     )
     private let resetFollowMenuItem = NSMenuItem(title: "重置跟随位置", action: #selector(resetFollowPositionFromMenu(_:)), keyEquivalent: "")
+    private let configurationMenuItem = NSMenuItem(
+        title: "配置",
+        action: nil,
+        keyEquivalent: ""
+    )
+    private let configurationMenu = NSMenu(title: "配置")
     private let openConfigMenuItem = NSMenuItem(title: "打开配置文件", action: #selector(openConfigFileFromMenu(_:)), keyEquivalent: ",")
     private let reloadConfigMenuItem = NSMenuItem(title: "重新加载配置", action: #selector(reloadConfigFromMenu(_:)), keyEquivalent: "")
     private var refreshTimer: Timer?
@@ -75,8 +110,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var followHealthStatus = "waiting-for-pet"
     private var lastLocationSource: String?
     private var lastQuotaUpdatedAt: Date?
+    private var cachedCodexDesktopRunning = false
+    private var nextCodexDesktopCheckAt: CFAbsoluteTime = 0
     private var isPanelHiddenByUser = false
-    private var isManualStandaloneEnabled = false
+    private var isStandalonePanelActive = false
     private var lastStatusMenuSignature = ""
     private var lastStatusBarDisplayState: MenuBarDisplayState?
     private lazy var statusBarIconImage: NSImage? = {
@@ -118,7 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        quotaView.setRunningTaskBadgeAnimationsEnabled(false)
+        quotaView.setTaskAnimationsEnabled(false)
         refreshTimer?.invalidate()
         taskProgressTimer?.invalidate()
         btcRefreshTimer?.invalidate()
@@ -177,17 +214,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusMenu.delegate = self
 
-        codexStatusMenuItem.isEnabled = false
-        followStatusMenuItem.isEnabled = false
-        stockStatusMenuItem.isEnabled = false
-        statusMenu.addItem(codexStatusMenuItem)
-        statusMenu.addItem(followStatusMenuItem)
-        statusMenu.addItem(stockStatusMenuItem)
-        statusMenu.addItem(.separator())
-
         for item in [
-            showPanelMenuItem,
-            hidePanelMenuItem,
+            togglePanelVisibilityMenuItem,
             collapsePanelMenuItem,
             refreshQuotaMenuItem,
             toggleMarketPricesMenuItem,
@@ -197,9 +225,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             reloadConfigMenuItem,
         ] {
             item.target = self
-            statusMenu.addItem(item)
         }
 
+        for item in [
+            codexStatusMenuItem,
+            followStatusMenuItem,
+            stockStatusMenuItem,
+        ] {
+            item.isEnabled = false
+            statusDetailsMenu.addItem(item)
+        }
+        statusDetailsMenuItem.submenu = statusDetailsMenu
+
+        panelMenu.addItem(togglePanelVisibilityMenuItem)
+        panelMenu.addItem(collapsePanelMenuItem)
+        panelMenu.addItem(resetFollowMenuItem)
+        panelMenuItem.submenu = panelMenu
+
+        quotaMenuItem.submenu = quotaMenu
+
+        displayContentMenu.addItem(toggleMarketPricesMenuItem)
+        displayContentMenu.addItem(toggleStockPricesMenuItem)
+        displayContentMenuItem.submenu = displayContentMenu
+
+        configurationMenu.addItem(openConfigMenuItem)
+        configurationMenu.addItem(reloadConfigMenuItem)
+        configurationMenuItem.submenu = configurationMenu
+
+        for item in [
+            statusDetailsMenuItem,
+            panelMenuItem,
+            quotaMenuItem,
+            displayContentMenuItem,
+            configurationMenuItem,
+        ] {
+            statusMenu.addItem(item)
+        }
         statusMenu.addItem(.separator())
         let quitItem = NSMenuItem(title: "退出", action: #selector(quitFromMenu(_:)), keyEquivalent: "q")
         quitItem.target = self
@@ -222,6 +283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             quotaUpdatedText = quotaView.statusText
         }
 
+        let statusSummaryTitle = "状态：\(quotaView.quotaSourceName) \(quotaView.connectionText)"
         let quotaTitle = "\(quotaView.quotaSourceName)：\(quotaView.connectionText) · 额度：\(quotaUpdatedText)"
         let stockTitle: String
         if showsStockPrices {
@@ -247,25 +309,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             showsMarketPrices: showsMarketPrices,
             showsStockPrices: showsStockPrices
         )
+        let rateLimitOptions = quotaView.quotaPresentation?.rateLimitOptions
+            ?? []
+        let selectedRateLimitID = quotaView.quotaPresentation?
+            .selectedRateLimitID
+        let panelVisibilityTitle = panelVisibilityMenuItemTitle(
+            showPanelEnabled: controlState.showPanelEnabled
+        )
+        let rateLimitSignature = rateLimitOptions.map {
+            "\($0.id):\($0.displayName)"
+        }.joined(separator: ",") + "|" + (selectedRateLimitID ?? "")
         // 只有菜单显示内容真正变化时才更新 AppKit 对象，减少高频跟随期间的无效工作。
         let signature = [
+            statusSummaryTitle,
             quotaTitle,
             followTitle,
             stockTitle,
-            String(controlState.showPanelEnabled),
-            String(controlState.hidePanelEnabled),
+            panelVisibilityTitle,
             controlState.collapseTitle,
             String(controlState.refreshQuotaEnabled),
             String(controlState.marketPricesEnabled),
             String(controlState.stockPricesEnabled),
+            rateLimitSignature,
         ].joined(separator: "|")
 
         if force || signature != lastStatusMenuSignature {
+            statusDetailsMenuItem.title = statusSummaryTitle
             codexStatusMenuItem.title = quotaTitle
             followStatusMenuItem.title = followTitle
             stockStatusMenuItem.title = stockTitle
-            showPanelMenuItem.isEnabled = controlState.showPanelEnabled
-            hidePanelMenuItem.isEnabled = controlState.hidePanelEnabled
+            togglePanelVisibilityMenuItem.title = panelVisibilityTitle
+            togglePanelVisibilityMenuItem.isEnabled = controlState.showPanelEnabled
+                || controlState.hidePanelEnabled
             collapsePanelMenuItem.title = controlState.collapseTitle
             refreshQuotaMenuItem.isEnabled = controlState.refreshQuotaEnabled
             toggleMarketPricesMenuItem.state = controlState.marketPricesEnabled
@@ -274,9 +349,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             toggleStockPricesMenuItem.state = controlState.stockPricesEnabled
                 ? .on
                 : .off
+            updateQuotaRateLimitMenu(
+                options: rateLimitOptions,
+                selectedID: selectedRateLimitID
+            )
             lastStatusMenuSignature = signature
         }
         updateStatusBarIcon()
+    }
+
+    private func updateQuotaRateLimitMenu(
+        options: [QuotaRateLimitOption],
+        selectedID: String?
+    ) {
+        quotaMenu.removeAllItems()
+        quotaMenu.addItem(refreshQuotaMenuItem)
+
+        guard !options.isEmpty else {
+            quotaMenuItem.title = "额度"
+            return
+        }
+
+        let selected = options.first { $0.id == selectedID }
+            ?? options[0]
+        quotaMenuItem.title = "额度：\(selected.displayName)"
+        guard options.count > 1 else { return }
+
+        quotaMenu.addItem(.separator())
+
+        for option in options {
+            let item = NSMenuItem(
+                title: "\(option.displayName)额度",
+                action: #selector(selectQuotaRateLimitFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = option.id
+            item.state = option.id == selected.id ? .on : .off
+            quotaMenu.addItem(item)
+        }
     }
 
     private func updateStatusBarIcon() {
@@ -324,13 +435,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.level = .statusBar
         panel.hidesOnDeactivate = false
         panel.ignoresMouseEvents = false
-        panel.isMovable = false
+        panel.isMovable = true
         panel.isReleasedWhenClosed = false
         panel.isFloatingPanel = true
         panel.becomesKeyOnlyIfNeeded = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         quotaView.onToggleCollapsed = { [weak self] in
             self?.toggleCollapsed()
+        }
+        quotaView.onCycleRateLimit = { [weak self] in
+            self?.cycleQuotaRateLimit()
+        }
+        quotaView.onOpenTask = { [weak self] item in
+            guard let target = item.target else { return }
+            self?.taskWindowNavigator.open(target)
+        }
+        quotaView.onWindowDragCompleted = { [weak self] in
+            self?.saveStandalonePanelOrigin()
         }
     }
 
@@ -351,22 +472,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         panel.invalidateShadow()
         if !isPanelHiddenByUser {
-            followPet(forceStandaloneFallback: isManualStandaloneEnabled)
+            followPet()
         }
         updateStatusMenu()
     }
 
-    @objc private func showPanelFromMenu(_ sender: Any?) {
+    @objc private func togglePanelVisibilityFromMenu(_ sender: Any?) {
+        if isPanelHiddenByUser || panel?.isVisible != true {
+            showPanelFromMenu(sender)
+        } else {
+            hidePanelFromMenu(sender)
+        }
+    }
+
+    private func showPanelFromMenu(_ sender: Any?) {
         isPanelHiddenByUser = false
-        isManualStandaloneEnabled = true
-        followPet(forceStandaloneFallback: true)
+        followPet()
         updateStatusMenu()
     }
 
-    @objc private func hidePanelFromMenu(_ sender: Any?) {
-        isManualStandaloneEnabled = false
+    private func hidePanelFromMenu(_ sender: Any?) {
         isPanelHiddenByUser = true
-        quotaView.setRunningTaskBadgeAnimationsEnabled(false)
+        isStandalonePanelActive = false
+        quotaView.allowsWindowDragging = false
+        quotaView.setTaskAnimationsEnabled(false)
         if panel.isVisible {
             panel.orderOut(nil)
         }
@@ -384,6 +513,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func refreshQuotaFromMenu(_ sender: Any?) {
         refreshQuota()
         updateStatusMenu()
+    }
+
+    @objc private func selectQuotaRateLimitFromMenu(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        selectQuotaRateLimit(id: id)
+    }
+
+    private func selectQuotaRateLimit(id: String) {
+        guard let current = quotaView.quotaPresentation else { return }
+        let selected = current.selectingRateLimit(id: id)
+        guard selected.selectedRateLimitID != current.selectedRateLimitID else {
+            updateStatusMenu(force: true)
+            return
+        }
+        quotaView.quotaPresentation = selected
+        updateStatusMenu(force: true)
+    }
+
+    private func cycleQuotaRateLimit() {
+        guard let current = quotaView.quotaPresentation else { return }
+        let selected = current.cyclingRateLimit()
+        guard selected.selectedRateLimitID != current.selectedRateLimitID else {
+            return
+        }
+        quotaView.quotaPresentation = selected
+        updateStatusMenu(force: true)
     }
 
     @objc private func toggleMarketPricesFromMenu(_ sender: Any?) {
@@ -428,7 +583,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         updateExpandedPanelSize()
         if !isPanelHiddenByUser {
-            followPet(forceStandaloneFallback: isManualStandaloneEnabled)
+            followPet()
         }
         writeHealth(
             status: enabled ? "market-prices-shown" : "market-prices-hidden",
@@ -468,7 +623,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         updateExpandedPanelSize()
         if !isPanelHiddenByUser {
-            followPet(forceStandaloneFallback: isManualStandaloneEnabled)
+            followPet()
         }
         writeHealth(
             status: enabled ? "stock-prices-shown" : "stock-prices-hidden",
@@ -496,8 +651,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func resetFollowPositionFromMenu(_ sender: Any?) {
         locator.reset()
+        UserDefaults.standard.removeObject(
+            forKey: standalonePanelOriginPreferenceKey
+        )
         isPanelHiddenByUser = false
-        isManualStandaloneEnabled = false
+        isStandalonePanelActive = false
         followPet()
         updateStatusMenu()
     }
@@ -564,7 +722,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             locator.reset()
             refreshQuota()
             if !isPanelHiddenByUser {
-                followPet(forceStandaloneFallback: isManualStandaloneEnabled)
+                followPet()
             }
             updateStatusMenu(force: true)
         } catch {
@@ -586,10 +744,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.terminate(sender)
     }
 
-    private func followPet(forceStandaloneFallback: Bool = false) {
-        // 这是跟随功能的状态分支：用户隐藏 → 找不到桌宠时回退/等待 → 找到后精确跟随。
+    private func followPet() {
+        // 这是跟随功能的状态分支：用户隐藏 → 找不到桌宠时独立显示 → 找到后精确跟随。
         guard !isPanelHiddenByUser else {
-            quotaView.setRunningTaskBadgeAnimationsEnabled(false)
+            isStandalonePanelActive = false
+            quotaView.allowsWindowDragging = false
+            quotaView.setTaskAnimationsEnabled(false)
             if panel.isVisible {
                 panel.orderOut(nil)
             }
@@ -601,29 +761,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        guard let pet = locator.locate() else {
-            lastLocationSource = nil
-            if forceStandaloneFallback || isManualStandaloneEnabled || shouldShowStandalonePanel() {
-                showStandalonePanel()
-                quotaView.followStatusText = "固定显示"
-                followHealthStatus = "screen-fallback"
-                lastLocationSource = "screen-fallback"
-                writeHealth(
-                    status: "fallback-visible",
-                    panelVisible: true,
-                    locationSource: "screen-fallback"
-                )
-            } else {
-                quotaView.setRunningTaskBadgeAnimationsEnabled(false)
-                panel.orderOut(nil)
-                quotaView.followStatusText = "等待桌宠"
-                followHealthStatus = "waiting-for-pet"
-                writeHealth(status: "waiting-for-codex", panelVisible: false, locationSource: nil)
-            }
+        let pet = isCodexDesktopRunning() ? locator.locate() : nil
+        guard let pet else {
+            showStandalonePanel()
+            quotaView.followStatusText = "固定显示"
+            followHealthStatus = "screen-fallback"
+            lastLocationSource = "screen-fallback"
+            writeHealth(
+                status: "fallback-visible",
+                panelVisible: true,
+                locationSource: "screen-fallback"
+            )
             updateStatusMenu()
             return
         }
 
+        isStandalonePanelActive = false
+        quotaView.allowsWindowDragging = false
         quotaView.followStatusText = "跟随中"
         followHealthStatus = "following-pet"
         lastLocationSource = pet.source
@@ -646,7 +800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !panel.isVisible {
             panel.orderFrontRegardless()
         }
-        quotaView.setRunningTaskBadgeAnimationsEnabled(true)
+        quotaView.setTaskAnimationsEnabled(true)
         writeHealth(
             status: "following-pet",
             panelVisible: true,
@@ -657,10 +811,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusMenu()
     }
 
-    private func shouldShowStandalonePanel() -> Bool {
-        if let overlayOpen = locator.overlayOpen { return overlayOpen }
-
-        return NSWorkspace.shared.runningApplications.contains { application in
+    private func isCodexDesktopRunning() -> Bool {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now >= nextCodexDesktopCheckAt else {
+            return cachedCodexDesktopRunning
+        }
+        nextCodexDesktopCheckAt = now + 1
+        cachedCodexDesktopRunning = NSWorkspace.shared.runningApplications.contains { application in
             let name = application.localizedName?.lowercased() ?? ""
             let bundleID = application.bundleIdentifier?.lowercased() ?? ""
             return name == "codex"
@@ -668,22 +825,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 || bundleID.contains("openai.codex")
                 || bundleID.contains("openai.chat")
         }
+        return cachedCodexDesktopRunning
     }
 
     private func showStandalonePanel() {
-        let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
-            ?? NSScreen.main
-            ?? NSScreen.screens.first
-        guard let screen else { return }
-
-        let visible = screen.visibleFrame
+        let wasAlreadyStandalone = isStandalonePanelActive
+        let screens = NSScreen.screens
+        let preferredScreen = preferredStandaloneScreen(from: screens)
         let currentPanelSize = quotaView.isCollapsed
             ? collapsedPanelSize
             : currentExpandedPanelSize
-        let origin = NSPoint(
-            x: (visible.maxX - currentPanelSize.width - 24).rounded(),
-            y: (visible.maxY - currentPanelSize.height - 24).rounded()
-        )
+        let savedOrigin = wasAlreadyStandalone
+            ? panel.frame.origin
+            : storedStandalonePanelOrigin()
+        guard let origin = standalonePanelOrigin(
+            savedOrigin: savedOrigin,
+            panelSize: currentPanelSize,
+            screenVisibleFrames: screens.map(\.visibleFrame),
+            preferredScreenVisibleFrame: preferredScreen?.visibleFrame
+        ) else { return }
+
+        isStandalonePanelActive = true
+        quotaView.allowsWindowDragging = true
         quotaView.pointerSide = .bottom
         quotaView.pointerCenterX = currentPanelSize.width / 2
         if panel.frame.origin != origin {
@@ -692,7 +855,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !panel.isVisible {
             panel.orderFrontRegardless()
         }
-        quotaView.setRunningTaskBadgeAnimationsEnabled(true)
+        quotaView.setTaskAnimationsEnabled(true)
+    }
+
+    private func preferredStandaloneScreen(from screens: [NSScreen]) -> NSScreen? {
+        if panel.isVisible,
+           let currentScreen = screens.max(by: {
+               visibleArea(of: panel.frame, on: $0)
+                   < visibleArea(of: panel.frame, on: $1)
+           }),
+           visibleArea(of: panel.frame, on: currentScreen) > 0
+        {
+            return currentScreen
+        }
+        return screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
+            ?? NSScreen.main
+            ?? screens.first
+    }
+
+    private func visibleArea(of rect: NSRect, on screen: NSScreen) -> CGFloat {
+        let intersection = screen.visibleFrame.intersection(rect)
+        guard !intersection.isNull else { return 0 }
+        return intersection.width * intersection.height
+    }
+
+    private func storedStandalonePanelOrigin() -> NSPoint? {
+        guard let rawValue = UserDefaults.standard.string(
+            forKey: standalonePanelOriginPreferenceKey
+        ) else { return nil }
+        let origin = NSPointFromString(rawValue)
+        guard origin.x.isFinite, origin.y.isFinite else { return nil }
+        return origin
+    }
+
+    private func saveStandalonePanelOrigin() {
+        guard isStandalonePanelActive else { return }
+        UserDefaults.standard.set(
+            NSStringFromPoint(panel.frame.origin),
+            forKey: standalonePanelOriginPreferenceKey
+        )
     }
 
     private func refreshQuota() {
@@ -762,13 +963,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 日志扫描可能访问较多文件，放到 utility 队列，避免阻塞菜单和面板绘制。
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            let snapshot = self.taskProgressReader.read()
+            let result = self.taskProgressReader.readResult()
             // 所有 NSView / NSPanel 状态都必须回到主线程更新。
             DispatchQueue.main.async {
                 self.isRefreshingTaskProgress = false
-                self.quotaView.taskProgress = snapshot
+                let events = self.taskAttentionTracker.update(
+                    with: result.allItems
+                )
+                self.quotaView.applyTaskProgress(result, events: events)
                 let nextSize = panelSizeForTaskRows(
-                    snapshot.rowCount,
+                    result.snapshot.rowCount,
                     showsMarketPrices: self.showsMarketPrices,
                     showsStockPrices: self.showsStockPrices,
                     stockRowCount: enabledStockQuoteConfigurations.count
@@ -782,9 +986,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.panel.setContentSize(nextSize)
                 }
                 if !self.isPanelHiddenByUser {
-                    self.followPet(
-                        forceStandaloneFallback: self.isManualStandaloneEnabled
-                    )
+                    self.followPet()
                 }
             }
         }

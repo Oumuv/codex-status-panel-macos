@@ -2,18 +2,26 @@
 set -euo pipefail
 
 ROOT="${0:A:h:h}"
-VERSION="1.2.5"
+APP="$ROOT/build/Codex 状态面板.app"
 STAGE_ROOT="$ROOT/build/release"
 STAGE="$STAGE_ROOT/Codex状态面板-macOS"
-OUT="$ROOT/dist/Codex-Status-Panel-macOS-Universal-v$VERSION.zip"
 LABEL="io.github.mayday-materials.codex-status-panel"
 
 "$ROOT/scripts/build.sh" >/dev/null
+VERSION="$(
+  /usr/bin/plutil -extract CFBundleShortVersionString raw \
+    "$APP/Contents/Info.plist"
+)"
+[[ -n "$VERSION" ]] || {
+  echo "构建产物缺少 CFBundleShortVersionString" >&2
+  exit 1
+}
+OUT="$ROOT/dist/Codex-Status-Panel-macOS-Universal-v$VERSION.zip"
 
 /bin/rm -rf "$STAGE"
 /bin/mkdir -p "$STAGE/panel" "$ROOT/dist"
 
-/usr/bin/ditto "$ROOT/build/Codex 状态面板.app" "$STAGE/panel/Codex 状态面板.app"
+/usr/bin/ditto "$APP" "$STAGE/panel/Codex 状态面板.app"
 /bin/cp "$ROOT/Resources/$LABEL.plist.in" "$STAGE/panel/$LABEL.plist.in"
 /bin/cp "$ROOT/Resources/default-panel-config.json" "$STAGE/panel/default-panel-config.json"
 /bin/cp "$ROOT/README.md" "$STAGE/README.md"

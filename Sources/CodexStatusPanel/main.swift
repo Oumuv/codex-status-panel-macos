@@ -12,6 +12,7 @@ let cliFlags: Set<String> = [
     "--print-stock",
     "--print-panel-location",
     "--print-saved-panel-location",
+    "--print-pet-window-diagnostics",
     "--self-test-placement",
     "--self-test-menu-controls",
     "--self-test-task-progress",
@@ -54,6 +55,10 @@ if CommandLine.arguments.contains("--print-saved-panel-location") {
     printPanelPlacementOnce(savedStateOnly: true)
 }
 
+if CommandLine.arguments.contains("--print-pet-window-diagnostics") {
+    printPetWindowDiagnostics()
+}
+
 if CommandLine.arguments.contains("--self-test-placement") {
     runPlacementSelfTest()
 }
@@ -88,7 +93,7 @@ if CommandLine.arguments.contains("--print-task-progress") {
 
 if let previewFlag = CommandLine.arguments.firstIndex(of: "--render-preview") {
     guard CommandLine.arguments.indices.contains(previewFlag + 1) else {
-        fputs("用法：CodexStatusPanel --render-preview <output.png> [--collapsed] [--preview-usage <mode>]\n", stderr)
+        fputs("用法：CodexStatusPanel --render-preview <output.png> [--collapsed] [--preview-usage <mode>] [--preview-task <mode>]\n", stderr)
         exit(1)
     }
     let usageMode: PreviewUsageMode
@@ -100,17 +105,34 @@ if let previewFlag = CommandLine.arguments.firstIndex(of: "--render-preview") {
                 rawValue: CommandLine.arguments[modeFlag + 1]
               )
         else {
-            fputs("用法：--preview-usage <codex|unconfigured|sub2api-wallet|sub2api-empty-wallet|sub2api-warning|sub2api-danger>\n", stderr)
+            fputs("用法：--preview-usage <codex|unconfigured|sub2api-wallet|sub2api-empty-wallet|sub2api-rate-1d|sub2api-rate-7d|sub2api-warning|sub2api-danger>\n", stderr)
             exit(1)
         }
         usageMode = parsed
     } else {
         usageMode = .codex
     }
+    let taskMode: PreviewTaskMode
+    if let modeFlag = CommandLine.arguments.firstIndex(
+        of: "--preview-task"
+    ) {
+        guard CommandLine.arguments.indices.contains(modeFlag + 1),
+              let parsed = PreviewTaskMode(
+                rawValue: CommandLine.arguments[modeFlag + 1]
+              )
+        else {
+            fputs("用法：--preview-task <showcase|reading|running|waiting|completed|failed|idle>\n", stderr)
+            exit(1)
+        }
+        taskMode = parsed
+    } else {
+        taskMode = .showcase
+    }
     renderPreviewOnce(
         to: CommandLine.arguments[previewFlag + 1],
         collapsed: CommandLine.arguments.contains("--collapsed"),
-        usageMode: usageMode
+        usageMode: usageMode,
+        taskMode: taskMode
     )
 }
 

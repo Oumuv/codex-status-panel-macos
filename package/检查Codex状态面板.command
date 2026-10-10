@@ -3,12 +3,17 @@ emulate -L zsh
 setopt PIPE_FAIL
 
 APP="$HOME/Applications/Codex 状态面板.app"
+APP_INFO_PLIST="$APP/Contents/Info.plist"
 BIN="$APP/Contents/MacOS/CodexStatusPanel"
 LABEL="io.github.mayday-materials.codex-status-panel"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 HEALTH="$HOME/Library/Caches/io.github.mayday-materials.codex-status-panel/panel-health.json"
 LOG_PATH="$HOME/Library/Logs/Codex 状态面板.log"
+PANEL_VERSION="$(
+  /usr/bin/plutil -extract CFBundleShortVersionString raw \
+    "$APP_INFO_PLIST" 2>/dev/null
+)"
 FAILED=0
 
 check() {
@@ -28,7 +33,8 @@ check "面板签名正常" '[[ -d "$APP" ]] && /usr/bin/codesign --verify --deep
 check "登录启动项存在" '[[ -f "$PLIST" ]]'
 check "登录启动项格式正常" '[[ -f "$PLIST" ]] && /usr/bin/plutil -lint "$PLIST" >/dev/null'
 check "面板进程正在运行" '/bin/launchctl print "$DOMAIN/$LABEL" 2>/dev/null | /usr/bin/grep -Eq "^[[:space:]]*pid = [0-9]+"'
-check "健康状态版本正确" '[[ -s "$HEALTH" ]] && /usr/bin/grep -q '"'"'"version":"1.2.5"'"'"' "$HEALTH"'
+check "面板版本可读" '[[ -n "$PANEL_VERSION" ]]'
+check "健康状态版本正确" '[[ -n "$PANEL_VERSION" && -s "$HEALTH" ]] && /usr/bin/grep -Fq "\"version\":\"$PANEL_VERSION\"" "$HEALTH"'
 check "行情开关状态可读" '[[ -s "$HEALTH" ]] && /usr/bin/grep -Eq '"'"'"marketPricesEnabled":(true|false)'"'"' "$HEALTH"'
 check "币价开关状态可读" '[[ -s "$HEALTH" ]] && /usr/bin/grep -Eq '"'"'"cryptoPricesEnabled":(true|false)'"'"' "$HEALTH"'
 check "A 股开关状态可读" '[[ -s "$HEALTH" ]] && /usr/bin/grep -Eq '"'"'"stockPricesEnabled":(true|false)'"'"' "$HEALTH"'
