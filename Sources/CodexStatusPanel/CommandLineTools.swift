@@ -1456,6 +1456,26 @@ func runTaskProgressSelfTest() -> Never {
         x: bodyRect.midX,
         y: taskProgressRowRect(index: 1, in: bodyRect).midY
     )
+    let clientFixtures: [(String, String, CodexTaskClient)] = [
+        ("orca_desktop", "vscode", .orca),
+        ("codex-tui", "vscode", .cli),
+        ("codex_cli_rs", "vscode", .cli),
+        ("t3-code", "vscode", .t3),
+        ("t3_code", "vscode", .t3),
+        ("t3code", "vscode", .t3),
+        ("T3 Code", "vscode", .t3),
+        ("Codex Desktop", "vscode", .app),
+        ("codex_work", "vscode", .app),
+        ("another_desktop", "vscode", .unknown),
+        ("", "vscode", .unknown),
+        ("", "cli", .cli),
+    ]
+    let clientChecks = clientFixtures.map { originator, source, expected in
+        let metadata = #"{"type":"session_meta","payload":{"originator":"\#(originator)","source":"\#(source)"}}"#
+        return CodexTaskProgressReader.taskTarget(
+            sessionMetadataLine: metadata, rolloutURL: rolloutURL
+        ).client == expected
+    }
     let navigationChecks = [
         cliTarget.client == .cli
             && cliTarget.threadID == threadID
@@ -1500,7 +1520,20 @@ func runTaskProgressSelfTest() -> Never {
                 taskCount: 3,
                 in: bodyRect
             ) == nil,
-    ]
+        TaskWindowNavigator.tty(fromLsofOutput: "n/dev/tty\nn/dev/ttys009\n") == "/dev/ttys009",
+        TaskWindowNavigator.tty(fromLsofOutput: "n/dev/tty\n") == nil,
+        TaskWindowNavigator.fallbackApplicationBundleIdentifier(for: .orca) == "com.stablyai.orca",
+        TaskWindowNavigator.fallbackApplicationBundleIdentifier(for: .t3) == "com.t3tools.t3code",
+        [.cli, .unknown, .pi, .app].allSatisfy {
+            TaskWindowNavigator.fallbackApplicationBundleIdentifier(for: $0) == nil
+        },
+        TaskWindowNavigator.hostBundleIdentifier(
+            forExecutablePath: "/tmp/daemon-host/app.noindex/Orca Agents.app/Contents/MacOS/Orca Agents"
+        ) == "com.stablyai.orca",
+        TaskWindowNavigator.hostBundleIdentifier(
+            forExecutablePath: "/tmp/codex"
+        ) == nil,
+    ] + clientChecks
     guard navigationChecks.allSatisfy({ $0 }) else {
         fputs("task window navigation mapping failed\n", stderr)
         exit(1)
@@ -1910,7 +1943,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=19/19; pi=10/10; navigation=9/9; attention=9/9; animation=4/4; ball-effects=9/9; text-effects=10/10; celebration=17/17; list=pass; layout=pass; icons=4/4; balls=5/5")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=19/19; pi=10/10; navigation=\(navigationChecks.count)/\(navigationChecks.count); attention=9/9; animation=4/4; ball-effects=9/9; text-effects=10/10; celebration=17/17; list=pass; layout=pass; icons=4/4; balls=5/5")
     exit(0)
 }
 

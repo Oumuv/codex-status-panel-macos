@@ -39,7 +39,7 @@ echo "检查行情数据自测入口..."
   | /usr/bin/grep -q 'market-data-self-test:.*bounds=pass'
 echo "检查任务进度自测入口..."
 "$BIN" --self-test-task-progress \
-  | /usr/bin/grep -q 'task-progress-self-test:.*incremental=19/19;.*pi=10/10;.*navigation=9/9;.*icons=4/4'
+  | /usr/bin/grep -q 'task-progress-self-test:.*incremental=19/19;.*pi=10/10;.*navigation=28/28;.*icons=4/4'
 echo "检查 Pi 桥接扩展事件..."
 for EVENT in \
   session_start before_agent_start agent_start ui_prompt_start ui_prompt_end \

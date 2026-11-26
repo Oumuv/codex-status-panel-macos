@@ -55,6 +55,8 @@ enum TaskProgressSource: String, Hashable {
 enum CodexTaskClient: String, Equatable {
     case cli
     case app
+    case orca
+    case t3
     case pi
     case unknown
 }
@@ -968,16 +970,21 @@ final class CodexTaskProgressReader {
             sourceName = ""
         }
 
-        if sourceName.contains("vscode")
-            || originator.contains("desktop")
-            || originator.contains("codex_work")
-        {
+        // app-server 的 source 也可能是 vscode；originator 才能区分宿主。
+        // 先识别第三方及 TUI，不能把 orca_desktop 当成 Codex Desktop。
+        if originator == "orca" || originator.hasPrefix("orca_")
+            || originator.hasPrefix("orca-") { return .orca }
+        if ["t3 code", "t3-code", "t3_code", "t3code"].contains(where: {
+            originator == $0 || originator.hasPrefix($0 + "-")
+                || originator.hasPrefix($0 + "_")
+        }) { return .t3 }
+        if originator.contains("codex-tui") || originator.contains("codex_cli") {
+            return .cli
+        }
+        if ["codex desktop", "codex_desktop", "codex-desktop", "codex_work"].contains(originator) {
             return .app
         }
-        if sourceName.contains("cli")
-            || originator.contains("codex-tui")
-            || originator.contains("codex_cli")
-        {
+        if sourceName == "cli" {
             return .cli
         }
         return .unknown

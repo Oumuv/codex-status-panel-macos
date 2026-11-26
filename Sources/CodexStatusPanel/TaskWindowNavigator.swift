@@ -1,4 +1,4 @@
-// 将任务面板中的 rollout 定位到 Codex App 或承载 Codex CLI 的终端窗口。
+// 按会话来源和当前进程宿主定位任务；定位失败时禁止跨工具回退。
 
 import AppKit
 import Darwin
@@ -22,12 +22,11 @@ final class TaskWindowNavigator {
             openInCodexApp(target)
             return
         }
-
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             if target.client == .pi {
                 self?.openPiCLI(target)
             } else {
-                self?.openCLIOrFallback(target)
+                self?.openCodexTask(target)
             }
         }
     }
@@ -64,8 +63,25 @@ final class TaskWindowNavigator {
 
     static func tty(fromLsofOutput output: String) -> String? {
         for line in output.split(whereSeparator: \.isNewline) {
-            guard line.hasPrefix("n/dev/tty") else { continue }
+            // /dev/tty 是通用控制终端设备，不是可用于匹配窗口的具体 TTY。
+            guard line.hasPrefix("n/dev/ttys"), line.count > "n/dev/ttys".count else { continue }
             return String(line.dropFirst())
+        }
+        return nil
+    }
+
+    static func fallbackApplicationBundleIdentifier(for client: CodexTaskClient) -> String? {
+        switch client {
+        case .orca: return "com.stablyai.orca"
+        case .t3: return "com.t3tools.t3code"
+        default: return nil
+        }
+    }
+
+    static func hostBundleIdentifier(forExecutablePath path: String) -> String? {
+        // Orca 的 terminal-host 是独立 daemon，父进程可能已是 launchd，且没有 TTY。
+        if path.contains("/Orca Agents.app/Contents/MacOS/") {
+            return "com.stablyai.orca"
         }
         return nil
     }
@@ -97,7 +113,7 @@ final class TaskWindowNavigator {
             fputs("task-navigation: Pi 任务缺少有效进程 ID，无法定位终端\n", stderr)
             return
         }
-        guard focusTerminal(
+        guard focusProcess(
             processID: processID,
             workingDirectory: target.workingDirectory
         ) else {
@@ -109,15 +125,10 @@ final class TaskWindowNavigator {
         }
     }
 
-    private func openCLIOrFallback(_ target: TaskProgressTarget) {
+    private func openCodexTask(_ target: TaskProgressTarget) {
         let processIDs = codexProcessIDs(for: target.rolloutPath)
-        guard !processIDs.isEmpty else {
-            openInCodexApp(target)
-            return
-        }
-
         for processID in processIDs {
-            if focusTerminal(
+            if focusProcess(
                 processID: processID,
                 workingDirectory: target.workingDirectory
             ) {
@@ -125,19 +136,34 @@ final class TaskWindowNavigator {
             }
         }
 
-        openInCodexApp(target)
+        if let bundleID = Self.fallbackApplicationBundleIdentifier(for: target.client),
+                  let application = runningApplication(bundleIdentifier: bundleID) {
+            activate(application)
+            reportApplicationOnlyNavigation()
+        } else {
+            fputs("task-navigation: 无法定位 \(target.client.rawValue) 任务的原窗口；未回退到其他工具\n", stderr)
+        }
     }
 
-    private func focusTerminal(
+    private func focusProcess(
         processID: pid_t,
         workingDirectory: String?
     ) -> Bool {
-        guard let tty = tty(for: processID) else { return false }
         if let owner = owningApplication(for: processID) {
+            let kind = Self.terminalKind(forBundleIdentifier: owner.bundleIdentifier ?? "")
+            // GUI app-server 没有 TTY 也应回到其宿主，不应改开 Codex App。
+            guard kind != .other else {
+                activate(owner)
+                reportApplicationOnlyNavigation()
+                return true
+            }
+            guard let tty = tty(for: processID) else {
+                activate(owner)
+                reportApplicationOnlyNavigation()
+                return true
+            }
             focus(
-                terminalKind: Self.terminalKind(
-                    forBundleIdentifier: owner.bundleIdentifier ?? ""
-                ),
+                terminalKind: kind,
                 application: owner,
                 tty: tty,
                 workingDirectory: workingDirectory
@@ -145,6 +171,7 @@ final class TaskWindowNavigator {
             return true
         }
 
+        guard let tty = tty(for: processID) else { return false }
         return focusKnownTerminal(
             tty: tty,
             workingDirectory: workingDirectory
@@ -168,8 +195,12 @@ final class TaskWindowNavigator {
             executable: "/usr/sbin/lsof",
             arguments: ["-a", "-p", String(processID), "-Fn"]
         )
-        guard result.status == 0 else { return nil }
-        return Self.tty(fromLsofOutput: result.output)
+        if result.status == 0, let tty = Self.tty(fromLsofOutput: result.output) { return tty }
+        let psResult = runCommand(executable: "/bin/ps", arguments: ["-o", "tty=", "-p", String(processID)])
+        let name = psResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard psResult.status == 0, name.hasPrefix("ttys"),
+              name.dropFirst(4).allSatisfy(\.isNumber), name.count > 4 else { return nil }
+        return "/dev/" + name
     }
 
     private func owningApplication(for processID: pid_t) -> NSRunningApplication? {
@@ -177,6 +208,11 @@ final class TaskWindowNavigator {
         var visited = Set<pid_t>()
 
         for _ in 0..<16 where currentPID > 1 && visited.insert(currentPID).inserted {
+            if let path = executablePath(of: currentPID),
+               let hostID = Self.hostBundleIdentifier(forExecutablePath: path),
+               let host = runningApplication(bundleIdentifier: hostID) {
+                return host
+            }
             if let application = NSRunningApplication(processIdentifier: currentPID),
                let bundleIdentifier = application.bundleIdentifier,
                bundleIdentifier != Bundle.main.bundleIdentifier
@@ -187,6 +223,17 @@ final class TaskWindowNavigator {
             currentPID = parentPID
         }
         return nil
+    }
+
+    private func executablePath(of processID: pid_t) -> String? {
+        // PROC_PIDPATHINFO_MAXSIZE 是 Swift 不导入的复合 C 宏 (4 * MAXPATHLEN)。
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        guard proc_pidpath(processID, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    private func reportApplicationOnlyNavigation() {
+        fputs("task-navigation: 仅激活已确认的宿主 App；尚未定位具体任务标签页\n", stderr)
     }
 
     private func parentProcessID(of processID: pid_t) -> pid_t? {
@@ -220,6 +267,7 @@ final class TaskWindowNavigator {
 
         if !focused {
             activate(application)
+            reportApplicationOnlyNavigation()
         }
     }
 
@@ -249,6 +297,7 @@ final class TaskWindowNavigator {
             if result == "focused" { return true }
             if result == "ambiguous" {
                 activate(ghostty)
+                reportApplicationOnlyNavigation()
                 return true
             }
         }
