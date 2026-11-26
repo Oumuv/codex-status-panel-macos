@@ -39,7 +39,14 @@ echo "检查行情数据自测入口..."
   | /usr/bin/grep -q 'market-data-self-test:.*bounds=pass'
 echo "检查任务进度自测入口..."
 "$BIN" --self-test-task-progress \
-  | /usr/bin/grep -q 'task-progress-self-test:.*incremental=16/16;.*icons=4/4'
+  | /usr/bin/grep -q 'task-progress-self-test:.*incremental=19/19;.*pi=10/10;.*navigation=9/9;.*icons=4/4'
+echo "检查 Pi 桥接扩展事件..."
+for EVENT in \
+  session_start before_agent_start agent_start ui_prompt_start ui_prompt_end \
+  turn_end agent_before_settle agent_settled session_shutdown; do
+  /usr/bin/grep -Fq "pi.on(\"$EVENT\"" \
+    "$ROOT/Resources/pi-status-bridge.ts"
+done
 echo "检查认证回退自测入口..."
 "$BIN" --self-test-authentication-fallback \
   | /usr/bin/grep -q 'authentication-fallback-self-test:.*presentation=3/3'

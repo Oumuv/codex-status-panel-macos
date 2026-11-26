@@ -9,7 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var quotaProvider = makeQuotaUsageProvider(
         configuration: panelConfig.usageProvider
     )
-    private let taskProgressReader = CodexTaskProgressReader()
+    private let taskProgressReader = CombinedTaskProgressReader()
     private let taskAttentionTracker = TaskAttentionTracker()
     private let btcPriceClient = MarketPriceClient(symbol: "BTCUSDT")
     private let ethPriceClient = MarketPriceClient(symbol: "ETHUSDT")

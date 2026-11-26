@@ -9,10 +9,17 @@
 
 ## 运行时数据
 
-- Codex 额度由本机 `codex app-server` 提供，只用于面板显示，不上传到本项目服务器。
-- BTC/ETH 行情默认关闭；如用户在配置中开启，会请求公共行情接口，不需要 API Key。
+本项目没有自建数据收集服务器。运行时数据按用户启用的功能在本机处理，或发送到以下明确的数据源：
+
+- 默认 Codex 额度由本机 `codex app-server` 提供，只用于面板显示。
+- 配置 Sub2API 后，App 会向用户配置的服务地址请求 `/v1/usage`，并在 `Authorization` 请求头中携带配置的 Bearer API Key。API Key 保存在用户自己的 `panel-config.json` 中；建议仅使用可信 HTTPS 服务。
+- BTC/ETH 行情默认关闭；启用后会请求 Binance 公共行情接口，不需要 API Key。
+- A 股行情默认关闭；启用后会请求东方财富公共行情接口，并在本机缓存最近一次有效行情，不需要 API Key。
+- Codex 任务状态来自本机 `CODEX_HOME`（默认 `~/.codex`）中的 session 和未读状态文件。
 - macOS 日志位于当前用户的 `~/Library/Logs`。
-- 健康状态文件只记录面板版本、进程、连接状态、跟随状态、是否显示行情和面板定位误差，不记录真实额度值、token 或邮箱。
+- 健康状态文件记录面板版本、PID、运行和连接状态、跟随状态、面板可见性与高度、定位来源与误差、行情开关、A 股市场状态和更新时间；不记录真实额度值、token、API Key、邮箱或会话内容。
+- Pi 状态桥接只在本机写入会话 ID、Pi 进程 PID、运行模式、工作目录、会话文件路径、状态和时间戳。任务标题最多 80 字符；未命名会话可能使用首条提示首行的前 80 字符。桥接不读取 Pi 认证文件，也不保存其余提示内容、回复、工具参数或工具输出。
+- Pi 桥接状态位于当前用户的 `~/Library/Application Support/io.github.mayday-materials.codex-status-panel/pi-sessions`，卸载时删除。
 
 ## 发布前审计
 
