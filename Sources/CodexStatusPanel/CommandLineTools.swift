@@ -787,16 +787,13 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
     let navigationMetadata = #"{"type":"session_meta","payload":{"id":"\#(navigationThreadID)","cwd":"/tmp/navigation-project","originator":"codex-tui","source":"cli","thread_source":"user"}}"#
     let userMessage = #"{"type":"event_msg","payload":{"type":"user_message","message":"阶段二增量任务"}}"#
     let started = #"{"type":"event_msg","payload":{"type":"task_started"}}"#
-    let completed = #"{"type":"event_msg","payload":{"type":"task_complete"}}"#
-    let taskFailed = #"{"type":"event_msg","payload":{"type":"task_failed"}}"#
-    let aborted = #"{"type":"event_msg","payload":{"type":"turn_aborted"}}"#
+    let endTimestamp = ISO8601DateFormatter().string(from: now)
+    let completed = #"{"timestamp":"\#(endTimestamp)","type":"event_msg","payload":{"type":"task_complete"}}"#
+    let taskFailed = #"{"timestamp":"\#(endTimestamp)","type":"event_msg","payload":{"type":"task_failed"}}"#
+    let aborted = #"{"timestamp":"\#(endTimestamp)","type":"event_msg","payload":{"type":"turn_aborted"}}"#
     let request = #"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call-stage-2"}}"#
     let response = #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-stage-2"}}"#
     let cliApproval = #"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"date\",\"sandbox_permissions\":\"require_escalated\"}","call_id":"call-cli-incremental"}}"#
-    let noUnreadState = CodexTaskProgressReader.UnreadThreadState(
-        ids: [],
-        isAvailable: false
-    )
     var clockOffset: TimeInterval = 0
     var failures: [String] = []
 
@@ -847,7 +844,7 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
         CodexTaskProgressReader(
             rolloutURLsProvider: urls,
             threadTitlesOverride: [:],
-            unreadStateOverride: noUnreadState
+            unreadThreadIDsOverride: []
         )
     }
 
@@ -1034,7 +1031,7 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
     )
 
     let spacedErrorURL = fixtureDirectory.appendingPathComponent("spaced-error.jsonl")
-    let spacedError = #"{"type" : "event_msg", "payload" : {"type" : "error"}}"#
+    let spacedError = #"{"timestamp" : "\#(endTimestamp)", "type" : "event_msg", "payload" : {"type" : "error"}}"#
     try writeLines([sessionMetadata, spacedError], to: spacedErrorURL)
     let spacedErrorReader = makeReader { [spacedErrorURL] }
     record(
@@ -1060,6 +1057,48 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
         )
     )
     record("semantic-equivalence", semanticSnapshot == referenceSnapshot)
+
+    let orcaURL = fixtureDirectory.appendingPathComponent("orca-title.jsonl")
+    let orcaContext = ##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\n<INSTRUCTIONS>项目规则</INSTRUCTIONS>"},{"type":"input_text","text":"<environment_context>环境说明</environment_context>"}]}}"##
+    let orcaMessage = #"{"type": "response_item", "payload": {"type": "message", "role": "user", "content":[{"type":"input_text","text":"[Image #1] 排查 Orca 标题"},{"type":"input_text","text":"<image name=\"example\"/>"},{"type":"input_image"},{"type":"input_text","text":"</image>"}]}}"#
+    let orcaReminder = #"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<system-reminder>系统提醒</system-reminder>"}]}}"#
+    let assistantMessage = #"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"不是用户任务"}]}}"#
+    let orcaReader = makeReader { [orcaURL] }
+    let orcaStart = [sessionMetadata, started, orcaContext, assistantMessage]
+    let contextDate = try writeLines(orcaStart, to: orcaURL)
+    let initialOrcaTitle = orcaReader.read(at: contextDate).items.first?.title
+    let orcaAppend = Data("\(orcaMessage)\n\(orcaReminder)\n".utf8)
+    let messageDate = try append(orcaAppend, to: orcaURL)
+    let orcaSnapshot = orcaReader.read(at: messageDate)
+    let orcaReference = CodexTaskProgressReader.parse(
+        lines: orcaStart + [orcaMessage, orcaReminder],
+        modificationDate: contextDate,
+        now: messageDate,
+        target: orcaSnapshot.items.first?.target
+    )
+    record(
+        "orca-response-title-incremental-and-rebuild",
+        initialOrcaTitle == "Codex 任务"
+            && orcaSnapshot.items.first?.title == "排查 Orca 标题"
+            && orcaSnapshot == orcaReference
+            && orcaReader.lastReadDiagnostics.incrementalReadCount == 1
+            && makeReader { [orcaURL] }.read(at: messageDate).items.first?.title == "排查 Orca 标题"
+    )
+    let orcaNextMessage = orcaMessage.replacingOccurrences(of: "排查 Orca 标题", with: "新一轮 Orca 任务")
+    let nextOrcaDate = try append(Data("\(completed)\n\(started)\n\(orcaNextMessage)\n".utf8), to: orcaURL)
+    record(
+        "orca-next-turn-title",
+        orcaReader.read(at: nextOrcaDate).items.first?.title == "新一轮 Orca 任务"
+    )
+    let legacyAndOrca = CodexTaskProgressReader.parse(
+        lines: [orcaMessage, started, orcaReminder, userMessage],
+        modificationDate: messageDate,
+        now: messageDate
+    )
+    record(
+        "explicit-user-event-wins-over-response-message",
+        legacyAndOrca.items.first?.title == "阶段二增量任务"
+    )
 
     let failedURL = fixtureDirectory.appendingPathComponent("task-failed.jsonl")
     try writeLines([sessionMetadata, started], to: failedURL)
@@ -1089,6 +1128,92 @@ private func taskProgressIncrementalFailures(now: Date) throws -> [String] {
             && abortedReader.lastReadDiagnostics.incrementalReadCount == 1
     )
 
+    return failures
+}
+
+private func codexTerminalVisibilityFailures() throws -> [String] {
+    let fileManager = FileManager.default
+    let fixtureDirectory = fileManager.temporaryDirectory.appendingPathComponent(
+        "codex-status-panel-task-visibility-\(UUID().uuidString)",
+        isDirectory: true
+    )
+    try fileManager.createDirectory(at: fixtureDirectory, withIntermediateDirectories: true)
+    defer { try? fileManager.removeItem(at: fixtureDirectory) }
+
+    let threadID = "12345678-1234-4abc-8def-1234567890ab"
+    let url = fixtureDirectory.appendingPathComponent("rollout-\(threadID).jsonl")
+    let endedAt = Date(timeIntervalSince1970: 1_800_000_000.125)
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let started = #"{"type":"event_msg","payload":{"type":"task_started"}}"#
+    let request = #"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"visibility-request"}}"#
+    var failures: [String] = []
+
+    func terminal(_ type: String, at date: Date) -> String {
+        #"{"timestamp":"\#(formatter.string(from: date))","type":"event_msg","payload":{"type":"\#(type)"}}"#
+    }
+
+    func makeReader(unreadIDs: Set<String>) -> CodexTaskProgressReader {
+        CodexTaskProgressReader(
+            rolloutURLsProvider: { [url] },
+            threadTitlesOverride: [:],
+            unreadThreadIDsOverride: unreadIDs
+        )
+    }
+
+    func record(_ name: String, _ condition: @autoclosure () -> Bool) {
+        if !condition() { failures.append(name) }
+    }
+
+    let cases: [(String, TaskProgressKind, TimeInterval)] = [
+        ("task_complete", .completed, 120),
+        ("task_failed", .failed, 300),
+        ("turn_aborted", .failed, 300),
+        ("error", .failed, 300),
+    ]
+    for (event, kind, visibility) in cases {
+        let endEvent = terminal(event, at: endedAt)
+        try Data("\(started)\n\(endEvent)\n".utf8).write(to: url, options: .atomic)
+        let expiresAt = endedAt.addingTimeInterval(visibility)
+        let justBeforeExpiry = expiresAt.addingTimeInterval(-0.125)
+        let unreadReader = makeReader(unreadIDs: [threadID])
+        record("\(event)-unread-visible", unreadReader.read(at: justBeforeExpiry).kind == kind)
+        record("\(event)-read-visible", makeReader(unreadIDs: []).read(at: justBeforeExpiry).kind == kind)
+        let expired = unreadReader.readResult(at: expiresAt)
+        record(
+            "\(event)-expires-from-cache",
+            expired.snapshot == .idle && expired.allItems.isEmpty
+                && unreadReader.lastReadDiagnostics.cacheHitCount == 1
+        )
+
+        let afterExpiry = expiresAt.addingTimeInterval(10)
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        // 后补的普通日志和重复的结束事件都不能重新开始倒计时。
+        let duplicateEnd = terminal(event, at: afterExpiry)
+        try handle.write(contentsOf: Data("{\"type\":\"noop\"}\n\(duplicateEnd)\n".utf8))
+        try fileManager.setAttributes([.modificationDate: afterExpiry], ofItemAtPath: url.path)
+        record("\(event)-still-expired-after-append", unreadReader.read(at: afterExpiry) == .idle)
+        record("\(event)-still-expired-after-restart", makeReader(unreadIDs: [threadID]).read(at: afterExpiry) == .idle)
+
+        try handle.write(contentsOf: Data("\(started)\n\(request)\n".utf8))
+        record("\(event)-new-turn-waits", unreadReader.read(at: afterExpiry).kind == .waitingForInput)
+        let nextEnd = terminal(event, at: afterExpiry)
+        try handle.write(contentsOf: Data("\(nextEnd)\n".utf8))
+        record("\(event)-new-turn-ends", unreadReader.read(at: afterExpiry).kind == kind)
+    }
+
+    let missingTimestamp = #"{"type":"event_msg","payload":{"type":"task_complete"}}"#
+    let invalidTimestamp = #"{"timestamp":"invalid","type":"event_msg","payload":{"type":"task_failed"}}"#
+    for (name, event) in [("missing", missingTimestamp), ("invalid", invalidTimestamp)] {
+        record(
+            "\(name)-timestamp-does-not-use-mtime",
+            CodexTaskProgressReader.parse(
+                lines: [started, event], modificationDate: endedAt, now: endedAt
+            ) == .idle
+        )
+    }
     return failures
 }
 
@@ -1234,8 +1359,9 @@ private func piTaskProgressFailures(now: Date) -> [String] {
 func runTaskProgressSelfTest() -> Never {
     let now = Date()
     let started = #"{"type":"event_msg","payload":{"type":"task_started"}}"#
-    let completed = #"{"type":"event_msg","payload":{"type":"task_complete"}}"#
-    let failed = #"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
+    let endTimestamp = ISO8601DateFormatter().string(from: now)
+    let completed = #"{"timestamp":"\#(endTimestamp)","type":"event_msg","payload":{"type":"task_complete"}}"#
+    let failed = #"{"timestamp":"\#(endTimestamp)","type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
     let request = #"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call-1"}}"#
     let response = #"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1"}}"#
     let cliApproval = #"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"date\",\"sandbox_permissions\":\"require_escalated\"}","call_id":"call-cli-approval"}}"#
@@ -1424,57 +1550,18 @@ func runTaskProgressSelfTest() -> Never {
       }
     }
     """.utf8)
-    guard let unreadState = CodexTaskProgressReader.unreadThreadState(
-              from: currentUnreadStateData
-          ),
-          unreadState.isAvailable,
-          unreadState.ids == Set([threadID, otherThreadID]),
-          let readState = CodexTaskProgressReader.unreadThreadState(
-              from: currentReadStateData
-          ),
-          readState.isAvailable,
-          readState.ids.isEmpty,
-          let legacyUnreadState = CodexTaskProgressReader.unreadThreadState(
-              from: legacyUnreadStateData
-          ),
-          legacyUnreadState.ids == Set([threadID]),
-          CodexTaskProgressReader.unreadThreadState(
+    guard CodexTaskProgressReader.unreadThreadIDs(from: currentUnreadStateData)
+            == Set([threadID, otherThreadID]),
+          CodexTaskProgressReader.unreadThreadIDs(from: currentReadStateData) == [],
+          CodexTaskProgressReader.unreadThreadIDs(from: legacyUnreadStateData)
+            == [threadID],
+          CodexTaskProgressReader.unreadThreadIDs(
               from: malformedCurrentStateData
           ) == nil
     else {
         fputs("Codex unread state schema parsing failed\n", stderr)
         exit(1)
     }
-    let unavailableState = CodexTaskProgressReader.UnreadThreadState(ids: [], isAvailable: false)
-    let visibilityChecks = [
-        CodexTaskProgressReader.shouldDisplay(
-            kind: .completed,
-            threadID: threadID,
-            modificationDate: now.addingTimeInterval(-3600),
-            now: now,
-            unreadState: unreadState
-        ),
-        !CodexTaskProgressReader.shouldDisplay(
-            kind: .completed,
-            threadID: threadID,
-            modificationDate: now,
-            now: now,
-            unreadState: readState
-        ),
-        CodexTaskProgressReader.shouldDisplay(
-            kind: .failed,
-            threadID: threadID,
-            modificationDate: now,
-            now: now,
-            unreadState: unavailableState,
-            fallbackVisibility: 120
-        ),
-    ]
-    guard visibilityChecks.allSatisfy({ $0 }) else {
-        fputs("completed task filtering failed\n", stderr)
-        exit(1)
-    }
-
     let userMetadata = #"{"type":"session_meta","payload":{"thread_source":"user","source":{"cli":{}}}}"#
     let subagentMetadata = #"{"type":"session_meta","payload":{"thread_source":"subagent","source":{"subagent":{"thread_spawn":{}}}}}"#
     let automationMetadata = #"{"type":"session_meta","payload":{"thread_source":"automation","source":"vscode"}}"#
@@ -1513,6 +1600,17 @@ func runTaskProgressSelfTest() -> Never {
                 + "\n",
             stderr
         )
+        exit(1)
+    }
+
+    do {
+        let failures = try codexTerminalVisibilityFailures()
+        guard failures.isEmpty else {
+            fputs("Codex terminal visibility checks failed: \(failures.joined(separator: ", "))\n", stderr)
+            exit(1)
+        }
+    } catch {
+        fputs("Codex terminal visibility fixture failed: \(error.localizedDescription)\n", stderr)
         exit(1)
     }
 
@@ -1812,7 +1910,7 @@ func runTaskProgressSelfTest() -> Never {
         exit(1)
     }
 
-    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=16/16; pi=10/10; navigation=9/9; attention=9/9; animation=4/4; ball-effects=9/9; text-effects=10/10; celebration=17/17; list=pass; layout=pass; icons=4/4; balls=5/5")
+    print("task-progress-self-test: lifecycle=13/13; title=pass; visibility=pass; filtering=pass; incremental=19/19; pi=10/10; navigation=9/9; attention=9/9; animation=4/4; ball-effects=9/9; text-effects=10/10; celebration=17/17; list=pass; layout=pass; icons=4/4; balls=5/5")
     exit(0)
 }
 

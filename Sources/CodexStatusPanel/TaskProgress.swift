@@ -190,11 +190,6 @@ func sortedTaskProgressItems(
 /// 从本机 Codex rollout JSONL 日志中恢复用户可见任务的当前状态。
 /// 读取过程分为：发现候选文件 → 解析尾部事件 → 合并标题 → 过滤与排序。
 final class CodexTaskProgressReader {
-    struct UnreadThreadState {
-        let ids: Set<String>
-        let isAvailable: Bool
-    }
-
     struct ReadDiagnostics: Equatable {
         var bytesRead = 0
         var fullRebuildCount = 0
@@ -227,7 +222,10 @@ final class CodexTaskProgressReader {
         var pendingInteractionCalls = Set<String>()
         var latestUserTitle: String?
         var activeTaskTitle: String?
+        var pendingResponseUserTitle: String?
+        var activeResponseUserTitle: String?
         var taskStartedAt: Date?
+        var taskEndedAt: Date?
     }
 
     private struct ParsedCacheEntry {
@@ -255,11 +253,12 @@ final class CodexTaskProgressReader {
     private let fileManager: FileManager
     private let rolloutURLsProvider: (() -> [URL])?
     private let threadTitlesOverride: [String: String]?
-    private let unreadStateOverride: UnreadThreadState?
+    private let unreadThreadIDsOverride: Set<String>?
     private let maximumTailBytes: UInt64 = 1_048_576
     private let rolloutRescanInterval: TimeInterval = 5
     private let activeTaskFreshness: TimeInterval = 30 * 60
-    private let completedTaskVisibility: TimeInterval = 2 * 60
+    private static let completedTaskVisibility: TimeInterval = 2 * 60
+    private static let failedTaskVisibility: TimeInterval = 5 * 60
     private var cachedRollouts: [RolloutCandidate] = []
     private var sessionInfoCache: [String: SessionInfoCacheEntry] = [:]
     private var parsedCache: [String: ParsedCacheEntry] = [:]
@@ -267,7 +266,6 @@ final class CodexTaskProgressReader {
     private var cachedThreadIndexModificationDate: Date?
     private var cachedUnreadThreadIDs = Set<String>()
     private var cachedUnreadStateModificationDate: Date?
-    private var hasCachedUnreadState = false
     private var nextRolloutScanAt = Date.distantPast
 
     private(set) var lastReadDiagnostics = ReadDiagnostics()
@@ -276,12 +274,12 @@ final class CodexTaskProgressReader {
         fileManager: FileManager = .default,
         rolloutURLsProvider: (() -> [URL])? = nil,
         threadTitlesOverride: [String: String]? = nil,
-        unreadStateOverride: UnreadThreadState? = nil
+        unreadThreadIDsOverride: Set<String>? = nil
     ) {
         self.fileManager = fileManager
         self.rolloutURLsProvider = rolloutURLsProvider
         self.threadTitlesOverride = threadTitlesOverride
-        self.unreadStateOverride = unreadStateOverride
+        self.unreadThreadIDsOverride = unreadThreadIDsOverride
     }
 
     func read(at now: Date = Date()) -> TaskProgressSnapshot {
@@ -291,10 +289,10 @@ final class CodexTaskProgressReader {
     func readResult(at now: Date = Date()) -> TaskProgressReadResult {
         lastReadDiagnostics = ReadDiagnostics()
         let threadTitles = threadTitlesOverride ?? readThreadTitleIndex()
-        let unreadState = unreadStateOverride ?? readUnreadThreadState()
+        let unreadThreadIDs = unreadThreadIDsOverride ?? readUnreadThreadIDs()
         var items: [TaskProgressItem] = []
 
-        let candidates = recentRollouts(at: now, unreadThreadIDs: unreadState.ids)
+        let candidates = recentRollouts(at: now, unreadThreadIDs: unreadThreadIDs)
         for candidate in candidates {
             let cacheKey = candidate.url.path
             guard let metadata = fileMetadata(for: candidate.url),
@@ -322,15 +320,6 @@ final class CodexTaskProgressReader {
                 target: item.target
             )
 
-            let threadID = Self.threadID(from: candidate.url)
-            guard Self.shouldDisplay(
-                kind: item.kind,
-                threadID: threadID,
-                modificationDate: metadata.modificationDate,
-                now: now,
-                unreadState: unreadState,
-                fallbackVisibility: completedTaskVisibility
-            ) else { continue }
             items.append(item)
         }
 
@@ -613,9 +602,12 @@ final class CodexTaskProgressReader {
         modificationDate: Date,
         diagnostics: inout ReadDiagnostics
     ) {
-        guard relevantLineMarkers.contains(where: {
-            data.range(of: $0, options: [], in: range) != nil
-        }) else { return }
+        func contains(_ marker: Data) -> Bool {
+            data.range(of: marker, options: [], in: range) != nil
+        }
+        guard relevantLineMarkers.contains(where: contains)
+                || responseUserMarkers.allSatisfy(contains)
+        else { return }
 
         diagnostics.jsonDecodingAttemptCount += 1
         let lineData = data.subdata(in: range)
@@ -643,18 +635,46 @@ final class CodexTaskProgressReader {
                let message = payload["message"] as? String,
                let title = taskTitle(from: message)
             {
-                state.latestUserTitle = title
+                if state.lifecycle == .running {
+                    state.activeTaskTitle = title
+                } else {
+                    state.latestUserTitle = title
+                }
             } else if payloadType == "task_started" {
                 state.lifecycle = .running
                 state.pendingInteractionCalls.removeAll()
-                state.activeTaskTitle = state.latestUserTitle ?? state.activeTaskTitle
+                state.activeTaskTitle = state.latestUserTitle
+                state.latestUserTitle = nil
+                state.activeResponseUserTitle = state.pendingResponseUserTitle
+                state.pendingResponseUserTitle = nil
                 state.taskStartedAt = timestamp(from: record) ?? modificationDate
+                state.taskEndedAt = nil
             } else if payloadType == "task_complete" {
+                if state.lifecycle != .completed || state.taskEndedAt == nil {
+                    state.taskEndedAt = timestamp(from: record)
+                }
                 state.lifecycle = .completed
                 state.pendingInteractionCalls.removeAll()
             } else if ["task_failed", "turn_aborted", "error"].contains(payloadType) {
+                if state.lifecycle != .failed || state.taskEndedAt == nil {
+                    state.taskEndedAt = timestamp(from: record)
+                }
                 state.lifecycle = .failed
                 state.pendingInteractionCalls.removeAll()
+            }
+            return
+        }
+
+        // Orca 等客户端可能只写 response_item；用户消息通常在 task_started 之后到达。
+        if record["type"] as? String == "response_item", payloadType == "message",
+           payload["role"] as? String == "user"
+        {
+            if state.lifecycle == .running {
+                if state.activeResponseUserTitle == nil {
+                    state.activeResponseUserTitle = responseUserTitle(from: payload)
+                }
+            } else if state.pendingResponseUserTitle == nil {
+                state.pendingResponseUserTitle = responseUserTitle(from: payload)
             }
             return
         }
@@ -703,7 +723,10 @@ final class CodexTaskProgressReader {
         now: Date,
         target: TaskProgressTarget?
     ) -> TaskProgressSnapshot {
-        let title = state.activeTaskTitle ?? state.latestUserTitle ?? "Codex 任务"
+        let title = state.activeTaskTitle ?? state.activeResponseUserTitle
+            ?? (state.lifecycle == nil
+                ? state.latestUserTitle ?? state.pendingResponseUserTitle : nil)
+            ?? "Codex 任务"
         let taskStartedAt = state.taskStartedAt ?? modificationDate
         if state.lifecycle == .running, !state.pendingInteractionCalls.isEmpty {
             return TaskProgressSnapshot(items: [TaskProgressItem(
@@ -714,6 +737,14 @@ final class CodexTaskProgressReader {
             )])
         }
         if let lifecycle = state.lifecycle {
+            if lifecycle == .completed || lifecycle == .failed {
+                // 只信任结束事件的时间，避免旧任务因日志补写或重启重新显示。
+                guard let endedAt = state.taskEndedAt else { return .idle }
+                let visibility = lifecycle == .completed
+                    ? completedTaskVisibility : failedTaskVisibility
+                let elapsed = now.timeIntervalSince(endedAt)
+                guard elapsed >= 0, elapsed < visibility else { return .idle }
+            }
             return TaskProgressSnapshot(items: [TaskProgressItem(
                 title: title,
                 kind: lifecycle,
@@ -751,6 +782,8 @@ final class CodexTaskProgressReader {
             || line.contains("require_escalated")
             || line.contains("function_call_output")
             || line.contains("custom_tool_call_output")
+            || (line.contains(#""response_item""#)
+                && line.contains(#""role""#) && line.contains(#""user""#))
     }
 
     private static let relevantLineMarkers = [
@@ -766,6 +799,33 @@ final class CodexTaskProgressReader {
         Data("function_call_output".utf8),
         Data("custom_tool_call_output".utf8),
     ]
+
+    private static let responseUserMarkers = [
+        Data(#""response_item""#.utf8), Data(#""role""#.utf8), Data(#""user""#.utf8),
+    ]
+
+    private static func responseUserTitle(from payload: [String: Any]) -> String? {
+        guard let content = payload["content"] as? [[String: Any]] else { return nil }
+        let text = content.compactMap { item -> String? in
+            guard item["type"] as? String == "input_text",
+                  let raw = item["text"] as? String
+            else { return nil }
+            var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            let context = value.lowercased()
+            guard !context.hasPrefix("# agents.md"),
+                  !context.hasPrefix("<environment_context>"),
+                  !context.hasPrefix("<system-reminder>"),
+                  !context.hasPrefix("[from the result of "),
+                  !context.hasPrefix("<image "),
+                  context != "<image>", context != "</image>"
+            else { return nil }
+            if context.hasPrefix("[image #"), let boundary = value.firstIndex(of: "]") {
+                value = String(value[value.index(after: boundary)...])
+            }
+            return value
+        }.joined(separator: "\n")
+        return taskTitle(from: text)
+    }
 
     private static func taskTitle(from rawMessage: String) -> String? {
         var value = rawMessage
@@ -923,21 +983,6 @@ final class CodexTaskProgressReader {
         return .unknown
     }
 
-    static func shouldDisplay(
-        kind: TaskProgressKind,
-        threadID: String?,
-        modificationDate: Date,
-        now: Date,
-        unreadState: UnreadThreadState,
-        fallbackVisibility: TimeInterval = 2 * 60
-    ) -> Bool {
-        guard kind == .completed || kind == .failed else { return true }
-        if unreadState.isAvailable, let threadID {
-            return unreadState.ids.contains(threadID)
-        }
-        return now.timeIntervalSince(modificationDate) <= fallbackVisibility
-    }
-
     private func codexHomeURL() -> URL {
         if let override = ProcessInfo.processInfo.environment["CODEX_HOME"],
            !override.isEmpty
@@ -987,7 +1032,7 @@ final class CodexTaskProgressReader {
         return titles
     }
 
-    private func readUnreadThreadState() -> UnreadThreadState {
+    private func readUnreadThreadIDs() -> Set<String> {
         let stateURL: URL
         if let override = ProcessInfo.processInfo.environment[
             "CODEX_STATUS_PANEL_STATE_FILE"
@@ -1013,34 +1058,24 @@ final class CodexTaskProgressReader {
         values.isRegularFile == true,
         let modificationDate = values.contentModificationDate
         else {
-            return UnreadThreadState(
-                ids: cachedUnreadThreadIDs,
-                isAvailable: hasCachedUnreadState
-            )
+            return cachedUnreadThreadIDs
         }
         if cachedUnreadStateModificationDate == modificationDate {
-            return UnreadThreadState(
-                ids: cachedUnreadThreadIDs,
-                isAvailable: hasCachedUnreadState
-            )
+            return cachedUnreadThreadIDs
         }
 
         guard let data = try? Data(contentsOf: stateURL),
-              let unreadState = Self.unreadThreadState(from: data)
+              let unreadThreadIDs = Self.unreadThreadIDs(from: data)
         else {
-            return UnreadThreadState(
-                ids: cachedUnreadThreadIDs,
-                isAvailable: hasCachedUnreadState
-            )
+            return cachedUnreadThreadIDs
         }
 
-        cachedUnreadThreadIDs = unreadState.ids
+        cachedUnreadThreadIDs = unreadThreadIDs
         cachedUnreadStateModificationDate = modificationDate
-        hasCachedUnreadState = true
-        return unreadState
+        return unreadThreadIDs
     }
 
-    static func unreadThreadState(from data: Data) -> UnreadThreadState? {
+    static func unreadThreadIDs(from data: Data) -> Set<String>? {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
 
@@ -1058,7 +1093,7 @@ final class CodexTaskProgressReader {
                 else { return nil }
                 ids.formUnion(identityIDs)
             }
-            return UnreadThreadState(ids: ids, isAvailable: true)
+            return ids
         }
 
         guard let atomState = root[
@@ -1069,7 +1104,7 @@ final class CodexTaskProgressReader {
         ] as? [String: Any],
         let ids = unreadThreadIDs(from: unreadByHost)
         else { return nil }
-        return UnreadThreadState(ids: ids, isAvailable: true)
+        return ids
     }
 
     private static func unreadThreadIDs(
@@ -1148,6 +1183,7 @@ final class CodexTaskProgressReader {
             else { continue }
             let threadID = Self.threadID(from: url)
             let isUnread = threadID.map { unreadThreadIDs.contains($0) } ?? false
+            // 未读仅用于发现候选，不能延长结束态的展示时间。
             guard now.timeIntervalSince(modified) <= activeTaskFreshness || isUnread,
                   isUserVisibleRollout(url)
             else {
